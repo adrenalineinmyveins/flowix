@@ -1,0 +1,10 @@
+[package]
+name = "flowix-redaction"
+description = "F6 L1 规则脱敏引擎：确定性规则目录 + 词表 + 占位符映射（零 Tauri 依赖，纯函数）"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+regex = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
