@@ -13,6 +13,9 @@ pub const AGENT_ACCESS_FILE_NAME: &str = "agent-access.json";
 pub enum AgentAccessKind {
     Notebook,
     Folder,
+    /// 标签级授权：scope 为某标签路径及其子树。
+    /// `path` 字段留空，实际范围见 `tag_path`。
+    Tag,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,6 +26,9 @@ pub struct AgentAccessEntry {
     pub path: String,
     pub name: String,
     pub enabled: bool,
+    /// 标签路径，仅 kind=Tag 时有意义。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag_path: Option<String>,
     /// Legacy field; notebook workspace ownership now lives in `.flowix`.
     #[serde(default, skip_serializing)]
     pub workspace: bool,
@@ -251,6 +257,7 @@ fn entries_semantically_equal(a: &[AgentAccessEntry], b: &[AgentAccessEntry]) ->
             && x.path == y.path
             && x.name == y.name
             && x.enabled == y.enabled
+            && x.tag_path == y.tag_path
     })
 }
 
@@ -260,6 +267,11 @@ fn trim_path(path: &str) -> String {
 
 fn refresh_missing_flags(entries: &mut [AgentAccessEntry]) {
     for entry in entries {
+        // 标签级授权无对应目录，missing 恒为 false。
+        if entry.kind == AgentAccessKind::Tag {
+            entry.missing = false;
+            continue;
+        }
         entry.missing = !Path::new(&entry.path).is_dir();
     }
 }
@@ -295,9 +307,25 @@ mod tests {
             path: path.to_string(),
             name: name.to_string(),
             enabled,
+            tag_path: None,
             workspace: false,
             added_at: 1,
             updated_at,
+            missing: false,
+        }
+    }
+
+    fn tag_entry(id: &str, tag_path: &str, name: &str, enabled: bool) -> AgentAccessEntry {
+        AgentAccessEntry {
+            id: id.to_string(),
+            kind: AgentAccessKind::Tag,
+            path: String::new(),
+            name: name.to_string(),
+            enabled,
+            tag_path: Some(tag_path.to_string()),
+            workspace: false,
+            added_at: 1,
+            updated_at: 1,
             missing: false,
         }
     }

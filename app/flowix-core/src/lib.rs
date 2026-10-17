@@ -12,6 +12,7 @@
 //! - [`secret`]    - 敏感凭据存储适配层 (本地 SQLite `default.db` 的
 //!   key-value 表), 通过 `SecretStore` 抽象让 desktop 与 CLI 共用。
 
+pub mod agent;
 pub mod memo_file;
 pub mod secret;
 pub mod service;
