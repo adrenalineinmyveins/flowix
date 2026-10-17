@@ -324,7 +324,60 @@ pub(crate) fn emit_with_recorded_commit_from_window(
             }
         }
     }
+
+    // F2 喂养触发器：把单条 memo 事件派发给 nurture 订阅者。
+    dispatch_nurture_event(&event);
+
     commit
+}
+
+fn dispatch_nurture_event(event: &MemoEvent) {
+    let (notebook_id, relative_path, tags, updated_at, source) = match event {
+        MemoEvent::Created {
+            memo,
+            notebook_id,
+            source,
+            ..
+        } => (
+            notebook_id.clone(),
+            memo.relative_path.clone(),
+            memo.tags.clone(),
+            memo.updated_at,
+            source.clone(),
+        ),
+        MemoEvent::Updated {
+            memo,
+            notebook_id,
+            source,
+            ..
+        } => (
+            notebook_id.clone(),
+            memo.relative_path.clone(),
+            memo.tags.clone(),
+            memo.updated_at,
+            source.clone(),
+        ),
+        MemoEvent::Deleted {
+            relative_path,
+            notebook_id,
+            source,
+            ..
+        } => (
+            notebook_id.clone(),
+            relative_path.clone(),
+            Vec::new(),
+            0,
+            source.clone(),
+        ),
+        MemoEvent::TagsRenamed { .. } | MemoEvent::TagsDeleted { .. } => return,
+    };
+    crate::nurture::dispatch_trigger_event(crate::nurture::NurtureTriggerEvent {
+        source,
+        notebook_id,
+        relative_path,
+        tags,
+        updated_at,
+    });
 }
 
 #[derive(Serialize, Clone)]

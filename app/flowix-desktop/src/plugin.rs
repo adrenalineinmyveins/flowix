@@ -70,6 +70,31 @@ pub struct PluginCatalogSnapshot {
 struct PluginStateFile {
     #[serde(default)]
     disabled: HashSet<String>,
+    #[serde(default)]
+    publish_states: std::collections::BTreeMap<String, String>,
+}
+
+/// 读取某个插件的发布状态：`private` / `shared` / `published`。
+pub fn get_publish_state(id: &str) -> String {
+    read_plugin_state_result()
+        .ok()
+        .and_then(|state| state.publish_states.get(id).cloned())
+        .unwrap_or_else(|| "private".to_string())
+}
+
+/// 设置某个插件的发布状态。
+pub fn set_publish_state(id: &str, state: &str) -> Result<(), String> {
+    if !matches!(state, "private" | "shared" | "published") {
+        return Err("STATE_INVALID".to_string());
+    }
+    if !valid_plugin_id(id) {
+        return Err("invalid plugin id".into());
+    }
+    let mut plugin_state = read_plugin_state_result()?;
+    plugin_state
+        .publish_states
+        .insert(id.to_string(), state.to_string());
+    write_plugin_state(&plugin_state)
 }
 
 #[derive(Debug, Clone, Serialize)]

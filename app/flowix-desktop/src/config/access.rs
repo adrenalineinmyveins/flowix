@@ -149,6 +149,7 @@ impl AgentAccessStore {
                     path: trimmed_path,
                     name: nb.name.clone(),
                     enabled: true,
+                    tag_path: None,
                     workspace: false,
                     added_at: now,
                     updated_at: now,
@@ -237,6 +238,7 @@ fn reconcile_with_notebook_configs(
                     path: trimmed_path,
                     name: nb.name.clone(),
                     enabled: true,
+                    tag_path: None,
                     workspace: false,
                     added_at: now,
                     updated_at: now,
@@ -444,5 +446,37 @@ mod tests {
 
         assert!(!entries[0].missing);
         assert!(entries[1].missing);
+    }
+
+    #[test]
+    fn tag_entries_round_trip_preserves_tag_path() {
+        let cfg = AgentAccessConfig {
+            version: 1,
+            entries: vec![tag_entry("tag_1", "finance/财报", "财报", true)],
+            defaults: None,
+        };
+        let encoded = serde_json::to_string(&cfg).unwrap();
+        let decoded: AgentAccessConfig = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.entries.len(), 1);
+        assert_eq!(decoded.entries[0].kind, AgentAccessKind::Tag);
+        assert_eq!(
+            decoded.entries[0].tag_path.as_deref(),
+            Some("finance/财报")
+        );
+    }
+
+    #[test]
+    fn tag_entry_missing_is_always_false() {
+        let mut entries = vec![tag_entry("tag_1", "finance/财报", "财报", true)];
+        refresh_missing_flags(&mut entries);
+        assert!(!entries[0].missing);
+    }
+
+    #[test]
+    fn semantic_equality_detects_tag_path_change() {
+        let a = vec![tag_entry("tag_1", "finance/财报", "财报", true)];
+        let mut b = a.clone();
+        b[0].tag_path = Some("industry/电商".to_string());
+        assert!(!entries_semantically_equal(&a, &b));
     }
 }
