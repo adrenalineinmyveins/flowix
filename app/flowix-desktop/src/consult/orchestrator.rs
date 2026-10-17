@@ -58,6 +58,22 @@ pub fn parse_wait_completed(wait: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// 检测最后回答中的反问标记（C-M3 文本协议）。
+/// 返回标记内的问题文本；无标记返回 None。
+pub fn extract_askback(answer: &str) -> Option<String> {
+    let start = answer.find("<consult-askback>")?;
+    let end = answer.rfind("</consult-askback>")?;
+    if end <= start {
+        return None;
+    }
+    let question = &answer[start + "<consult-askback>".len()..end];
+    let trimmed = question.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+const MAX_ASKBACKS: usize = 3;
+const ASKBACK_TIMEOUT_SECS: u64 = 120;
+
 /// 消费一个 Pending 咨询。由 `consult_initiate` spawn 的 task 调用；
 /// 任何失败路径都把 meta 置 Failed 并推信箱事件（水位式：不重试）。
 pub async fn orchestrate(app: &AppHandle, notebook_root: &Path, mut meta: ConsultMeta, prompt: String) {
@@ -155,8 +171,9 @@ async fn run_consult_cycle(
     meta.updated_at = chrono::Utc::now().timestamp_millis();
     write_consult_meta(notebook_root, meta);
 
-    // 3. 轮询：预算 + 完成。
+    // 3. 轮询：预算 + 完成 + 反问。
     let mut guard = BudgetGuard::new(meta.token_budget);
+    let mut askbacks = 0usize;
     let deadline = tokio::time::Instant::now()
         + std::time::Duration::from_secs(CONSULT_TIMEOUT_SECS);
     loop {
@@ -186,23 +203,48 @@ async fn run_consult_cycle(
                 return Err(("budget_exceeded".into(), true));
             }
         }
-        // 完成。
-        if let Ok(wait) = host
+        // 完成（或反问）。
+        let completed = host
             .request(json!({
                 "jsonrpc": "2.0", "id": host.next_request_id(),
                 "method": "thread/subagent/wait",
                 "params": { "childThreadId": child_id }
             }))
             .await
-        {
-            if parse_wait_completed(&wait) {
-                break;
+            .ok()
+            .and_then(|wait| parse_wait_completed(&wait).then_some(wait));
+        if let Some(_wait) = completed {
+            let history = host
+                .request(json!({
+                    "jsonrpc": "2.0", "id": host.next_request_id(),
+                    "method": "session/history",
+                    "params": { "sessionId": child_id, "limit": 50 }
+                }))
+                .await
+                .map_err(|e| ("history_failed".to_string(), false))?;
+            let asks_back = extract_last_assistant(&history)
+                .and_then(|text| extract_askback(&text));
+            if let (Some(question), true) = (asks_back, askbacks < MAX_ASKBACKS) {
+                askbacks += 1;
+                if handle_askback(host, meta, notebook_root, &child_id, question).await {
+                    // 答复已注入，回到轮询等 B 继续。
+                    continue;
+                }
+                // 等待通道异常（如 cancel 已移除 waiter）：按未答复兜底注入。
+                let _ = send_followup(
+                    host,
+                    &child_id,
+                    "咨询方未答复，请基于现有信息作答。",
+                )
+                .await;
+                continue;
             }
+            break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
     }
 
-    // 4. 取回答。
+    // 4. 取最终回答（反问轮次之后的输出）。
     let history = host
         .request(json!({
             "jsonrpc": "2.0", "id": host.next_request_id(),
@@ -210,13 +252,70 @@ async fn run_consult_cycle(
             "params": { "sessionId": child_id, "limit": 50 }
         }))
         .await
-        .map_err(|e| err(format!("history_failed: {e}")))?;
+        .map_err(|e| (format!("history_failed: {e}"), false))?;
     let answer = extract_last_assistant(&history)
-        .ok_or_else(|| err("run_failed: no assistant output".into()))?;
+        .ok_or_else(|| ("run_failed: no assistant output".to_string(), false))?;
 
     // 5. 清理。
     let _ = interrupt_and_close(host, &child_id, &parent_id).await;
     Ok(answer)
+}
+
+/// 处理一次反问：置 WaitingAskback、推信箱事件、注册等待通道并阻塞等
+/// 答复（120s），收到则经 `thread/subagent/send`（followupTask 模式）注入
+/// B 的线程并恢复 Running。返回 false 表示等待通道异常（无答复可注入）。
+async fn handle_askback(
+    host: &dyn crate::agent_external::deepseek_harness::DshClient,
+    meta: &mut ConsultMeta,
+    notebook_root: &Path,
+    child_id: &str,
+    question: String,
+) -> bool {
+    meta.status = ConsultStatus::WaitingAskback;
+    meta.updated_at = chrono::Utc::now().timestamp_millis();
+    write_consult_meta(notebook_root, meta);
+    push_event(
+        &meta.consult_id,
+        ConsultEvent::Askback { question: question.clone(), options: Vec::new() },
+    );
+    append_consult_log(
+        notebook_root,
+        meta,
+        &ConsultEvent::Askback { question, options: Vec::new() },
+    );
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    super::register_askback_waiter(&meta.consult_id, tx);
+    let answer = tokio::time::timeout(
+        std::time::Duration::from_secs(ASKBACK_TIMEOUT_SECS),
+        rx.recv(),
+    )
+    .await;
+    let answer = match answer {
+        Ok(Some(answer)) => answer,
+        // 超时：注入未答复提示，让 B 基于现有信息继续。
+        _ => "咨询方未答复，请基于现有信息作答。".to_string(),
+    };
+    let sent = send_followup(host, child_id, &answer).await;
+    meta.status = ConsultStatus::Running;
+    meta.updated_at = chrono::Utc::now().timestamp_millis();
+    write_consult_meta(notebook_root, meta);
+    sent
+}
+
+/// 经 `thread/subagent/send` 以 followupTask 模式向 B 注入一条消息。
+async fn send_followup(
+    host: &dyn crate::agent_external::deepseek_harness::DshClient,
+    child_id: &str,
+    input: &str,
+) -> bool {
+    host.request(json!({
+        "jsonrpc": "2.0", "id": host.next_request_id(),
+        "method": "thread/subagent/send",
+        "params": { "childThreadId": child_id, "input": input, "mode": "followupTask" }
+    }))
+    .await
+    .is_ok()
 }
 
 async fn interrupt_and_close(
@@ -273,5 +372,24 @@ mod tests {
         assert!(parse_wait_completed(&json!({ "completed": true })));
         assert!(!parse_wait_completed(&json!({ "completed": false })));
         assert!(!parse_wait_completed(&json!({})));
+    }
+
+    #[test]
+    fn extracts_askback_marker() {
+        assert_eq!(
+            extract_askback("<consult-askback>需要 Q3 的物流时效数据</consult-askback>")
+                .as_deref(),
+            Some("需要 Q3 的物流时效数据")
+        );
+        // 前后有噪声文本仍可提取。
+        assert_eq!(
+            extract_askback("前置说明\n<consult-askback>  问题  </consult-askback>\n尾注")
+                .as_deref(),
+            Some("问题")
+        );
+        // 无标记 / 空问题 / 只有开头标签。
+        assert!(extract_askback("普通回答").is_none());
+        assert!(extract_askback("<consult-askback>   </consult-askback>").is_none());
+        assert!(extract_askback("<consult-askback>没有闭合").is_none());
     }
 }

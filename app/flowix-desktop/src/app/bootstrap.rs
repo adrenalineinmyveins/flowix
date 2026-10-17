@@ -462,6 +462,7 @@ pub fn run() {
             commands::consult::consult_initiate,
             commands::consult::consult_status,
             commands::consult::consult_events,
+            commands::consult::consult_askback_reply,
             commands::consult::consult_cancel,
             commands::skill::skill_registry_list,
             commands::skill::skill_set_publish_state,

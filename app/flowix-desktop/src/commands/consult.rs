@@ -88,6 +88,27 @@ pub struct SeqEvent {
     pub event: ConsultEvent,
 }
 
+/// 提交反问答复：送入等待通道，由编排器经 `thread/subagent/send` 注入 B。
+/// 返回 false 表示该咨询当前不在等待答复（已超时/已结束）。
+#[tauri::command]
+pub fn consult_askback_reply(
+    cwd: String,
+    from_agent_id: String,
+    consult_id: String,
+    answer: String,
+) -> Result<bool, String> {
+    let root = notebook_root(&cwd)?;
+    let meta = consult::read_consult_meta(&root, &from_agent_id, &consult_id)
+        .ok_or_else(|| "CONSULT_NOT_FOUND".to_string())?;
+    if meta.status != ConsultStatus::WaitingAskback {
+        return Err("ASKBACK_NOT_WAITING".to_string());
+    }
+    if answer.trim().is_empty() {
+        return Err("ANSWER_REQUIRED".to_string());
+    }
+    Ok(consult::reply_askback(&consult_id, answer.trim().to_string()))
+}
+
 /// 取消咨询：置 Cancelled 并向信箱推终止事件。
 /// 实际子 thread 取消随 DSH 方法通道接线补全。
 #[tauri::command]

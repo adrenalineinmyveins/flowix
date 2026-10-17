@@ -96,6 +96,39 @@ pub fn latest_seq(consult_id: &str) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// AskBackGate：反问答复通道（C-M3）
+// ---------------------------------------------------------------------------
+
+/// 等待答复的 askback 会话：consultId → 答复发送端。编排器注册后阻塞
+/// 等待；`consult_askback_reply` IPC 把答复送入通道，由编排器经
+/// `thread/subagent/send` 注入 B 的线程。
+fn askback_waiters(
+) -> &'static Mutex<BTreeMap<String, tokio::sync::mpsc::Sender<String>>> {
+    static WAITERS: OnceLock<Mutex<BTreeMap<String, tokio::sync::mpsc::Sender<String>>>> =
+        OnceLock::new();
+    WAITERS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+pub fn register_askback_waiter(consult_id: &str, tx: tokio::sync::mpsc::Sender<String>) {
+    let mut waiters = askback_waiters().lock().unwrap_or_else(|e| e.into_inner());
+    waiters.insert(consult_id.to_string(), tx);
+}
+
+/// 提交反问答复。返回 false 表示当前没有在等待答复的咨询（已超时或已结束）。
+pub fn reply_askback(consult_id: &str, answer: String) -> bool {
+    let mut waiters = askback_waiters().lock().unwrap_or_else(|e| e.into_inner());
+    match waiters.remove(consult_id) {
+        Some(tx) => tx.try_send(answer).is_ok(),
+        None => false,
+    }
+}
+
+pub fn has_askback_waiter(consult_id: &str) -> bool {
+    let waiters = askback_waiters().lock().unwrap_or_else(|e| e.into_inner());
+    waiters.contains_key(consult_id)
+}
+
+// ---------------------------------------------------------------------------
 // 预算护栏（纯逻辑）
 // ---------------------------------------------------------------------------
 
@@ -133,6 +166,7 @@ impl BudgetGuard {
 pub enum ConsultStatus {
     Pending,
     Running,
+    WaitingAskback,
     Completed,
     Failed,
     BudgetExceeded,
@@ -248,10 +282,12 @@ pub fn validate_request(
     Ok((to_profile, budget))
 }
 
-/// 组装给 B 的咨询提示词（简版 context builder，设计 §3.2）。
+/// 组装给 B 的咨询提示词（简版 context builder，设计 §3.2 + §3.4 反问协议）。
 ///
-/// 素材注入（发起方 disclosure_scope 内笔记围栏化）属 C-M1 完整版；
-/// 本版注入 B 的专长画像与问题，供子线程冷启动。
+/// 反问用文本协议（C-M3 编排层实现）：B 需要补充信息时输出
+/// `<consult-askback>问题</consult-askback>` 标记并停止其余输出，编排器
+/// 检测后挂起等待咨询方答复。演进路径：DSH runtime 内置工具版（设计
+/// 未决事项 #1），文本协议与 JSON 契约同可靠性级别。
 pub fn build_consult_prompt(
     to_profile: &AgentProfile,
     from_display_name: &str,
@@ -266,7 +302,12 @@ pub fn build_consult_prompt(
         "你是 Agent「{}」，专长：{}。\n\
 另一位 Agent「{}」向你咨询。\n\n\
 <question>\n{}\n</question>\n\n\
-请基于你的专长作答。回答将作为咨询结果返回给咨询方。",
+请基于你的专长作答。回答将作为咨询结果返回给咨询方。\n\n\
+## 补充信息协议\n\
+如果问题缺少关键背景而无法作答，请只输出一行标记：\n\
+<consult-askback>你想问的问题</consult-askback>\n\
+不要输出其他内容。咨询方的答复会随后注入，你基于答复继续作答。\n\
+信息足够时禁止使用该标记，直接给出完整回答。",
         to_profile.display_name, expertise, from_display_name, question.trim()
     )
 }
@@ -481,10 +522,31 @@ mod tests {
         assert!(prompt.contains("财报专家"));
         assert!(prompt.contains("finance/财报"));
         assert!(prompt.contains("电商运营"));
+        // C-M3 反问协议在提示词中。
+        assert!(prompt.contains("<consult-askback>"));
+        assert!(prompt.contains("补充信息协议"));
         // 空专长兜底。
         let mut bare = to.clone();
         bare.expertise = vec![];
         assert!(build_consult_prompt(&bare, "x", "y").contains("（未声明）"));
+    }
+
+    #[test]
+    fn askback_waiter_round_trip() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        register_askback_waiter("cst_wait", tx);
+        assert!(has_askback_waiter("cst_wait"));
+        // 答复送达并移除 waiter。
+        assert!(reply_askback("cst_wait", "补充：物流时效 48h".into()));
+        assert!(!has_askback_waiter("cst_wait"));
+        // 通道里能收到（当前线程 runtime 驱动一次）。
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let received = runtime.block_on(async { rx.recv().await });
+        assert_eq!(received.as_deref(), Some("补充：物流时效 48h"));
+        // 无 waiter 时答复返回 false。
+        assert!(!reply_askback("cst_wait", "迟到".into()));
     }
 
     fn write_min_profile(root: &Path, agent_id: &str) {
