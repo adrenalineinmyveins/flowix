@@ -146,6 +146,16 @@ pub struct NoteSearchHit {
     pub matched_in: String,
 }
 
+/// Lightweight material row for the nurture pipeline: note identity, title,
+/// modification time and tags, without the authoritative body bytes.
+#[derive(Debug, Clone)]
+pub struct NoteMaterialRow {
+    pub relative_path: String,
+    pub title: String,
+    pub updated_at: i64,
+    pub tags: Vec<String>,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct NoteTodoMigrationReport {
     pub notes_written: usize,
@@ -692,6 +702,66 @@ impl MemoFile {
             .map_err(io::Error::other)?;
         let rows = stmt
             .query_map(params![tag, format!("{prefix}%")], |row| row.get(0))
+            .map_err(io::Error::other)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(io::Error::other)
+    }
+
+    /// 列出水位之后、匹配任一标签路径（或其子树）的笔记素材行。
+    ///
+    /// `tag_paths` 为空表示不过滤标签（Notebook 全选）。供喂养管道取材器
+    /// 使用，返回轻量投影（不含正文），正文由调用方按 relative_path 读取
+    /// Markdown 后剥离 frontmatter。
+    pub fn list_note_materials_updated_after(
+        &self,
+        notebook_id: &str,
+        tag_paths: &[String],
+        updated_after: i64,
+        limit: usize,
+    ) -> io::Result<Vec<NoteMaterialRow>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.open_note_index_connection(notebook_id)?;
+        let mut sql = String::from(
+            "SELECT n.relative_path, n.title, n.updated_at, \
+             COALESCE((SELECT group_concat(t.tag, ' ') FROM note_tags t WHERE t.relative_path=n.relative_path), '') \
+             FROM notes n WHERE n.updated_at > ?1",
+        );
+        let mut args: Vec<SqlValue> = vec![updated_after.into()];
+        if !tag_paths.is_empty() {
+            let clauses = tag_paths
+                .iter()
+                .map(|_| {
+                    "EXISTS (SELECT 1 FROM note_tags t2 WHERE t2.relative_path=n.relative_path \
+                     AND (t2.tag=? OR substr(t2.tag,1,length(?)+1)=?))"
+                })
+                .collect::<Vec<_>>();
+            sql.push_str(" AND (");
+            sql.push_str(&clauses.join(" OR "));
+            sql.push_str(")");
+            for tag in tag_paths {
+                args.push(tag.clone().into());
+                args.push(tag.clone().into());
+                args.push(format!("{tag}/").into());
+            }
+        }
+        sql.push_str(" ORDER BY n.updated_at DESC, n.relative_path DESC LIMIT ?");
+        args.push((limit as i64).into());
+        let mut stmt = conn.prepare(&sql).map_err(io::Error::other)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(args), |row| {
+                let tags_raw: String = row.get(3)?;
+                let tags = tags_raw
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                Ok(NoteMaterialRow {
+                    relative_path: row.get(0)?,
+                    title: row.get(1)?,
+                    updated_at: row.get(2)?,
+                    tags,
+                })
+            })
             .map_err(io::Error::other)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(io::Error::other)
     }

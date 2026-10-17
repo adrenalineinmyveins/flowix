@@ -50,8 +50,8 @@ mod note_index;
 mod versions;
 
 pub use note_index::{
-    NoteEntry, NoteIndexReconcileReport, NotePropertyMigrationReport, NoteSearchHit,
-    NoteTodoMigrationReport, NoteWriteOutcome,
+    NoteEntry, NoteIndexReconcileReport, NoteMaterialRow, NotePropertyMigrationReport,
+    NoteSearchHit, NoteTodoMigrationReport, NoteWriteOutcome,
 };
 pub use operation_locks::{FileLockIntent, FileWriteGuard, OperationLocks};
 
