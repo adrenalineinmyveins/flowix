@@ -231,6 +231,85 @@ pub async fn redaction_preview(
     .map_err(|error| error.to_ipc_error())
 }
 
+fn notebook_root(cwd: &str) -> Result<PathBuf, String> {
+    let path = Path::new(cwd);
+    if !path.is_absolute() || !path.is_dir() {
+        return Err("INVALID_CWD".to_string());
+    }
+    Ok(path.to_path_buf())
+}
+
+/// 确认门决定：approved=true → 留档 confirmed；false → cancelled。
+/// 留档不存在 / 已结算 → RECEIPT_NOT_FOUND / ALREADY_SETTLED。
+#[tauri::command]
+pub fn redaction_confirm(
+    cwd: String,
+    receipt_id: String,
+    approved: bool,
+) -> Result<crate::redaction::RedactionOutboxRecord, String> {
+    let root = notebook_root(&cwd)?;
+    crate::redaction::submit_confirmation(&root, &receipt_id, approved)
+}
+
+/// 确认门挂起等待（agent 自动发起路径）。超时 → 留档 cancelled +
+/// `confirm_timeout:<id>`；拒绝 → cancelled 正常返回。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum ConfirmGateResult {
+    Confirmed { payload: String },
+    Cancelled,
+}
+
+#[tauri::command]
+pub async fn redaction_confirm_wait(
+    cwd: String,
+    receipt_id: String,
+    timeout_secs: Option<u64>,
+) -> Result<ConfirmGateResult, String> {
+    let root = notebook_root(&cwd)?;
+    let timeout = timeout_secs.unwrap_or_else(|| load_config().unwrap_or_default().confirm_timeout_secs as u64);
+    match crate::redaction::wait_for_confirmation(&root, &receipt_id, timeout).await {
+        Ok(crate::redaction::ConfirmOutcome::Confirmed(bytes)) => {
+            let payload = String::from_utf8(bytes)
+                .map_err(|_| "ENVELOPE_NOT_UTF8".to_string())?;
+            Ok(ConfirmGateResult::Confirmed { payload })
+        }
+        Ok(crate::redaction::ConfirmOutcome::Cancelled) => Ok(ConfirmGateResult::Cancelled),
+        Err(error) => Err(error.to_ipc_error()),
+    }
+}
+
+/// 唯一发送出口：只有 confirmed 留档能取出信封字节（与留档 byte-equal）。
+/// draft / cancelled / failed / 不存在一律 `UNCONFIRMED_SEND_BLOCKED:*`。
+/// F5 网络层就绪后在此出口上接传输，兜底断言保持在本函数。
+#[tauri::command]
+pub fn redaction_send(cwd: String, receipt_id: String) -> Result<SendPayload, String> {
+    let root = notebook_root(&cwd)?;
+    let bytes = crate::redaction::take_confirmed_payload(&root, &receipt_id)?;
+    let byte_length = bytes.len();
+    let payload = String::from_utf8(bytes).map_err(|_| "ENVELOPE_NOT_UTF8".to_string())?;
+    Ok(SendPayload {
+        payload,
+        byte_length,
+    })
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendPayload {
+    pub payload: String,
+    pub byte_length: usize,
+}
+
+/// 出站留档列表（created_at 升序），确认门 UI 与审计页共用。
+#[tauri::command]
+pub fn redaction_outbox_list(
+    cwd: String,
+) -> Result<Vec<crate::redaction::RedactionOutboxRecord>, String> {
+    let root = notebook_root(&cwd)?;
+    Ok(crate::redaction::list_records(&root))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

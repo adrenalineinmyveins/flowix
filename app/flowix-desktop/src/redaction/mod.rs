@@ -13,6 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 use flowix_redaction::{
     self as l1, check_placeholder_integrity, CustomWord, PlaceholderProblem, RedactionOptions,
@@ -21,6 +22,14 @@ use flowix_redaction::{
 
 use crate::config::access::AgentAccessEntry;
 use crate::nurture::should_accept_event_in_notebook;
+
+pub mod outbox;
+
+pub use outbox::{
+    draft_from_preview, list_records, new_receipt_id, outbox_dir, read_record, settle,
+    status_name, take_confirmed_payload, write_record, OutboxStatus, RedactionEnvelope,
+    RedactionOutboxRecord, OUTBOX_LIMIT,
+};
 
 pub const REDACTION_LEVELS: &[&str] = &["r1", "r2", "r3"];
 /// L3 复扫回炉上限（初次蒸馏之外最多重写次数），对应规格 §3.4「上限 2 次」。
@@ -35,6 +44,8 @@ pub enum RedactionPipelineError {
     DistillFailed(String),
     RuleHitAfterDistill { rule_ids: Vec<String>, attempts: u32 },
     PlaceholderBroken { problems: Vec<String>, attempts: u32 },
+    /// 确认门超时：与拒绝同义，留档已记 cancelled（规格 §3.4）。
+    ConfirmTimeout { receipt_id: String },
 }
 
 impl RedactionPipelineError {
@@ -47,6 +58,7 @@ impl RedactionPipelineError {
             Self::DistillFailed(_) => "distill_failed".to_string(),
             Self::RuleHitAfterDistill { .. } => "rule_hit_after_distill".to_string(),
             Self::PlaceholderBroken { .. } => "placeholder_broken".to_string(),
+            Self::ConfirmTimeout { .. } => "confirm_timeout".to_string(),
         }
     }
 
@@ -62,6 +74,7 @@ impl RedactionPipelineError {
             }
             Self::PayloadTooLarge { limit_kb, .. } => format!("payload_too_large:{limit_kb}"),
             Self::InvalidLevel(level) => format!("invalid_level:{level}"),
+            Self::ConfirmTimeout { receipt_id } => format!("confirm_timeout:{receipt_id}"),
             Self::ScopeEmpty => self.error_code(),
         }
     }
@@ -370,12 +383,99 @@ fn classify_problems(
 }
 
 // ---------------------------------------------------------------------------
+// 确认门（M3）：waiter 挂起 + confirm/cancel 唤醒 + 超时同义 cancelled
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmOutcome {
+    /// 用户确认：返回可发送的信封字节（与留档 byte-equal）。
+    Confirmed(Vec<u8>),
+    /// 用户拒绝：留档已记 cancelled，不发送。
+    Cancelled,
+}
+
+fn confirm_waiters() -> &'static Mutex<BTreeMap<String, tokio::sync::mpsc::Sender<bool>>> {
+    static WAITERS: OnceLock<Mutex<BTreeMap<String, tokio::sync::mpsc::Sender<bool>>>> =
+        OnceLock::new();
+    WAITERS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+pub fn has_confirm_waiter(receipt_id: &str) -> bool {
+    confirm_waiters()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(receipt_id)
+}
+
+/// 提交确认门决定（IPC 侧调用）：结算留档状态并唤醒等待方。
+/// 返回结算后的留档；`false` = 拒绝（cancelled）。
+pub fn submit_confirmation(
+    notebook_root: &std::path::Path,
+    receipt_id: &str,
+    approved: bool,
+) -> Result<RedactionOutboxRecord, String> {
+    let status = if approved {
+        OutboxStatus::Confirmed
+    } else {
+        OutboxStatus::Cancelled
+    };
+    let record = settle(notebook_root, receipt_id, status)?;
+    let mut waiters = confirm_waiters().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(tx) = waiters.remove(receipt_id) {
+        let _ = tx.try_send(approved);
+    }
+    Ok(record)
+}
+
+/// 确认门挂起等待（agent 自动发起路径；用户主动路径直接走
+/// `submit_confirmation`）。超时与拒绝同义：留档记 cancelled，
+/// 返回 `ConfirmTimeout`。
+pub async fn wait_for_confirmation(
+    notebook_root: &std::path::Path,
+    receipt_id: &str,
+    timeout_secs: u64,
+) -> Result<ConfirmOutcome, RedactionPipelineError> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    {
+        let mut waiters = confirm_waiters().lock().unwrap_or_else(|e| e.into_inner());
+        waiters.insert(receipt_id.to_string(), tx);
+    }
+    let decision = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs.max(1)),
+        rx.recv(),
+    )
+    .await;
+    {
+        let mut waiters = confirm_waiters().lock().unwrap_or_else(|e| e.into_inner());
+        waiters.remove(receipt_id);
+    }
+    match decision {
+        Ok(Some(true)) => Ok(ConfirmOutcome::Confirmed(
+            take_confirmed_payload(notebook_root, receipt_id).map_err(|_| {
+                RedactionPipelineError::ConfirmTimeout {
+                    receipt_id: receipt_id.to_string(),
+                }
+            })?,
+        )),
+        Ok(Some(false)) | Ok(None) => Ok(ConfirmOutcome::Cancelled),
+        Err(_) => {
+            let _ = settle(notebook_root, receipt_id, OutboxStatus::Cancelled);
+            Err(RedactionPipelineError::ConfirmTimeout {
+                receipt_id: receipt_id.to_string(),
+            })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DSH 接线与完整 preview 编排
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RedactionPreviewReport {
+    /// 关联 outbox 留档（draft 态），确认门与发送出口都以它为凭据。
+    pub receipt_id: String,
     pub final_text: String,
     pub placeholder_map: BTreeMap<String, String>,
     pub l1_hits: Vec<l1::RuleHit>,
@@ -499,7 +599,8 @@ pub async fn preview_full(
         Err(error) => return Err(error),
     };
 
-    Ok(RedactionPreviewReport {
+    let mut report = RedactionPreviewReport {
+        receipt_id: String::new(),
         final_text: outcome.text,
         placeholder_map: l1_report.placeholder_map,
         l1_hits: l1_report.hits,
@@ -510,7 +611,16 @@ pub async fn preview_full(
         truncated: payload.truncated,
         target_level: target_level.to_string(),
         rule_set_version: l1::RULE_CATALOG_VERSION.to_string(),
-    })
+    };
+    let record = draft_from_preview(
+        question,
+        scope_entry_ids,
+        &report,
+        chrono::Utc::now().timestamp_millis(),
+    );
+    write_record(&notebook_root, &record).map_err(RedactionPipelineError::DistillFailed)?;
+    report.receipt_id = record.receipt_id;
+    Ok(report)
 }
 
 trait TapDebug {
@@ -1018,5 +1128,126 @@ mod tests {
             .error_code(),
             "rule_hit_after_distill"
         );
+        assert_eq!(
+            RedactionPipelineError::ConfirmTimeout {
+                receipt_id: "rct_x".into()
+            }
+            .to_ipc_error(),
+            "confirm_timeout:rct_x"
+        );
+    }
+
+    // ---------------- 确认门（M3）----------------
+
+    fn draft_record(root: &std::path::Path) -> RedactionOutboxRecord {
+        let mut map = BTreeMap::new();
+        map.insert("⟦PHONE-1⟧".to_string(), "13800138000".to_string());
+        let report = RedactionPreviewReport {
+            receipt_id: String::new(),
+            final_text: "某客户 ⟦PHONE-1⟧ 咨询".into(),
+            placeholder_map: map,
+            l1_hits: vec![],
+            attempts: 1,
+            used_fallback: false,
+            included_paths: vec![],
+            dropped_paths: vec![],
+            truncated: false,
+            target_level: "r2".into(),
+            rule_set_version: "l1-v1".into(),
+        };
+        let record = draft_from_preview("q", &["e1".into(), "e2".into()], &report, 42);
+        write_record(root, &record).unwrap();
+        record
+    }
+
+    #[tokio::test]
+    async fn confirm_gate_approve_returns_byte_equal_payload() {
+        let root = tempfile::tempdir().unwrap();
+        let record = draft_record(root.path());
+
+        let wait_root = std::path::PathBuf::from(root.path());
+        let receipt = record.receipt_id.clone();
+        let waiter = tokio::spawn(async move {
+            wait_for_confirmation(&wait_root, &receipt, 30).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(has_confirm_waiter(&record.receipt_id));
+        let settled =
+            submit_confirmation(root.path(), &record.receipt_id, true).unwrap();
+        assert_eq!(settled.status, OutboxStatus::Confirmed);
+
+        let outcome = waiter.await.unwrap().unwrap();
+        match outcome {
+            ConfirmOutcome::Confirmed(bytes) => {
+                let reread = read_record(root.path(), &record.receipt_id).unwrap();
+                assert_eq!(bytes, reread.envelope_bytes());
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(!has_confirm_waiter(&record.receipt_id));
+    }
+
+    #[tokio::test]
+    async fn confirm_gate_reject_cancels_record() {
+        let root = tempfile::tempdir().unwrap();
+        let record = draft_record(root.path());
+
+        let wait_root = std::path::PathBuf::from(root.path());
+        let receipt = record.receipt_id.clone();
+        let waiter = tokio::spawn(async move {
+            wait_for_confirmation(&wait_root, &receipt, 30).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let settled =
+            submit_confirmation(root.path(), &record.receipt_id, false).unwrap();
+        assert_eq!(settled.status, OutboxStatus::Cancelled);
+
+        assert_eq!(waiter.await.unwrap().unwrap(), ConfirmOutcome::Cancelled);
+        let after = read_record(root.path(), &record.receipt_id).unwrap();
+        assert_eq!(after.status, OutboxStatus::Cancelled);
+        assert!(after.settled_at.is_some());
+        assert_eq!(
+            take_confirmed_payload(root.path(), &record.receipt_id).unwrap_err(),
+            "UNCONFIRMED_SEND_BLOCKED:status_cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_gate_timeout_marks_cancelled() {
+        let root = tempfile::tempdir().unwrap();
+        let record = draft_record(root.path());
+
+        let err = wait_for_confirmation(root.path(), &record.receipt_id, 1)
+            .await
+            .unwrap_err();
+        assert_eq!(err.error_code(), "confirm_timeout");
+        let after = read_record(root.path(), &record.receipt_id).unwrap();
+        assert_eq!(after.status, OutboxStatus::Cancelled);
+        assert!(!has_confirm_waiter(&record.receipt_id));
+    }
+
+    #[test]
+    fn outbox_fifo_via_public_api() {
+        let root = tempfile::tempdir().unwrap();
+        for i in 0..(OUTBOX_LIMIT + 3) {
+            let mut map = BTreeMap::new();
+            map.insert("⟦PHONE-1⟧".to_string(), "13800138000".to_string());
+            let report = RedactionPreviewReport {
+                receipt_id: String::new(),
+                final_text: format!("payload-{i}"),
+                placeholder_map: map,
+                l1_hits: vec![],
+                attempts: 1,
+                used_fallback: false,
+                included_paths: vec![],
+                dropped_paths: vec![],
+                truncated: false,
+                target_level: "r1".into(),
+                rule_set_version: "l1-v1".into(),
+            };
+            let record = draft_from_preview("q", &[], &report, i as i64);
+            write_record(root.path(), &record).unwrap();
+        }
+        assert_eq!(list_records(root.path()).len(), OUTBOX_LIMIT);
     }
 }
