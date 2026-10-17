@@ -182,14 +182,15 @@ state.json 存于 `<notebook>/.flowix/agents/<agentId>/state.json`，仅本地�
 
 ## 5. 与现有系统的集成
 
-### 5.1 笔记索引与投影
+### 5.1 笔记索引与投影（2026-10-17 实现时修订）
 
-profile.md 作为普通笔记进入 `note_index`，`MemoIndexEntry` 已有 `properties: Value`（frontmatter 全量）与 `tags: Vec<String>`。索引层识别 `flowix_kind == "agent-profile"` 后做两件事：
+原设计假设「profile.md 作为普通笔记进入 note_index」。实现时经集成测试核实：`FileManagementPolicy::is_ignored` 对所有点开头目录（含 `.agents/`）整体排除（[file_management.rs](../app/flowix-core/src/memo_file/file_management.rs) `name.starts_with('.')`），profile 与既有 `.agents/agents/agent.md` 子代理配置同等待遇——**不进 note_index、不进 FTS、不出现在笔记列表**。该边界由测试 `profile_note_is_excluded_from_note_index` 锁定。
 
-- 从 `properties` 中派生 `displayName / expertise / consultable / agentType` 存入衍生字段，供卡片 UI 列表查询不重读磁盘
-- 不把 profile.md 排入普通笔记的默认结果集（或在列表中以卡片形态单独渲染）——前端决策，索引层只打标
+修订后的数据通路：
 
-expertise 与笔记标签体系复用同一套 tag-path 归一化（`normalize_tag_path`），F2 喂养写入专长标签时直接调用该校验；非法路径拒收并记日志。
+- 卡片 UI 数据源 = `agent_profile_list` IPC（直扫 `.agents/*/profile.md` 解析投影），不依赖 note_index
+- F2 取材查询天然不会捞到 `.agents/`（索引排除 + 触发器路径过滤双保险）
+- expertise 仍复用 `normalize_tag_path` 校验（写入侧约束，与索引无关）
 
 ### 5.2 与 Agent 运行时的关系
 

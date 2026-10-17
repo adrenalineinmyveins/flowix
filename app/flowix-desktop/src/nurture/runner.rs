@@ -168,7 +168,8 @@ async fn run_inner(
     } else {
         profile.agent_type.clone()
     };
-    let answer = run_distill_once(app, &state, &notebook_root, &prompt, &agent_type).await?;
+    let (answer, thread_id_for_state) =
+        run_distill_once(app, &state, &notebook_root, &prompt, &agent_type).await?;
 
     // 5. 解析与校验。
     let output = parse_nurture_output(&answer)?;
@@ -178,7 +179,7 @@ async fn run_inner(
     write_profile_content(&notebook_root, &profile.agent_id, &updated)?;
     append_memories(&notebook_root, &profile.agent_id, &output.memories);
 
-    // 7. 水位推进与留痕。
+    // 7. 水位推进、运行状态记账与留痕。
     let watermark = materials.iter().map(|m| m.updated_at).max().unwrap_or(now);
     nurture_state.agent_id = profile.agent_id.clone();
     nurture_state.watermark = watermark;
@@ -186,6 +187,14 @@ async fn run_inner(
     nurture_state.consecutive_failures = 0;
     nurture_state.paused = false;
     write_nurture_state(&notebook_root, &profile.agent_id, &nurture_state);
+    // F1 运行状态记账：runs +1、lastRunAt、distill thread 进 FIFO。
+    // token 用量待 usage 事件接线（F4），当前不计。
+    {
+        let mut agent_state =
+            crate::commands::agent_profile::read_state_or_new(&notebook_root, &profile.agent_id);
+        agent_state.record_run(&thread_id_for_state, now);
+        let _ = crate::commands::agent_profile::write_state(&notebook_root, &agent_state);
+    }
     append_log_line(
         &notebook_root,
         &profile.agent_id,
@@ -226,7 +235,8 @@ fn find_first_profile(root: &Path) -> Result<Option<(AgentProfile, String)>, Str
     Ok(None)
 }
 
-/// 发起一次蒸馏 agent run 并等待完成，返回最终 assistant 文本。
+/// 发起一次蒸馏 agent run 并等待完成，返回 (最终 assistant 文本, threadId)。
+/// threadId 供调用方做运行状态记账（线程本身已删除）。
 ///
 /// 线程模式与 `plugin_run` 一致：create → listen stream_end → dispatch →
 /// 读输出 → 删除线程。
@@ -236,7 +246,7 @@ async fn run_distill_once(
     notebook_root: &Path,
     prompt: &str,
     agent_type: &str,
-) -> Result<String, String> {
+) -> Result<(String, String), String> {
     let runtime = crate::agent_external::runtime_registry::ExternalRuntimeKind::parse(agent_type)
         .map_err(|e| format!("agent_type_invalid: {e}"))?;
     let runtime_key = runtime.key().to_string();
@@ -330,6 +340,7 @@ async fn run_distill_once(
                 .map(|message| message.content)
         })
         .ok_or_else(|| "run_failed: no assistant output".to_string())
+        .map(|answer| (answer, thread.thread_id.clone()))
     }
     .await;
 

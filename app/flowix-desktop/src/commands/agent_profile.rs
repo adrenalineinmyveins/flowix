@@ -8,7 +8,40 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use flowix_core::agent::{generate_agent_id, AgentProfile, ProfileError};
+use flowix_core::agent::{generate_agent_id, AgentProfile, AgentState, ProfileError};
+
+/// state.json 路径：`<nb>/.flowix/agents/<id>/state.json`（仅本地）。
+fn state_path(root: &Path, agent_id: &str) -> PathBuf {
+    root.join(".flowix").join("agents").join(agent_id).join("state.json")
+}
+
+/// 读取运行状态；不存在返回 `STATE_NOT_FOUND`。
+pub(crate) fn read_state(root: &Path, agent_id: &str) -> Result<AgentState, String> {
+    let path = state_path(root, agent_id);
+    if !path.exists() {
+        return Err("STATE_NOT_FOUND".to_string());
+    }
+    let raw = fs::read_to_string(&path)
+        .map_err(|error| format!("读取 state.json 失败: {error}"))?;
+    serde_json::from_str(&raw).map_err(|error| format!("解析 state.json 失败: {error}"))
+}
+
+/// 原子写运行状态。
+pub(crate) fn write_state(root: &Path, state: &AgentState) -> Result<(), String> {
+    let path = state_path(root, &state.agent_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("创建 state 目录失败: {error}"))?;
+    }
+    let content = serde_json::to_string_pretty(state)
+        .map_err(|error| format!("序列化 state 失败: {error}"))?;
+    crate::config::user::atomic_write_json(&path, &content)
+        .map_err(|error| format!("写入 state.json 失败: {error}"))
+}
+
+/// 读取运行状态；无文件时返回该 agent 的新建空状态（内部记账用）。
+pub(crate) fn read_state_or_new(root: &Path, agent_id: &str) -> AgentState {
+    read_state(root, agent_id).unwrap_or_else(|_| AgentState::new(agent_id))
+}
 
 fn notebook_root(cwd: &str) -> Result<PathBuf, String> {
     let path = Path::new(cwd);
@@ -229,7 +262,27 @@ pub fn agent_profile_delete(cwd: String, agent_id: String) -> Result<(), String>
             let _ = fs::remove_dir(parent);
         }
     }
+    // 级联清理：memories.md 与本地运行面（state.json / nurture.json /
+    // nurture-log.jsonl）。同步面只剩用户自建的额外文件。
+    let memories = root.join(".agents").join(&agent_id).join("memories.md");
+    if crate::config::path_is_inside(&memories, &root) {
+        let _ = fs::remove_file(memories);
+    }
+    let local_dir = root.join(".flowix").join("agents").join(&agent_id);
+    if crate::config::path_is_inside(&local_dir, &root) && local_dir.is_dir() {
+        let _ = fs::remove_dir_all(&local_dir);
+    }
     Ok(())
+}
+
+/// 读取 Agent 本地运行状态（用量/最近线程）。无状态文件返回
+/// `STATE_NOT_FOUND`（新 agent 尚未运行过）。
+#[tauri::command]
+pub fn agent_state_get(cwd: String, agent_id: String) -> Result<AgentState, String> {
+    let root = notebook_root(&cwd)?;
+    // profile 必须存在，避免对已删 agent 查询残留状态。
+    read_profile(&root, &agent_id)?;
+    read_state(&root, &agent_id)
 }
 
 /// 手动触发一次喂养（跳过阈值与间隔检查，豁免暂停由 runner 判断）。
@@ -331,5 +384,78 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.starts_with("INVALID_EXPERTISE"));
+    }
+
+    #[test]
+    fn state_round_trip_via_read_write() {
+        let (_temp, root) = temp_root();
+        let profile = agent_profile_create(
+            root.to_string_lossy().into_owned(),
+            "A".into(),
+            String::new(),
+            vec![],
+            "codex".into(),
+        )
+        .unwrap();
+        // 新 agent 无状态文件。
+        assert_eq!(
+            read_state(&root, &profile.agent_id).unwrap_err(),
+            "STATE_NOT_FOUND"
+        );
+        // 记账后 round-trip 一致。
+        let mut state = read_state_or_new(&root, &profile.agent_id);
+        state.record_run("thr_1", 1000);
+        state.record_tokens(120, 30);
+        write_state(&root, &state).unwrap();
+        let read_back = read_state(&root, &profile.agent_id).unwrap();
+        assert_eq!(read_back, state);
+        assert_eq!(read_back.runs, 1);
+        // IPC 层：profile 存在 + state 存在 → 成功返回。
+        let via_ipc = agent_state_get(
+            root.to_string_lossy().into_owned(),
+            profile.agent_id.clone(),
+        )
+        .unwrap();
+        assert_eq!(via_ipc.recent_thread_ids, vec!["thr_1".to_string()]);
+    }
+
+    #[test]
+    fn agent_state_get_requires_profile() {
+        let (_temp, root) = temp_root();
+        let err = agent_state_get(root.to_string_lossy().into_owned(), "agt_ghost".into())
+            .unwrap_err();
+        assert_eq!(err, "PROFILE_NOT_FOUND");
+    }
+
+    #[test]
+    fn delete_cascades_memories_and_local_state() {
+        let (_temp, root) = temp_root();
+        let profile = agent_profile_create(
+            root.to_string_lossy().into_owned(),
+            "A".into(),
+            String::new(),
+            vec![],
+            "codex".into(),
+        )
+        .unwrap();
+        let agent_id = profile.agent_id.clone();
+        // 铺垫 memories.md 与本地运行面文件。
+        let memories = root.join(".agents").join(&agent_id).join("memories.md");
+        std::fs::write(&memories, "---\nflowix_kind: agent-memories\n---\n\n## 2026-10-17\n- 旧\n").unwrap();
+        let mut state = AgentState::new(&agent_id);
+        state.record_run("thr_1", 1);
+        write_state(&root, &state).unwrap();
+        let local_dir = root.join(".flowix").join("agents").join(&agent_id);
+        std::fs::write(local_dir.join("nurture.json"), "{}").unwrap();
+
+        agent_profile_delete(root.to_string_lossy().into_owned(), agent_id.clone()).unwrap();
+
+        assert!(!memories.exists());
+        assert!(!local_dir.exists());
+        // state 也不可达（目录整体删除）。
+        assert!(read_state(&root, &agent_id).is_err());
+        // profile 列表为空。
+        let list = agent_profile_list(root.to_string_lossy().into_owned()).unwrap();
+        assert!(list.is_empty());
     }
 }

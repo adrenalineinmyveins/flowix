@@ -457,6 +457,7 @@ pub fn run() {
             commands::agent_profile::agent_profile_create,
             commands::agent_profile::agent_profile_update,
             commands::agent_profile::agent_profile_delete,
+            commands::agent_profile::agent_state_get,
             commands::agent_profile::nurture_run_now,
             commands::skill::skill_registry_list,
             commands::skill::skill_set_publish_state,

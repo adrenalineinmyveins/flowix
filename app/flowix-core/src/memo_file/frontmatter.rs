@@ -81,9 +81,15 @@ static FM_LINE_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^(\s*)([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*?)\s*$").unwrap());
 pub const CANONICAL_FRONTMATTER_KEY: &str = "flowix_key";
 pub const LEGACY_FRONTMATTER_KEY: &str = "key";
-/// Reserved legacy identity fields. They are not note identities in the path
-/// index and must not appear as user-defined properties.
-pub const SYSTEM_FRONTMATTER_KEYS: [&str; 2] = [CANONICAL_FRONTMATTER_KEY, LEGACY_FRONTMATTER_KEY];
+/// System-managed frontmatter keys excluded from editor CAS comparison and
+/// user-property write-back. `flowix_kind` marks structured documents
+/// (agent-profile / agent-memories); profile business fields stay user-visible
+/// so editor writes can still detect nurture write-back conflicts.
+pub const SYSTEM_FRONTMATTER_KEYS: [&str; 3] = [
+    CANONICAL_FRONTMATTER_KEY,
+    LEGACY_FRONTMATTER_KEY,
+    "flowix_kind",
+];
 
 pub fn is_system_frontmatter_key(key: &str) -> bool {
     SYSTEM_FRONTMATTER_KEYS.contains(&key)

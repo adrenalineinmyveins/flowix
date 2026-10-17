@@ -191,6 +191,66 @@ pub fn generate_agent_id() -> String {
     format!("agt_{hex}")
 }
 
+/// Agent 本地运行状态（`<nb>/.flowix/agents/<id>/state.json`）的投影。
+///
+/// 仅本地：不进云同步、不进 FTS。写入方为桌面运行时（agent run / 咨询
+/// 记账），读取方为卡片 UI 与 F2 喂养统计。字段口径见
+/// AGENT-PROFILE-MODEL.md §4。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentState {
+    pub version: u32,
+    pub agent_id: String,
+    pub last_run_at: Option<i64>,
+    pub last_consulted_at: Option<i64>,
+    pub runs: u64,
+    pub consultations_received: u64,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    /// 最近 20 个 threadId，FIFO。
+    #[serde(default)]
+    pub recent_thread_ids: Vec<String>,
+    /// 设备级偏好（不跨设备）。
+    #[serde(default)]
+    pub local_preferences: serde_json::Value,
+}
+
+impl AgentState {
+    pub const MAX_RECENT_THREADS: usize = 20;
+
+    pub fn new(agent_id: impl Into<String>) -> Self {
+        Self {
+            version: 1,
+            agent_id: agent_id.into(),
+            last_run_at: None,
+            last_consulted_at: None,
+            runs: 0,
+            consultations_received: 0,
+            tokens_in: 0,
+            tokens_out: 0,
+            recent_thread_ids: Vec::new(),
+            local_preferences: serde_json::Value::Null,
+        }
+    }
+
+    /// 记一次 agent run：runs +1、lastRunAt、threadId 进 FIFO（去重置顶）。
+    pub fn record_run(&mut self, thread_id: &str, at_ms: i64) {
+        self.runs = self.runs.saturating_add(1);
+        self.last_run_at = Some(at_ms);
+        self.recent_thread_ids.retain(|id| id != thread_id);
+        self.recent_thread_ids.push(thread_id.to_string());
+        while self.recent_thread_ids.len() > Self::MAX_RECENT_THREADS {
+            self.recent_thread_ids.remove(0);
+        }
+    }
+
+    /// 记 token 用量（口径同 flowix/session/usage）。
+    pub fn record_tokens(&mut self, tokens_in: u64, tokens_out: u64) {
+        self.tokens_in = self.tokens_in.saturating_add(tokens_in);
+        self.tokens_out = self.tokens_out.saturating_add(tokens_out);
+    }
+}
+
 fn yaml_quote(s: &str) -> String {
     // 双引号转义，适合 merge_frontmatter 单行替换
     let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
@@ -268,6 +328,67 @@ mod tests {
         let id = generate_agent_id();
         assert!(id.starts_with("agt_"));
         assert_eq!(id.len(), 4 + 16);
+    }
+
+    #[test]
+    fn agent_state_record_run_fifo_and_dedup() {
+        let mut state = AgentState::new("agt_test");
+        state.record_run("t1", 100);
+        state.record_run("t2", 200);
+        assert_eq!(state.recent_thread_ids, vec!["t1", "t2"]);
+        assert_eq!(state.runs, 2);
+        assert_eq!(state.last_run_at, Some(200));
+        // 重复 threadId 去重置顶，不重复计数位置。
+        state.record_run("t1", 300);
+        assert_eq!(state.recent_thread_ids, vec!["t2", "t1"]);
+        assert_eq!(state.runs, 3);
+    }
+
+    #[test]
+    fn agent_state_recent_threads_capped_at_20() {
+        let mut state = AgentState::new("agt_test");
+        for i in 0..25 {
+            state.record_run(&format!("t{i}"), i as i64);
+        }
+        assert_eq!(state.recent_thread_ids.len(), AgentState::MAX_RECENT_THREADS);
+        assert_eq!(state.recent_thread_ids.first().map(String::as_str), Some("t5"));
+        assert_eq!(state.recent_thread_ids.last().map(String::as_str), Some("t24"));
+    }
+
+    #[test]
+    fn agent_state_json_round_trip() {
+        let mut state = AgentState::new("agt_test");
+        state.record_run("thr_1", 1000);
+        state.record_tokens(120, 30);
+        state.local_preferences = serde_json::json!({ "contextWindow": 128000 });
+        let encoded = serde_json::to_string(&state).unwrap();
+        let decoded: AgentState = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, state);
+        assert_eq!(decoded.runs, 1);
+        assert_eq!(decoded.tokens_in, 120);
+        assert_eq!(decoded.tokens_out, 30);
+    }
+
+    /// 集成（设计修订验证）：`.agents/` 属于点开头目录，被
+    /// FileManagementPolicy 整体排除在 note_index 之外（与
+    /// `.agents/agents/agent.md` 子代理配置同等待遇）。因此卡片 UI 的
+    /// 数据源是 `agent_profile_list`（直扫目录），profile 不进入笔记
+    /// 搜索与默认列表。此测试锁定该边界，防止未来误把 profile 当笔记
+    /// 索引（那会污染用户笔记列表）。
+    #[test]
+    fn profile_note_is_excluded_from_note_index() {
+        use crate::memo_file::FileManagementPolicy;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("notebook");
+        std::fs::create_dir_all(root.join(".agents").join("agt_projtest")).unwrap();
+        let policy = FileManagementPolicy::default();
+        let relative = std::path::Path::new(".agents/agt_projtest/profile.md");
+        assert!(
+            policy.is_index_ignored_at(&root, relative),
+            ".agents profile must stay out of the note index"
+        );
+        // 普通笔记不受影响。
+        assert!(!policy.is_index_ignored_at(&root, std::path::Path::new("notes/a.md")));
     }
 
     fn base_profile() -> AgentProfile {
