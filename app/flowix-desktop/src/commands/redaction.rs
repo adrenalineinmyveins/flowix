@@ -139,6 +139,20 @@ fn load_words() -> Result<Vec<CustomWord>, String> {
     Ok(read_words_from(&redaction_dir()?))
 }
 
+/// F6 管线（crate::redaction::preview_full）取配置：读不到文件时全默认值。
+pub(crate) fn redaction_config_for_pipeline() -> RedactionConfig {
+    redaction_dir()
+        .map(|dir| read_config_from(&dir))
+        .unwrap_or_default()
+}
+
+/// F6 管线取自定义词表：文件缺失/不可读时为空表。
+pub(crate) fn redaction_words_for_pipeline() -> Vec<CustomWord> {
+    redaction_dir()
+        .map(|dir| read_words_from(&dir))
+        .unwrap_or_default()
+}
+
 #[tauri::command]
 pub fn redaction_config_get() -> Result<RedactionConfig, String> {
     load_config()
@@ -157,12 +171,13 @@ pub fn redaction_config_set(config: RedactionConfig) -> Result<RedactionConfig, 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RedactionPreview {
-    pub report: RedactionReport,
+    pub report: flowix_redaction::RedactionReport,
     pub word_count: usize,
 }
 
+/// M1 诊断切片：文本直跑 L1 规则（不进 L0/L2 管线），供前端调试词表与规则。
 #[tauri::command]
-pub fn redaction_preview(text: String) -> Result<RedactionPreview, String> {
+pub fn redaction_l1_preview(text: String) -> Result<RedactionPreview, String> {
     if text.trim().is_empty() {
         return Err("TEXT_REQUIRED".to_string());
     }
@@ -173,13 +188,47 @@ pub fn redaction_preview(text: String) -> Result<RedactionPreview, String> {
         rewrite_absolute_time: config.rewrite_absolute_time,
         now: config
             .rewrite_absolute_time
-            .then(chrono::Local::now).map(|now| now.date_naive()),
+            .then(chrono::Local::now)
+            .map(|now| now.date_naive()),
     };
     let report = flowix_redaction::redact(&text, &options, &words);
     Ok(RedactionPreview {
         report,
         word_count: words.len(),
     })
+}
+
+/// 完整 preview 管线（规格 §5.3）：L0 组装（scope 白名单）→ L1 规则脱敏 →
+/// L2 蒸馏（DSH agent 会话）→ L3 复扫回炉。返回未确认态报告；
+/// 错误码 scope_empty / payload_too_large / distill_failed /
+/// rule_hit_after_distill / placeholder_broken / invalid_level。
+#[tauri::command]
+pub async fn redaction_preview(
+    app_handle: tauri::AppHandle,
+    cwd: String,
+    question: String,
+    scope_entry_ids: Vec<String>,
+    target_level: String,
+) -> Result<crate::redaction::RedactionPreviewReport, String> {
+    if question.trim().is_empty() {
+        return Err("QUESTION_REQUIRED".to_string());
+    }
+    let root = Path::new(&cwd);
+    if !root.is_absolute() || !root.is_dir() {
+        return Err("INVALID_CWD".to_string());
+    }
+    if !REDACTION_LEVELS.contains(&target_level.as_str()) {
+        return Err(format!("INVALID_LEVEL:{target_level}"));
+    }
+    crate::redaction::preview_full(
+        &app_handle,
+        &cwd,
+        &question,
+        &scope_entry_ids,
+        &target_level,
+    )
+    .await
+    .map_err(|error| error.to_ipc_error())
 }
 
 #[cfg(test)]
@@ -287,8 +336,8 @@ mod tests {
     }
 
     #[test]
-    fn preview_rejects_empty_text() {
-        let err = redaction_preview("   ".to_string()).unwrap_err();
+    fn l1_preview_rejects_empty_text() {
+        let err = redaction_l1_preview("   ".to_string()).unwrap_err();
         assert_eq!(err, "TEXT_REQUIRED");
     }
 }

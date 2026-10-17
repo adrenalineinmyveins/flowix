@@ -7,6 +7,7 @@
 mod runner;
 
 pub use runner::spawn_worker;
+pub(crate) use runner::run_distill_once;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

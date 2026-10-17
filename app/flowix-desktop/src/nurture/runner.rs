@@ -186,8 +186,15 @@ async fn run_inner(
     } else {
         profile.agent_type.clone()
     };
-    let (answer, thread_id_for_state) =
-        run_distill_once(app, &state, &notebook_root, &prompt, &agent_type).await?;
+    let (answer, thread_id_for_state) = run_distill_once(
+        app,
+        &state,
+        &notebook_root,
+        &prompt,
+        &agent_type,
+        "nurture:distill",
+    )
+    .await?;
 
     // 5. 解析与校验。
     let output = parse_nurture_output(&answer)?;
@@ -257,13 +264,14 @@ fn find_first_profile(root: &Path) -> Result<Option<(AgentProfile, String)>, Str
 /// threadId 供调用方做运行状态记账（线程本身已删除）。
 ///
 /// 线程模式与 `plugin_run` 一致：create → listen stream_end → dispatch →
-/// 读输出 → 删除线程。
-async fn run_distill_once(
+/// 读输出 → 删除线程。F6 脱敏蒸馏共用（title 区分审计来源）。
+pub(crate) async fn run_distill_once(
     app: &AppHandle,
     state: &AppState,
     notebook_root: &Path,
     prompt: &str,
     agent_type: &str,
+    title: &str,
 ) -> Result<(String, String), String> {
     let runtime = crate::agent_external::runtime_registry::ExternalRuntimeKind::parse(agent_type)
         .map_err(|e| format!("agent_type_invalid: {e}"))?;
@@ -273,7 +281,7 @@ async fn run_distill_once(
         .thread_manager
         .create_thread(
             crate::agent_types::default_agent_id(),
-            "nurture:distill".to_string(),
+            title.to_string(),
         )
         .await
         .map_err(|e| format!("create thread: {e}"))?;
@@ -309,7 +317,7 @@ async fn run_distill_once(
         permission_mode: None,
         codex_model: None,
         codex_reasoning_effort: None,
-        conversation_title: Some("nurture:distill".into()),
+        conversation_title: Some(title.to_string()),
     };
 
     let (stream_end_tx, mut stream_end_rx) = tokio::sync::mpsc::unbounded_channel();

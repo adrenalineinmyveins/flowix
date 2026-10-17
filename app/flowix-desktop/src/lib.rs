@@ -29,6 +29,7 @@ mod memo_events;
 mod nurture;
 mod plugin;
 mod process_window;
+mod redaction;
 mod runtime_log;
 #[cfg(windows)]
 mod runtime_state;

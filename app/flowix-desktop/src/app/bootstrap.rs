@@ -469,6 +469,7 @@ pub fn run() {
             commands::skill::skill_usage_summary,
             commands::redaction::redaction_config_get,
             commands::redaction::redaction_config_set,
+            commands::redaction::redaction_l1_preview,
             commands::redaction::redaction_preview,
             commands::artifact::artifact_resolve,
             commands::settings::get_preference,
