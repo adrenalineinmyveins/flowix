@@ -1,13 +1,12 @@
-//! F2 喂养管道 N1 骨架：触发器 + 合并调度器 + 留痕。
+//! F2 喂养管道：触发器 + 合并调度器 + N2 取材/蒸馏 + N3 写回核心。
 //!
-//! 只覆盖 F2 详细设计 v2.0 §3.1/§3.2 的 N1 范围：事件分发、路径与 scope
-//! 双过滤、阈值计数、coalescing 调度与 skip/failed 留痕。取材、蒸馏与写回
-//! 属 N2/N3，不在本模块。
-//!
-//! 骨架阶段：`start_trigger`/`start_scheduler` 待 AppState 接线，`source`/
-//! `updated_at`/`NurtureState` 等字段为 N2/N3 预留，故整体允许 dead_code。
+//! 覆盖 F2 详细设计 v2.0 §3.1–§3.5：事件分发、路径与 scope 双过滤、阈值
+//! 计数、coalescing 调度、留痕；取材/提示词/解析/写回的纯逻辑在本模块，
+//! 运行编排（agent run + 线程管理）在 [`runner`] 子模块。
 
-#![allow(dead_code)]
+mod runner;
+
+pub use runner::spawn_worker;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -19,6 +18,10 @@ use crate::config::access::{AgentAccessEntry, AgentAccessKind};
 use crate::memo_events::MemoChangeSource;
 
 /// 触发器收到的事件，由 `memo_events::emit` 主路径派生并分发。
+///
+/// `source` / `updated_at` 为 N3 完整版预留（来源白名单与事件级水位对账），
+/// 当前过滤只依赖路径与标签。
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct NurtureTriggerEvent {
     pub source: MemoChangeSource,
@@ -44,21 +47,22 @@ pub fn dispatch_trigger_event(event: NurtureTriggerEvent) {
     let _ = trigger_channel().send(event);
 }
 
-/// 启动触发器订阅 task。`scopes_provider` 每次事件时被调用，返回该
-/// notebook 的授权条目（Notebook/Folder/Tag）。
-///
-/// 待 N1 集成接线：需从 AppState 注入 AgentAccessStore 闭包后在 bootstrap
-/// 中 spawn，当前 N1 骨架阶段未接线，故标记允许 dead_code。
-#[allow(dead_code)]
-pub fn start_trigger<F>(scopes_provider: F) -> tokio::task::JoinHandle<()>
-where
-    F: Fn(&str) -> Vec<AgentAccessEntry> + Send + Sync + 'static,
-{
+/// 启动触发器订阅 task：每次事件从 AppState 解析该 notebook 的授权条目
+/// 与根路径，过滤后计数入队。由 bootstrap 调用一次。
+pub fn start_trigger(app: tauri::AppHandle) -> tokio::task::JoinHandle<()> {
     let mut rx = trigger_channel().subscribe();
     tokio::spawn(async move {
         while let Ok(event) = rx.recv().await {
-            let scopes = scopes_provider(&event.notebook_id);
-            if !should_accept_event(&event.relative_path, &event.tags, &scopes) {
+            let Some((notebook_root, scopes)) = notebook_scopes(&app, &event.notebook_id)
+            else {
+                continue;
+            };
+            if !should_accept_event_in_notebook(
+                notebook_root.as_deref(),
+                &event.relative_path,
+                &event.tags,
+                &scopes,
+            ) {
                 continue;
             }
             let mut sched = scheduler().lock().unwrap_or_else(|e| e.into_inner());
@@ -67,12 +71,34 @@ where
     })
 }
 
-/// 纯函数：路径 + scope 双过滤。
+/// 解析某 notebook 的（根路径, enabled 授权条目）。
+fn notebook_scopes(
+    app: &tauri::AppHandle,
+    notebook_id: &str,
+) -> Option<(Option<String>, Vec<AgentAccessEntry>)> {
+    use tauri::Manager;
+    let state = app.try_state::<crate::app::state::AppState>()?;
+    let memo_file = crate::lock_utils::read_lock(&state.memo_file, "memo_file");
+    let notebook_root = memo_file
+        .get_notebook_config_by_id(notebook_id)
+        .map(|config| config.path);
+    let entries: Vec<AgentAccessEntry> = state
+        .agent_access
+        .get_config()
+        .entries
+        .into_iter()
+        .filter(|entry| entry.enabled)
+        .collect();
+    Some((notebook_root, entries))
+}
+
+/// 纯函数：路径 + scope 双过滤（事件路径以 notebook 根解析后匹配）。
 ///
-/// 返回 false 表示该事件不应进入喂养计数。第一条闸：`.agents/` 与
-/// `.flowix/` 路径直接丢弃（防写回自身产物触发循环）。第二条闸：事件路径
-/// 必须命中至少一个 enabled 授权条目。
-pub fn should_accept_event(
+/// `notebook_root` 为 None 时退化为相对路径匹配（供单测）。第一条闸：
+/// `.agents/` 与 `.flowix/` 相对路径直接丢弃（防写回自身产物触发循环）。
+/// 第二条闸：事件必须命中至少一个 enabled 授权条目。
+pub fn should_accept_event_in_notebook(
+    notebook_root: Option<&str>,
     relative_path: &str,
     tags: &[String],
     scopes: &[AgentAccessEntry],
@@ -80,22 +106,40 @@ pub fn should_accept_event(
     if relative_path.starts_with(".agents/") || relative_path.starts_with(".flowix/") {
         return false;
     }
+    let absolute = notebook_root
+        .map(|root| format!("{}/{}", root.trim_end_matches('/'), relative_path));
     scopes
         .iter()
         .filter(|entry| entry.enabled)
-        .any(|entry| entry_matches(entry, relative_path, tags))
+        .any(|entry| entry_matches(entry, relative_path, absolute.as_deref(), tags))
 }
 
-fn entry_matches(entry: &AgentAccessEntry, relative_path: &str, tags: &[String]) -> bool {
+/// 纯函数：绝对路径形式的过滤（仅供单测，生产路径走
+/// `should_accept_event_in_notebook`）。
+#[cfg(test)]
+pub fn should_accept_event(
+    relative_path: &str,
+    tags: &[String],
+    scopes: &[AgentAccessEntry],
+) -> bool {
+    should_accept_event_in_notebook(None, relative_path, tags, scopes)
+}
+
+fn entry_matches(
+    entry: &AgentAccessEntry,
+    relative_path: &str,
+    absolute_path: Option<&str>,
+    tags: &[String],
+) -> bool {
     match entry.kind {
         AgentAccessKind::Notebook => true,
         AgentAccessKind::Folder => {
             let prefix = entry.path.trim_end_matches(['/', '\\']);
-            relative_path.starts_with(prefix)
-                && relative_path
-                    .get(prefix.len()..)
-                    .map(|rest| rest.starts_with('/') || rest.is_empty())
-                    .unwrap_or(true)
+            // Folder 授权存绝对路径；事件以解析出的绝对路径前缀匹配，
+            // 无根路径时退化为相对匹配（仅单测场景）。
+            absolute_path
+                .map(|absolute| path_has_prefix(absolute, prefix))
+                .unwrap_or_else(|| path_has_prefix(relative_path, prefix))
         }
         AgentAccessKind::Tag => {
             let Some(tag_path) = entry.tag_path.as_deref() else {
@@ -112,21 +156,28 @@ fn entry_matches(entry: &AgentAccessEntry, relative_path: &str, tags: &[String])
     }
 }
 
+fn path_has_prefix(path: &str, prefix: &str) -> bool {
+    path.starts_with(prefix)
+        && path
+            .get(prefix.len()..)
+            .map(|rest| rest.starts_with('/') || rest.is_empty())
+            .unwrap_or(true)
+}
+
 // ---------------------------------------------------------------------------
 // 调度器（coalescing worker，对照 document_derived.rs 模式）
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
 struct Scheduler {
-    running: bool,
     counters: BTreeMap<String, usize>, // agent_id -> 素材计数
     jobs: BTreeMap<String, Job>,       // agent_id -> Job
 }
 
-struct Job {
-    notebook_id: String,
-    agent_id: String,
-    manual: bool,
+pub(crate) struct Job {
+    pub(crate) notebook_id: String,
+    pub(crate) agent_id: String,
+    pub(crate) manual: bool,
 }
 
 fn scheduler() -> &'static Mutex<Scheduler> {
@@ -137,8 +188,8 @@ fn scheduler() -> &'static Mutex<Scheduler> {
 impl Scheduler {
     /// 计数并判断是否达阈值。达阈值清零并入队，返回 true 表示已入队。
     fn count_and_enqueue(&mut self, event: NurtureTriggerEvent, manual: bool) -> bool {
-        // N1 骨架：agent_id 暂用 notebook_id 派生占位，真实映射在 F1/F2
-        // 全量接线时替换为「scope 覆盖该笔记的所有 agent」。
+        // agent_id 暂用 notebook_id 派生占位，真实「scope 覆盖该笔记的所有
+        // agent」映射随 F1 agentPresets 接线替换；runner 侧再解析真实目标。
         let agent_id = format!("nurture:{}", event.notebook_id);
         let counter = self.counters.entry(agent_id.clone()).or_insert(0);
         *counter += 1;
@@ -161,29 +212,23 @@ impl Scheduler {
 
 const DEFAULT_THRESHOLD: usize = 10;
 
-/// 调度器工作循环入口。由 bootstrap 调用，spawn 单循环消费 jobs。
-///
-/// 待 N1 集成接线：需从 AppState 派生 nurture-log 目录后 spawn，当前 N1
-/// 骨架阶段未接线，故标记允许 dead_code。
-#[allow(dead_code)]
-pub fn start_scheduler<F>(log_dir: F) -> tokio::task::JoinHandle<()>
-where
-    F: Fn(&str) -> PathBuf + Send + Sync + 'static,
-{
-    tokio::spawn(async move {
-        loop {
-            let job = {
-                let mut sched = scheduler().lock().unwrap_or_else(|e| e.into_inner());
-                sched.pop_next()
-            };
-            let Some(job) = job else {
-                tokio::task::yield_now().await;
-                continue;
-            };
-            // N1 骨架：跳过判断与留痕。无实际取材/蒸馏。
-            append_log(&log_dir(&job.agent_id), &NurtureLogLine::skipped("no_material"));
-        }
-    })
+/// 手动入队一个喂养 job（跳过阈值与间隔检查）。供 IPC `nurture_run_now`。
+pub fn enqueue_manual(notebook_id: &str) {
+    let mut sched = scheduler().lock().unwrap_or_else(|e| e.into_inner());
+    sched.jobs.insert(
+        format!("nurture:{notebook_id}"),
+        Job {
+            notebook_id: notebook_id.to_string(),
+            agent_id: format!("nurture:{notebook_id}"),
+            manual: true,
+        },
+    );
+}
+
+/// 弹出下一个待执行 job。无 job 返回 None。由 runner 工作循环调用。
+pub(crate) fn pop_next_job() -> Option<Job> {
+    let mut sched = scheduler().lock().unwrap_or_else(|e| e.into_inner());
+    sched.pop_next()
 }
 
 // ---------------------------------------------------------------------------

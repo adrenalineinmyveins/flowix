@@ -323,6 +323,13 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 session_manager.run_session_service().await;
             });
+            // F2 喂养管道：触发器订阅（memo-event → 过滤计数）+ 工作循环
+            // （job → 取材蒸馏写回）。fire-and-forget，失败只留痕不阻塞启动。
+            {
+                let nurture_app = app.handle().clone();
+                let _ = crate::nurture::start_trigger(nurture_app.clone());
+                crate::nurture::spawn_worker(nurture_app);
+            }
             external_runtimes.listen_for_terminal_events(app.handle());
             if let Some(window) = app.get_webview_window("main") {
                 // �?��即�?齐主题背�?��, 消除冷启动白�?(尤其深色主�?)�?
@@ -450,6 +457,7 @@ pub fn run() {
             commands::agent_profile::agent_profile_create,
             commands::agent_profile::agent_profile_update,
             commands::agent_profile::agent_profile_delete,
+            commands::agent_profile::nurture_run_now,
             commands::skill::skill_registry_list,
             commands::skill::skill_set_publish_state,
             commands::skill::skill_usage_summary,

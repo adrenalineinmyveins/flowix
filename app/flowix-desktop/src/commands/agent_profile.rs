@@ -63,6 +63,33 @@ fn read_profile(root: &Path, agent_id: &str) -> Result<AgentProfile, String> {
     Ok(profile)
 }
 
+/// 读取 profile.md 原文（供喂养 runner 做读改写）。
+pub(crate) fn read_profile_content(root: &Path, agent_id: &str) -> Result<String, String> {
+    let path = profile_path(root, agent_id);
+    reject_symlink(&path, "profile.md")?;
+    fs::read_to_string(&path).map_err(|error| format!("读取 profile.md 失败: {error}"))
+}
+
+/// 原子写回 profile.md 内容（供喂养 runner 复用）。
+pub(crate) fn write_profile_content(
+    root: &Path,
+    agent_id: &str,
+    content: &str,
+) -> Result<(), String> {
+    let path = profile_path(root, agent_id);
+    ensure_inside(root, &path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "profile.md 缺少父目录".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| format!("创建 Agent 目录失败: {error}"))?;
+    reject_symlink(&path, "profile.md")?;
+    let temporary = parent.join(".profile.md.flowix-tmp");
+    reject_symlink(&temporary, "profile 临时文件")?;
+    fs::write(&temporary, content.as_bytes())
+        .map_err(|error| format!("写入 profile 临时文件失败: {error}"))?;
+    fs::rename(&temporary, &path).map_err(|error| format!("替换 profile.md 失败: {error}"))
+}
+
 fn write_profile(root: &Path, profile: &AgentProfile, body: &str) -> Result<(), String> {
     let path = profile_path(root, &profile.agent_id);
     ensure_inside(root, &path)?;
@@ -202,6 +229,14 @@ pub fn agent_profile_delete(cwd: String, agent_id: String) -> Result<(), String>
             let _ = fs::remove_dir(parent);
         }
     }
+    Ok(())
+}
+
+/// 手动触发一次喂养（跳过阈值与间隔检查，豁免暂停由 runner 判断）。
+/// 异步执行，进度经 nurture-log 与日志可观测。
+#[tauri::command]
+pub fn nurture_run_now(notebook_id: String) -> Result<(), String> {
+    crate::nurture::enqueue_manual(&notebook_id);
     Ok(())
 }
 
