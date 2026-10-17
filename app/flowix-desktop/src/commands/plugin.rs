@@ -69,8 +69,10 @@ pub fn plugin_prepare_prompt(
     plugin_id: String,
     user_prompt: String,
     context: String,
+    params: Option<Vec<(String, String)>>,
 ) -> Result<String, String> {
-    plugin::prepare_prompt(&plugin_id, &user_prompt, &context)
+    let params = params.unwrap_or_default();
+    plugin::prepare_prompt(&plugin_id, &user_prompt, &context, &params)
 }
 
 #[tauri::command]
@@ -81,11 +83,13 @@ pub async fn plugin_run(
     agent_type: String,
     notebook_path: String,
     source_note: Option<String>,
+    params: Option<Vec<(String, String)>>,
     state: State<'_, AppState>,
     app_handle: AppHandle,
 ) -> Result<plugin::PluginRunStarted, String> {
     let agent_type = plugin::resolve_agent_type(&plugin_id, &agent_type)?;
-    let prepared = plugin::prepare_prompt(&plugin_id, &user_prompt, &context)?;
+    let params = params.unwrap_or_default();
+    let prepared = plugin::prepare_prompt(&plugin_id, &user_prompt, &context, &params)?;
     let run_id = plugin::new_run_id();
     if !state
         .plugin_runs

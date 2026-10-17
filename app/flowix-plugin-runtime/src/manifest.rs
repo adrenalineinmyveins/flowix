@@ -32,6 +32,26 @@ pub struct PluginManifest {
     #[serde(default)]
     pub integrity: Option<PluginIntegrity>,
     pub output: PluginOutput,
+    /// schema v3：P2 知识绑定（tag-path 数组，运行时按 scope 检索注入）。
+    #[serde(default)]
+    pub knowledge_scope: Vec<String>,
+    /// schema v3：P4 工具授权（read/write/confirm 三档 + allowlist）。
+    #[serde(default)]
+    pub tool_grants: Vec<PluginToolGrant>,
+    /// schema v3：F6 联动——网络咨询时该技能允许的最高披露等级。
+    #[serde(default)]
+    pub min_redaction_level: Option<String>,
+}
+
+/// P4 工具授权声明。`tool` 白名单：flowix.memo / flowix.notebook / shell /
+/// artifact；`access` ∈ read | write | confirm（confirm 走 DSH approval）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginToolGrant {
+    pub tool: String,
+    pub access: String,
+    #[serde(default)]
+    pub allowlist: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,9 +201,13 @@ pub struct PluginDiscovery {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PluginExecution {
     #[serde(default)]
     pub runtime: Option<String>,
+    /// schema v3：单次运行 token 预算上限（超限取消并留痕）。
+    #[serde(default)]
+    pub budget_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -208,6 +232,66 @@ pub struct PluginOutput {
     pub parser: String,
 }
 
+/// schema v3 专属校验：知识绑定 / 工具授权 / 披露等级 / 预算。
+///
+/// v1/v2 清单的新字段经 serde default 为空，本函数不运行（U12 兼容）。
+fn validate_manifest_v3(manifest: &PluginManifest) -> Result<(), String> {
+    for tag in &manifest.knowledge_scope {
+        if !looks_like_tag_path(tag) {
+            return Err(format!(
+                "plugin knowledgeScope entry is not a tag path: {tag}"
+            ));
+        }
+    }
+    let mut granted = HashSet::new();
+    for grant in &manifest.tool_grants {
+        if !matches!(
+            grant.tool.as_str(),
+            "flowix.memo" | "flowix.notebook" | "shell" | "artifact"
+        ) {
+            return Err(format!("unsupported plugin tool grant: {}", grant.tool));
+        }
+        if !matches!(grant.access.as_str(), "read" | "write" | "confirm") {
+            return Err(format!(
+                "unsupported tool grant access '{}': {}",
+                grant.access, grant.tool
+            ));
+        }
+        if !granted.insert(grant.tool.as_str()) {
+            return Err(format!("duplicate tool grant: {}", grant.tool));
+        }
+        if grant.tool == "shell" && grant.access == "confirm" && grant.allowlist.is_empty() {
+            return Err("shell confirm grant requires a non-empty allowlist".into());
+        }
+        for entry in &grant.allowlist {
+            if entry.trim().is_empty() {
+                return Err(format!("tool grant allowlist has an empty entry: {}", grant.tool));
+            }
+        }
+    }
+    if let Some(level) = &manifest.min_redaction_level {
+        if !matches!(level.as_str(), "R1" | "R2" | "R3") {
+            return Err(format!("unsupported minRedactionLevel: {level}"));
+        }
+    }
+    if let Some(budget) = manifest.execution.budget_tokens {
+        if budget == 0 {
+            return Err("plugin execution budgetTokens must be positive".into());
+        }
+    }
+    Ok(())
+}
+
+/// 轻量 tag-path 形状检查（完整归一化在 desktop 侧走 flowix-core 的
+/// `normalize_tag_path`，此 crate 不依赖 core）。
+fn looks_like_tag_path(raw: &str) -> bool {
+    !raw.trim().is_empty()
+        && !raw.starts_with('/')
+        && !raw.ends_with('/')
+        && !raw.contains("//")
+        && !raw.contains(char::is_whitespace)
+}
+
 pub fn valid_plugin_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
@@ -227,11 +311,14 @@ pub fn is_relative_plugin_path(raw: &str) -> bool {
 }
 
 pub fn validate_manifest(manifest: &PluginManifest) -> Result<PluginDefinition, String> {
-    if !matches!(manifest.schema_version, 1 | 2) {
+    if !matches!(manifest.schema_version, 1 | 2 | 3) {
         return Err(format!(
             "unsupported plugin schema version: {}",
             manifest.schema_version
         ));
+    }
+    if manifest.schema_version >= 3 {
+        validate_manifest_v3(manifest)?;
     }
     if !valid_plugin_id(&manifest.id) {
         return Err("plugin id must use lowercase letters, numbers, '-' or '_'".into());

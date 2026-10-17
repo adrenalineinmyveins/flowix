@@ -13,6 +13,7 @@ mod apple_sign_in;
 mod artifact;
 mod cli_link;
 mod commands;
+mod consult;
 pub mod config;
 mod connection_probe;
 mod device_registration;

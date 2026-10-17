@@ -838,8 +838,144 @@ mod tests {
         parse_mindmap_input, parse_webpage_input, serialize_artifact_document,
         CreateArtifactRequest,
     };
+    use super::manifest::{
+        validate_manifest, PluginAgent, PluginEngines, PluginExecution, PluginInput,
+        PluginManifest, PluginOutput, PluginToolGrant, PluginUi,
+    };
     use flowix_core::memo_file::{MemoFile, NotebookConfig};
     use std::path::Path;
+
+    fn base_v3_manifest() -> PluginManifest {
+        PluginManifest {
+            schema_version: 3,
+            id: "demo".into(),
+            name: "Demo".into(),
+            version: "1.0.0".into(),
+            kind: "agent-markdown".into(),
+            ui: PluginUi {
+                placement: "sidebar".into(),
+                order: 0,
+                icon: "star".into(),
+            },
+            input: PluginInput {
+                fields: vec![],
+                prompt: None,
+                agent_type: None,
+            },
+            agent: Some(PluginAgent {
+                skill: "SKILL.md".into(),
+            }),
+            tool: None,
+            discovery: Default::default(),
+            execution: PluginExecution::default(),
+            engines: PluginEngines::default(),
+            permissions: vec![],
+            integrity: None,
+            output: PluginOutput {
+                format: "markdown".into(),
+                directory: "out".into(),
+                extension: "md".into(),
+                renderer: "text".into(),
+                parser: "markdown".into(),
+            },
+            knowledge_scope: vec![],
+            tool_grants: vec![],
+            min_redaction_level: None,
+        }
+    }
+
+    #[test]
+    fn v3_manifest_with_valid_extensions_passes() {
+        let mut manifest = base_v3_manifest();
+        manifest.knowledge_scope = vec!["finance/财报".into(), "industry".into()];
+        manifest.tool_grants = vec![PluginToolGrant {
+            tool: "flowix.memo".into(),
+            access: "read".into(),
+            allowlist: vec![],
+        }];
+        manifest.min_redaction_level = Some("R2".into());
+        manifest.execution.budget_tokens = Some(50_000);
+        assert!(validate_manifest(&manifest).is_ok());
+    }
+
+    #[test]
+    fn v3_rejects_bad_knowledge_scope_and_grants() {
+        let mut manifest = base_v3_manifest();
+        manifest.knowledge_scope = vec!["/leading-slash".into()];
+        assert!(validate_manifest(&manifest).is_err());
+
+        let mut manifest = base_v3_manifest();
+        manifest.tool_grants = vec![PluginToolGrant {
+            tool: "shell.exec".into(),
+            access: "read".into(),
+            allowlist: vec![],
+        }];
+        assert!(validate_manifest(&manifest)
+            .unwrap_err()
+            .contains("unsupported plugin tool grant"));
+
+        let mut manifest = base_v3_manifest();
+        manifest.tool_grants = vec![PluginToolGrant {
+            tool: "shell".into(),
+            access: "confirm".into(),
+            allowlist: vec![],
+        }];
+        assert!(validate_manifest(&manifest)
+            .unwrap_err()
+            .contains("non-empty allowlist"));
+
+        let mut manifest = base_v3_manifest();
+        manifest.tool_grants = vec![
+            PluginToolGrant { tool: "artifact".into(), access: "write".into(), allowlist: vec![] },
+            PluginToolGrant { tool: "artifact".into(), access: "read".into(), allowlist: vec![] },
+        ];
+        assert!(validate_manifest(&manifest).unwrap_err().contains("duplicate tool grant"));
+    }
+
+    #[test]
+    fn v3_rejects_bad_redaction_level_and_budget() {
+        let mut manifest = base_v3_manifest();
+        manifest.min_redaction_level = Some("R9".into());
+        assert!(validate_manifest(&manifest).is_err());
+
+        let mut manifest = base_v3_manifest();
+        manifest.execution.budget_tokens = Some(0);
+        assert!(validate_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn v1_v2_manifests_still_validate_with_absent_v3_fields() {
+        let mut manifest = base_v3_manifest();
+        manifest.schema_version = 2;
+        manifest.version = "0.1.0".into();
+        // v3 字段即使被误填非法值也不校验（v1/v2 语义不变）。
+        manifest.min_redaction_level = Some("R9".into());
+        assert!(validate_manifest(&manifest).is_ok());
+    }
+
+    #[test]
+    fn v3_fields_round_trip_through_json() {
+        let mut manifest = base_v3_manifest();
+        manifest.knowledge_scope = vec!["finance/财报".into()];
+        manifest.tool_grants = vec![PluginToolGrant {
+            tool: "shell".into(),
+            access: "confirm".into(),
+            allowlist: vec!["git status".into()],
+        }];
+        manifest.min_redaction_level = Some("R3".into());
+        manifest.execution.budget_tokens = Some(1000);
+        let encoded = serde_json::to_string(&manifest).unwrap();
+        assert!(encoded.contains("\"knowledgeScope\""));
+        assert!(encoded.contains("\"toolGrants\""));
+        assert!(encoded.contains("\"minRedactionLevel\""));
+        assert!(encoded.contains("\"budgetTokens\""));
+        let decoded: PluginManifest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.knowledge_scope, manifest.knowledge_scope);
+        assert_eq!(decoded.tool_grants.len(), 1);
+        assert_eq!(decoded.tool_grants[0].allowlist, vec!["git status".to_string()]);
+        assert_eq!(decoded.min_redaction_level.as_deref(), Some("R3"));
+        assert_eq!(decoded.execution.budget_tokens, Some(1000));
+    }
 
     #[test]
     fn accepts_one_root() {

@@ -34,6 +34,7 @@ pub mod artifact;
 pub mod boot;
 pub mod cli;
 pub mod cloud;
+pub mod consult;
 pub mod dialog;
 pub mod dsh;
 pub mod export;
