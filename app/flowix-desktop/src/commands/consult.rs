@@ -22,16 +22,23 @@ pub fn consult_initiate(
     cwd: String,
     from_agent_id: String,
     to_agent_id: String,
+    question: String,
     token_budget: Option<u64>,
+    app_handle: tauri::AppHandle,
 ) -> Result<ConsultMeta, String> {
     let root = notebook_root(&cwd)?;
+    if question.trim().is_empty() {
+        return Err("QUESTION_REQUIRED".to_string());
+    }
     consult::initiate_consult(
+        &app_handle,
         &root,
         ConsultRequest {
             from_agent_id,
             to_agent_id,
             token_budget,
         },
+        question,
     )
 }
 

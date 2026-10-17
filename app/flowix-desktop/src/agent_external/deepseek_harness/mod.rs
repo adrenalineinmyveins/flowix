@@ -15,5 +15,6 @@ mod transport;
 
 pub use config::resolve_runtime_config;
 pub use manager::{DeepSeekHarnessManager, DeepSeekHarnessSessionUsage};
+pub(crate) use transport::DshClient;
 
 pub const AGENT_TYPE: &str = "deepseek-harness";

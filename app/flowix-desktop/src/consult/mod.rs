@@ -1,11 +1,12 @@
-//! F4 本机 Agent 协作：咨询信箱、预算护栏与咨询元数据（可测核心）。
+//! F4 本机 Agent 协作：咨询信箱、预算护栏、咨询元数据与编排。
 //!
-//! 覆盖 AGENT-LOCAL-CONSULT §3.5/§3.3/§5 的纯逻辑与数据面：事件队列
-//! （seq 递增、断线重放、上限 100）、预算判定（used vs limit）、
-//! `consults/<id>.json` 元数据与 `events.jsonl` 留痕、发起前校验
-//! （profile 存在 + consultable）。subagent spawn 编排依赖 desktop →
-//! DSH appserver 的方法调用通道（C-M1 运行时部分），当前未接线——
-//! `initiate_consult` 建档后停留在 pending 状态，通道就绪后由编排器消费。
+//! 覆盖 AGENT-LOCAL-CONSUST §3.1–§3.5：事件队列（seq 递增、断线重放、
+//! 上限 100）、预算判定、`consults/<id>.json` 元数据与 `events.jsonl`
+//! 留痕、发起前校验（profile 存在 + consultable）。编排经 deepseek_harness
+//! 的 stdio JSON-RPC 主机调用 `thread/subagent/*`（B 是 A 的子线程，天然
+//! 受 maxDepth=4 / maxChildren=16 约束）。
+
+pub mod orchestrator;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
@@ -247,20 +248,43 @@ pub fn validate_request(
     Ok((to_profile, budget))
 }
 
-/// 建档：生成 consultId、写元数据、建内存信箱并推 Started。
-/// subagent spawn 编排未接线前，状态停留在 Pending。
-pub fn initiate_consult(
+/// 组装给 B 的咨询提示词（简版 context builder，设计 §3.2）。
+///
+/// 素材注入（发起方 disclosure_scope 内笔记围栏化）属 C-M1 完整版；
+/// 本版注入 B 的专长画像与问题，供子线程冷启动。
+pub fn build_consult_prompt(
+    to_profile: &AgentProfile,
+    from_display_name: &str,
+    question: &str,
+) -> String {
+    let expertise = if to_profile.expertise.is_empty() {
+        "（未声明）".to_string()
+    } else {
+        to_profile.expertise.join(", ")
+    };
+    format!(
+        "你是 Agent「{}」，专长：{}。\n\
+另一位 Agent「{}」向你咨询。\n\n\
+<question>\n{}\n</question>\n\n\
+请基于你的专长作答。回答将作为咨询结果返回给咨询方。",
+        to_profile.display_name, expertise, from_display_name, question.trim()
+    )
+}
+
+/// 建档（无运行时依赖，供测试）：校验 → 元数据 → 信箱 → prompt。
+pub fn register_consult(
     notebook_root: &Path,
-    request: ConsultRequest,
-) -> Result<ConsultMeta, String> {
-    let (_to_profile, budget) = validate_request(notebook_root, &request)?;
+    request: &ConsultRequest,
+    question: &str,
+) -> Result<(ConsultMeta, String), String> {
+    let (to_profile, budget) = validate_request(notebook_root, request)?;
     let consult_id = format!("cst_{}", uuid::Uuid::new_v4().simple());
     let now = chrono::Utc::now().timestamp_millis();
     let meta = ConsultMeta {
         version: 1,
         consult_id: consult_id.clone(),
-        from_agent_id: request.from_agent_id,
-        to_agent_id: request.to_agent_id,
+        from_agent_id: request.from_agent_id.clone(),
+        to_agent_id: request.to_agent_id.clone(),
         status: ConsultStatus::Pending,
         created_at: now,
         updated_at: now,
@@ -270,11 +294,35 @@ pub fn initiate_consult(
     };
     write_consult_meta(notebook_root, &meta);
     push_event(&consult_id, ConsultEvent::Started { material_count: 0 });
-    tracing::info!(
-        consult_id = %consult_id,
-        "consult registered (orchestrator spawn pending DSH method channel)"
-    );
+    let from_display_name = read_display_name(notebook_root, &request.from_agent_id)
+        .unwrap_or_else(|| request.from_agent_id.clone());
+    let prompt = build_consult_prompt(&to_profile, &from_display_name, question);
+    Ok((meta, prompt))
+}
+
+/// 建档并 spawn 编排 task：register → 异步跑完整周期。
+pub fn initiate_consult(
+    app: &tauri::AppHandle,
+    notebook_root: &Path,
+    request: ConsultRequest,
+    question: String,
+) -> Result<ConsultMeta, String> {
+    let (meta, prompt) = register_consult(notebook_root, &request, &question)?;
+    let app = app.clone();
+    let root = notebook_root.to_path_buf();
+    let meta_for_task = meta.clone();
+    tauri::async_runtime::spawn(async move {
+        orchestrator::orchestrate(&app, &root, meta_for_task, prompt).await;
+    });
     Ok(meta)
+}
+
+fn read_display_name(notebook_root: &Path, agent_id: &str) -> Option<String> {
+    let content = std::fs::read_to_string(
+        notebook_root.join(".agents").join(agent_id).join("profile.md"),
+    )
+    .ok()?;
+    AgentProfile::parse(&content).ok().map(|(profile, _)| profile.display_name)
 }
 
 #[cfg(test)]
@@ -391,23 +439,52 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.starts_with("BUDGET_INVALID"), "{err}");
-        // 合法发起：建档 + 信箱有 Started。
-        let meta = initiate_consult(
+        // 合法发起：建档 + 信箱有 Started + prompt 含问题与专长。
+        let (meta, prompt) = register_consult(
             root,
-            ConsultRequest {
+            &ConsultRequest {
                 from_agent_id: "agt_a".into(),
                 to_agent_id: "agt_b".into(),
                 token_budget: Some(1234),
             },
+            "复购率下滑怎么归因？",
         )
         .unwrap();
         assert_eq!(meta.status, ConsultStatus::Pending);
+        assert_eq!(meta.token_budget, 1234);
         assert!(read_consult_meta(root, "agt_a", &meta.consult_id).is_some());
         assert_eq!(latest_seq(&meta.consult_id), 1);
         assert!(matches!(
             events_after(&meta.consult_id, 0)[0].1,
             ConsultEvent::Started { .. }
         ));
+        assert!(prompt.contains("复购率下滑怎么归因？"));
+        assert!(prompt.contains("<question>"));
+    }
+
+    #[test]
+    fn consult_prompt_includes_expertise_and_names() {
+        let to = AgentProfile {
+            agent_id: "agt_b".into(),
+            display_name: "财报专家".into(),
+            bio: String::new(),
+            expertise: vec!["finance/财报".into()],
+            agent_type: "dsh".into(),
+            model: None,
+            consultable: true,
+            redaction_level: None,
+            disclosure_scope: vec![],
+            created_at: 1,
+            updated_at: 1,
+        };
+        let prompt = build_consult_prompt(&to, "电商运营", "Q3 复购为何下滑");
+        assert!(prompt.contains("财报专家"));
+        assert!(prompt.contains("finance/财报"));
+        assert!(prompt.contains("电商运营"));
+        // 空专长兜底。
+        let mut bare = to.clone();
+        bare.expertise = vec![];
+        assert!(build_consult_prompt(&bare, "x", "y").contains("（未声明）"));
     }
 
     fn write_min_profile(root: &Path, agent_id: &str) {
