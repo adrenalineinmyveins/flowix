@@ -480,7 +480,8 @@ impl<'a> Redactor<'a> {
                 if overlaps_guard(m.start(), end, &guard) {
                     continue;
                 }
-                let token = self.placeholder(kind, run);
+                let original = &text[m.start()..end];
+                let token = self.placeholder(kind, original);
                 edits.push((m.start(), end, token));
                 self.hit(rule);
             }
