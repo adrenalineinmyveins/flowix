@@ -9,7 +9,7 @@ mod runner;
 pub use runner::spawn_worker;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
@@ -47,8 +47,9 @@ pub fn dispatch_trigger_event(event: NurtureTriggerEvent) {
     let _ = trigger_channel().send(event);
 }
 
-/// 启动触发器订阅 task：每次事件从 AppState 解析该 notebook 的授权条目
-/// 与根路径，过滤后计数入队。由 bootstrap 调用一次。
+/// 启动触发器订阅 task：每次事件从 AppState 解析授权条目、根路径与该
+/// notebook 的全部 profile，对每个「全局闸 + per-agent 闸」都命中的 agent
+/// 独立计数，达阈值入队（job 携带真实 agent_id）。由 bootstrap 调用一次。
 pub fn start_trigger(app: tauri::AppHandle) -> tokio::task::JoinHandle<()> {
     let mut rx = trigger_channel().subscribe();
     tokio::spawn(async move {
@@ -65,10 +66,55 @@ pub fn start_trigger(app: tauri::AppHandle) -> tokio::task::JoinHandle<()> {
             ) {
                 continue;
             }
+            // 多 agent 映射：全局闸过了之后，per-agent 闸基于各自 profile
+            // 的 disclosure_scope（空 = 跟随全局）。命中者各自计数。
+            let Some(notebook_root) = notebook_root.as_deref() else {
+                continue;
+            };
+            let profiles = list_notebook_profiles(Path::new(notebook_root));
             let mut sched = scheduler().lock().unwrap_or_else(|e| e.into_inner());
-            let _ = sched.count_and_enqueue(event, /*manual=*/ false);
+            for (agent_id, profile) in profiles {
+                if !should_feed_agent(&profile, &event.tags) {
+                    continue;
+                }
+                let _ =
+                    sched.count_and_enqueue(&event.notebook_id, &agent_id, /*manual=*/ false);
+            }
         }
     })
+}
+
+/// per-agent 闸：profile 声明了 `flowix_disclosure_scope` 时，事件标签须
+/// 命中其中之一（或其子树）；为空表示不限（跟随全局授权）。
+/// 与 F6 联动一致：喂养输入范围 = 对外披露范围。
+pub fn should_feed_agent(profile: &flowix_core::agent::AgentProfile, tags: &[String]) -> bool {
+    if profile.disclosure_scope.is_empty() {
+        return true;
+    }
+    profile.disclosure_scope.iter().any(|scope| {
+        tags.iter().any(|tag| {
+            tag == scope || tag.strip_prefix(scope).is_some_and(|rest| rest.starts_with('/'))
+        })
+    })
+}
+
+/// 列出某 notebook 的全部 (agent_id, profile)。坏 profile 跳过。
+pub fn list_notebook_profiles(root: &Path) -> Vec<(String, flowix_core::agent::AgentProfile)> {
+    let Ok(entries) = std::fs::read_dir(root.join(".agents")) else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path().join("profile.md");
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Ok((profile, _)) = flowix_core::agent::AgentProfile::parse(&content) {
+            result.push((profile.agent_id.clone(), profile));
+        }
+    }
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    result
 }
 
 /// 解析某 notebook 的（根路径, enabled 授权条目）。
@@ -186,18 +232,16 @@ fn scheduler() -> &'static Mutex<Scheduler> {
 }
 
 impl Scheduler {
-    /// 计数并判断是否达阈值。达阈值清零并入队，返回 true 表示已入队。
-    fn count_and_enqueue(&mut self, event: NurtureTriggerEvent, manual: bool) -> bool {
-        // agent_id 暂用 notebook_id 派生占位，真实「scope 覆盖该笔记的所有
-        // agent」映射随 F1 agentPresets 接线替换；runner 侧再解析真实目标。
-        let agent_id = format!("nurture:{}", event.notebook_id);
-        let counter = self.counters.entry(agent_id.clone()).or_insert(0);
+    /// 计数并判断是否达阈值。达阈值清零并入队（key = 真实 agent_id），
+    /// 返回 true 表示已入队。
+    fn count_and_enqueue(&mut self, notebook_id: &str, agent_id: &str, manual: bool) -> bool {
+        let counter = self.counters.entry(agent_id.to_string()).or_insert(0);
         *counter += 1;
         if *counter >= DEFAULT_THRESHOLD {
             *counter = 0;
-            self.jobs.entry(agent_id.clone()).or_insert(Job {
-                notebook_id: event.notebook_id,
-                agent_id,
+            self.jobs.entry(agent_id.to_string()).or_insert(Job {
+                notebook_id: notebook_id.to_string(),
+                agent_id: agent_id.to_string(),
                 manual,
             });
             return true;
@@ -212,23 +256,32 @@ impl Scheduler {
 
 const DEFAULT_THRESHOLD: usize = 10;
 
-/// 手动入队一个喂养 job（跳过阈值与间隔检查）。供 IPC `nurture_run_now`。
-pub fn enqueue_manual(notebook_id: &str) {
+/// 手动入队：对该 notebook 的每个 profile 各建一个 manual job（跳过阈值
+/// 与间隔检查）。供 IPC `nurture_run_now`。
+pub fn enqueue_manual(notebook_id: &str, notebook_root: &Path) {
     let mut sched = scheduler().lock().unwrap_or_else(|e| e.into_inner());
-    sched.jobs.insert(
-        format!("nurture:{notebook_id}"),
-        Job {
-            notebook_id: notebook_id.to_string(),
-            agent_id: format!("nurture:{notebook_id}"),
-            manual: true,
-        },
-    );
+    for (agent_id, _) in list_notebook_profiles(notebook_root) {
+        sched.jobs.insert(
+            agent_id.clone(),
+            Job {
+                notebook_id: notebook_id.to_string(),
+                agent_id,
+                manual: true,
+            },
+        );
+    }
 }
 
 /// 弹出下一个待执行 job。无 job 返回 None。由 runner 工作循环调用。
 pub(crate) fn pop_next_job() -> Option<Job> {
     let mut sched = scheduler().lock().unwrap_or_else(|e| e.into_inner());
     sched.pop_next()
+}
+
+/// 当前待执行 job 数（供 IPC 返回与测试断言）。
+pub fn pending_job_count() -> usize {
+    let sched = scheduler().lock().unwrap_or_else(|e| e.into_inner());
+    sched.jobs.len()
 }
 
 // ---------------------------------------------------------------------------
@@ -547,21 +600,86 @@ mod tests {
     fn counter_reaches_threshold_then_resets() {
         let mut sched = Scheduler::default();
         for _ in 0..DEFAULT_THRESHOLD - 1 {
-            assert!(!sched.count_and_enqueue(ev("a.md"), false));
+            assert!(!sched.count_and_enqueue("nb", "agt_a", false));
         }
-        assert!(sched.count_and_enqueue(ev("a.md"), false));
+        assert!(sched.count_and_enqueue("nb", "agt_a", false));
         // 清零后重新计数。
-        assert!(!sched.count_and_enqueue(ev("a.md"), false));
+        assert!(!sched.count_and_enqueue("nb", "agt_a", false));
     }
 
     #[test]
     fn scheduler_dedupes_jobs_by_agent() {
         let mut sched = Scheduler::default();
         for _ in 0..DEFAULT_THRESHOLD * 2 {
-            sched.count_and_enqueue(ev("a.md"), false);
+            sched.count_and_enqueue("nb", "agt_a", false);
         }
         // 两次达阈值，但同一 agent 只保留一个 job。
         assert_eq!(sched.jobs.len(), 1);
+    }
+
+    #[test]
+    fn counters_are_independent_per_agent() {
+        let mut sched = Scheduler::default();
+        for _ in 0..DEFAULT_THRESHOLD - 1 {
+            assert!(!sched.count_and_enqueue("nb", "agt_b", false));
+        }
+        // agt_b 达阈值入队；agt_a 计数不受影响。
+        assert!(sched.count_and_enqueue("nb", "agt_b", false));
+        assert!(!sched.count_and_enqueue("nb", "agt_a", false));
+        assert_eq!(sched.jobs.len(), 1);
+        assert_eq!(sched.jobs.keys().next().map(String::as_str), Some("agt_b"));
+    }
+
+    #[test]
+    fn per_agent_gate_follows_disclosure_scope() {
+        let mut profile = test_profile("agt_x");
+        // 空 scope：跟随全局，任何标签都喂。
+        assert!(should_feed_agent(&profile, &["任意".into()]));
+        // 声明 scope：命中自身或子树才喂。
+        profile.disclosure_scope = vec!["finance/财报".into()];
+        assert!(should_feed_agent(&profile, &["finance/财报".into()]));
+        assert!(should_feed_agent(&profile, &["finance/财报/q3".into()]));
+        assert!(!should_feed_agent(&profile, &["finance".into()]));
+        assert!(!should_feed_agent(&profile, &["industry/电商".into()]));
+        assert!(!should_feed_agent(&profile, &[]));
+        // 多 scope 任一命中。
+        profile.disclosure_scope = vec!["a".into(), "b/c".into()];
+        assert!(should_feed_agent(&profile, &["b/c/d".into()]));
+    }
+
+    #[test]
+    fn enqueue_manual_creates_job_per_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for id in ["agt_m1", "agt_m2"] {
+            let profile = test_profile(id);
+            let dir = root.join(".agents").join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("profile.md"), profile.serialize("")).unwrap();
+        }
+        enqueue_manual("nb", root);
+        assert_eq!(pending_job_count(), 2);
+        let first = pop_next_job().unwrap();
+        assert_eq!(first.agent_id, "agt_m1");
+        assert!(first.manual);
+        let second = pop_next_job().unwrap();
+        assert_eq!(second.agent_id, "agt_m2");
+    }
+
+    fn test_profile(agent_id: &str) -> flowix_core::agent::AgentProfile {
+        flowix_core::agent::AgentProfile {
+            agent_id: agent_id.into(),
+            display_name: format!("Agent {agent_id}"),
+            bio: String::new(),
+            expertise: vec![],
+            agent_type: "dsh".into(),
+            model: None,
+            consultable: true,
+            redaction_level: None,
+            disclosure_scope: vec![],
+            created_at: 1,
+            updated_at: 1,
+        }
     }
 
     fn ev(relative_path: &str) -> NurtureTriggerEvent {

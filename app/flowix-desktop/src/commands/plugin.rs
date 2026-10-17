@@ -89,6 +89,14 @@ pub async fn plugin_run(
 ) -> Result<plugin::PluginRunStarted, String> {
     let agent_type = plugin::resolve_agent_type(&plugin_id, &agent_type)?;
     let params = params.unwrap_or_default();
+    // P2 knowledgeScope：声明了知识绑定的插件（manifest v3），运行时按
+    // 标签检索最新 20 条、100 KB 截断、围栏化后替换调用方传入的 context。
+    let knowledge_scope = plugin::get_plugin(&plugin_id)?.manifest.knowledge_scope;
+    let context = if knowledge_scope.is_empty() {
+        context
+    } else {
+        build_knowledge_context(&state, &notebook_path, &knowledge_scope)?
+    };
     let prepared = plugin::prepare_prompt(&plugin_id, &user_prompt, &context, &params)?;
     let run_id = plugin::new_run_id();
     if !state
@@ -240,6 +248,53 @@ pub async fn plugin_run(
         }
     });
     Ok(started)
+}
+
+/// P2 knowledgeScope 检索：按标签取最新 20 条 → 读正文剥 frontmatter →
+/// 100 KB 截断 → 围栏化渲染。无命中返回空串（context 为空但运行继续）。
+fn build_knowledge_context(
+    state: &AppState,
+    notebook_path: &str,
+    knowledge_scope: &[String],
+) -> Result<String, String> {
+    let (notebook_id, notebook_root) = {
+        let memo_file = crate::lock_utils::read_lock(&state.memo_file, "memo_file");
+        let canonical = dunce::canonicalize(notebook_path)
+            .map_err(|error| format!("notebook path unavailable: {error}"))?;
+        let config = memo_file
+            .read_notebook_configs()
+            .map_err(|e| format!("read notebook configs: {e}"))?
+            .into_iter()
+            .find(|config| {
+                dunce::canonicalize(&config.path)
+                    .map(|path| path == canonical)
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| "notebook is not registered".to_string())?;
+        (config.id, std::path::PathBuf::from(config.path))
+    };
+    let rows = {
+        let memo_file = crate::lock_utils::read_lock(&state.memo_file, "memo_file");
+        memo_file
+            .list_note_materials_updated_after(&notebook_id, knowledge_scope, 0, 20)
+            .map_err(|e| format!("query knowledge scope: {e}"))?
+    };
+    let rows: Vec<_> = rows
+        .into_iter()
+        .filter(|row| {
+            !row.relative_path.starts_with(".agents/")
+                && !row.relative_path.starts_with(".flowix/")
+        })
+        .collect();
+    let root = notebook_root.clone();
+    let (materials, _truncated) = crate::nurture::collect_materials(rows, move |relative| {
+        let path = flowix_core::memo_file::notebook_path_from_relative(&root, relative).ok()?;
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|content| flowix_core::memo_file::extract_body_content(&content).to_string())
+    }, 100);
+    let (context, _injected, _skipped) = plugin::render_knowledge_materials(&materials);
+    Ok(context)
 }
 
 #[tauri::command]

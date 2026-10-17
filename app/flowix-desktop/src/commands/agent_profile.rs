@@ -285,12 +285,24 @@ pub fn agent_state_get(cwd: String, agent_id: String) -> Result<AgentState, Stri
     read_state(&root, &agent_id)
 }
 
-/// 手动触发一次喂养（跳过阈值与间隔检查，豁免暂停由 runner 判断）。
-/// 异步执行，进度经 nurture-log 与日志可观测。
+/// 手动触发一次喂养（对该 notebook 的每个 profile 各入队一个 manual
+/// job，跳过阈值与间隔检查）。异步执行，进度经 nurture-log 可观测。
 #[tauri::command]
-pub fn nurture_run_now(notebook_id: String) -> Result<(), String> {
-    crate::nurture::enqueue_manual(&notebook_id);
-    Ok(())
+pub fn nurture_run_now(
+    notebook_id: String,
+    state: tauri::State<'_, crate::app::state::AppState>,
+) -> Result<usize, String> {
+    let notebook_root = {
+        let memo_file = crate::lock_utils::read_lock(&state.memo_file, "memo_file");
+        memo_file
+            .get_notebook_config_by_id(&notebook_id)
+            .map(|config| PathBuf::from(config.path))
+    };
+    let Some(notebook_root) = notebook_root else {
+        return Err(format!("notebook not found: {notebook_id}"));
+    };
+    crate::nurture::enqueue_manual(&notebook_id, &notebook_root);
+    Ok(crate::nurture::pending_job_count())
 }
 
 #[cfg(test)]

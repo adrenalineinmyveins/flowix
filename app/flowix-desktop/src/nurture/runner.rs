@@ -36,9 +36,12 @@ pub fn spawn_worker(app: AppHandle) {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 continue;
             };
-            if let Err(error) = run_nurture_once(&app, &job.notebook_id, job.manual).await {
+            if let Err(error) =
+                run_nurture_once(&app, &job.notebook_id, &job.agent_id, job.manual).await
+            {
                 tracing::warn!(
                     notebook_id = %job.notebook_id,
+                    agent_id = %job.agent_id,
                     "nurture run failed: {error}"
                 );
             }
@@ -52,12 +55,13 @@ pub fn spawn_worker(app: AppHandle) {
 pub(crate) async fn run_nurture_once(
     app: &AppHandle,
     notebook_id: &str,
+    agent_id: &str,
     manual: bool,
 ) -> Result<String, String> {
-    match run_inner(app, notebook_id, manual).await {
+    match run_inner(app, notebook_id, agent_id, manual).await {
         Ok(outcome) => Ok(outcome),
         Err(reason) => {
-            record_failure(app, notebook_id, &reason);
+            record_failure(app, notebook_id, agent_id, &reason);
             Err(reason)
         }
     }
@@ -66,6 +70,7 @@ pub(crate) async fn run_nurture_once(
 async fn run_inner(
     app: &AppHandle,
     notebook_id: &str,
+    agent_id: &str,
     manual: bool,
 ) -> Result<String, String> {
     let state = app
@@ -94,10 +99,23 @@ async fn run_inner(
         (root, tag_paths)
     };
 
-    let Some((profile, profile_content)) = find_first_profile(&notebook_root)?
-    else {
-        return skip_and_log(app, notebook_id, None, "no_profile");
+    // 1b. 取 job 指定 agent 的 profile（多 agent 映射：每 job 一个 agent）。
+    let profile_content = match crate::commands::agent_profile::read_profile_content(
+        &notebook_root,
+        agent_id,
+    ) {
+        Ok(content) => Some(content),
+        // 兼容旧 job（nurture: 前缀占位）：回退第一个 profile。
+        Err(_) => find_first_profile(&notebook_root)
+            .ok()
+            .flatten()
+            .map(|(_, content)| content),
     };
+    let Some(profile_content) = profile_content else {
+        return skip_and_log(app, notebook_id, Some(agent_id), "no_profile");
+    };
+    let (profile, _) = AgentProfile::parse(&profile_content)
+        .map_err(|e| format!("profile_parse_failed: {e}"))?;
 
     // 2. 间隔与暂停检查（手动触发豁免）。
     let mut nurture_state = read_nurture_state(&notebook_root, &profile.agent_id);
@@ -455,7 +473,7 @@ fn skip_and_log(
 }
 
 /// 失败留痕：consecutive_failures +1，达到 3 次置 paused，写 failed 日志。
-fn record_failure(app: &AppHandle, notebook_id: &str, reason: &str) {
+fn record_failure(app: &AppHandle, notebook_id: &str, agent_id: &str, reason: &str) {
     let Some(state) = app.try_state::<AppState>() else {
         return;
     };
@@ -468,17 +486,15 @@ fn record_failure(app: &AppHandle, notebook_id: &str, reason: &str) {
     let Some(notebook_root) = notebook_root else {
         return;
     };
-    let Some((profile, _)) = find_first_profile(&notebook_root).ok().flatten() else {
-        return;
-    };
-    let mut nurture_state = read_nurture_state(&notebook_root, &profile.agent_id);
+    let mut nurture_state = read_nurture_state(&notebook_root, agent_id);
+    nurture_state.agent_id = agent_id.to_string();
     nurture_state.consecutive_failures = nurture_state.consecutive_failures.saturating_add(1);
     if nurture_state.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
         nurture_state.paused = true;
     }
     append_log_line(
         &notebook_root,
-        &profile.agent_id,
+        agent_id,
         NurtureLogLine {
             ts: chrono::Utc::now().timestamp_millis(),
             kind: "failed".into(),
@@ -487,5 +503,5 @@ fn record_failure(app: &AppHandle, notebook_id: &str, reason: &str) {
             truncated: 0,
         },
     );
-    write_nurture_state(&notebook_root, &profile.agent_id, &nurture_state);
+    write_nurture_state(&notebook_root, agent_id, &nurture_state);
 }
