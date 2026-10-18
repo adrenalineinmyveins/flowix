@@ -219,6 +219,7 @@ pub fn agent_profile_create(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn agent_profile_update(
     cwd: String,
     agent_id: String,
@@ -226,6 +227,12 @@ pub fn agent_profile_update(
     bio: String,
     expertise: Vec<String>,
     agent_type: String,
+    // 隐私边界与模型覆盖：None = 不修改；Some(v) = 整体替换
+    // （redaction_level / model 传空串表示清除）。
+    consultable: Option<bool>,
+    redaction_level: Option<String>,
+    disclosure_scope: Option<Vec<String>>,
+    model: Option<String>,
 ) -> Result<AgentProfile, String> {
     let root = notebook_root(&cwd)?;
     let mut existing = read_profile(&root, &agent_id)?;
@@ -233,6 +240,28 @@ pub fn agent_profile_update(
     existing.bio = bio;
     existing.expertise = expertise;
     existing.agent_type = agent_type;
+    if let Some(consultable) = consultable {
+        existing.consultable = consultable;
+    }
+    if let Some(level) = redaction_level {
+        existing.redaction_level = (!level.trim().is_empty()).then(|| level.trim().to_string());
+    }
+    if let Some(scopes) = disclosure_scope {
+        let scopes: Vec<String> = scopes
+            .into_iter()
+            .map(|scope| scope.trim().to_string())
+            .filter(|scope| !scope.is_empty())
+            .collect();
+        for scope in &scopes {
+            if flowix_core::memo_file::normalize_tag_path(scope).is_none() {
+                return Err(format!("INVALID_DISCLOSURE_SCOPE:{scope}"));
+            }
+        }
+        existing.disclosure_scope = scopes;
+    }
+    if let Some(model) = model {
+        existing.model = (!model.trim().is_empty()).then(|| model.trim().to_string());
+    }
     existing.updated_at = chrono::Utc::now().timestamp_millis();
     existing.validate().map_err(profile_error)?;
     // 保留正文：重新读取原始内容取 body。
@@ -437,6 +466,101 @@ mod tests {
         let err = agent_state_get(root.to_string_lossy().into_owned(), "agt_ghost".into())
             .unwrap_err();
         assert_eq!(err, "PROFILE_NOT_FOUND");
+    }
+
+    #[test]
+    fn update_privacy_fields_and_model() {
+        let (_temp, root) = temp_root();
+        let profile = agent_profile_create(
+            root.to_string_lossy().into_owned(),
+            "A".into(),
+            String::new(),
+            vec![],
+            "codex".into(),
+        )
+        .unwrap();
+        let cwd = root.to_string_lossy().into_owned();
+
+        let updated = agent_profile_update(
+            cwd.clone(),
+            profile.agent_id.clone(),
+            "A".into(),
+            String::new(),
+            vec![],
+            "codex".into(),
+            Some(false),
+            Some("R2".into()),
+            Some(vec!["finance/财报".into(), " ".into()]),
+            Some("gpt-x".into()),
+        )
+        .unwrap();
+        assert!(!updated.consultable);
+        assert_eq!(updated.redaction_level.as_deref(), Some("R2"));
+        // 空白项被过滤，合法项保留。
+        assert_eq!(updated.disclosure_scope, vec!["finance/财报".to_string()]);
+        assert_eq!(updated.model.as_deref(), Some("gpt-x"));
+
+        // 旧调用形态（隐私参数全 None）不修改既有隐私字段。
+        let kept = agent_profile_update(
+            cwd.clone(),
+            profile.agent_id.clone(),
+            "A2".into(),
+            String::new(),
+            vec![],
+            "codex".into(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!kept.consultable);
+        assert_eq!(kept.redaction_level.as_deref(), Some("R2"));
+        assert_eq!(kept.disclosure_scope, vec!["finance/财报".to_string()]);
+
+        // 空串清除 redaction_level / model。
+        let cleared = agent_profile_update(
+            cwd,
+            profile.agent_id,
+            "A2".into(),
+            String::new(),
+            vec![],
+            "codex".into(),
+            None,
+            Some(String::new()),
+            None,
+            Some(String::new()),
+        )
+        .unwrap();
+        assert_eq!(cleared.redaction_level, None);
+        assert_eq!(cleared.model, None);
+    }
+
+    #[test]
+    fn update_rejects_invalid_disclosure_scope() {
+        let (_temp, root) = temp_root();
+        let profile = agent_profile_create(
+            root.to_string_lossy().into_owned(),
+            "A".into(),
+            String::new(),
+            vec![],
+            "codex".into(),
+        )
+        .unwrap();
+        let err = agent_profile_update(
+            root.to_string_lossy().into_owned(),
+            profile.agent_id,
+            "A".into(),
+            String::new(),
+            vec![],
+            "codex".into(),
+            None,
+            None,
+            Some(vec!["空格 标签".into()]),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.starts_with("INVALID_DISCLOSURE_SCOPE"));
     }
 
     #[test]

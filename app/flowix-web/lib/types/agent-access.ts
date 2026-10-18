@@ -25,7 +25,7 @@ import type {
  *   IPC `runtimeConfig.{agent}.workspacePaths`.
  */
 
-export type AgentAccessKind = "notebook" | "folder";
+export type AgentAccessKind = "notebook" | "folder" | "tag";
 
 export interface AgentAccessEntry {
   id: string;
@@ -33,6 +33,8 @@ export interface AgentAccessEntry {
   path: string;
   name: string;
   enabled: boolean;
+  /** 标签路径，仅 kind="tag" 有意义 (scope 为该标签路径及其子树, `path` 留空)。 */
+  tagPath?: string;
   /** @deprecated Workspace selection is notebook-owned; retained for v1 JSON. */
   workspace?: boolean;
   addedAt: number;
