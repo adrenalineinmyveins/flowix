@@ -1,13 +1,14 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Bot, Fingerprint, Loader2, Plus, Save, Trash2, X } from 'lucide-react';
+import { Bot, Fingerprint, Inbox, Loader2, Plus, Save, Trash2, X } from 'lucide-react';
 
 import { agentProfile } from '@platform/tauri/client';
 import type { AgentProfile, AgentState } from '@/lib/types/agent-profile';
 import { PROFILE_REDACTION_LEVELS } from '@/lib/types/agent-profile';
 import { AGENT_TYPES } from '@/lib/agent-types';
 import { useNoteStore } from '@features/memo/store/note-store';
+import { AgentProfileInbox } from '@features/agent/components/agent-profile-inbox';
 import { MEMO_LIST_VIEW_HEADER_INSET_CLASS } from '@features/memo/components/memo-list-view-tabs';
 import { WorkColumnTitlebarShell } from '@features/shell/components/work-column-titlebar-shell';
 import { SidebarToggleIcon } from '@shared/icons/sidebar-toggle-icon';
@@ -161,6 +162,15 @@ export function AgentProfileListPanel({ notebookPath }: { notebookPath: string }
           <Plus className="h-3.5 w-3.5" />
           {t('agent.profile.newCard')}
         </Button>
+        <Button
+          type="button"
+          variant="ghost"
+          className="h-7 shrink-0 gap-1 rounded-lg px-2 text-xs"
+          onClick={() => setTarget({ inbox: true })}
+        >
+          <Inbox className="h-3.5 w-3.5" />
+          {t('agent.inbox.title')}
+        </Button>
       </div>
 
       <div className="relative min-h-0 flex-1">
@@ -250,7 +260,11 @@ export function AgentProfileTitlebar({
       )}
       <Fingerprint className="ml-1 h-4 w-4 shrink-0 text-[var(--brand)]" />
       <span className="ml-2 min-w-0 truncate text-sm font-medium text-[var(--foreground)]">
-        {target && 'creating' in target ? t('agent.profile.createTitle') : t('agent.profile.title')}
+        {target && 'creating' in target
+          ? t('agent.profile.createTitle')
+          : target && 'inbox' in target
+            ? t('agent.inbox.title')
+            : t('agent.profile.title')}
       </span>
       <button
         type="button"
@@ -404,6 +418,11 @@ export function AgentProfileEditor({ notebookPath }: { notebookPath: string }) {
         </p>
       </div>
     );
+  }
+
+  // 收件箱：入站咨询信封的拉取 / 接受 / 拒绝。
+  if ('inbox' in target) {
+    return <AgentProfileInbox notebookPath={notebookPath} />;
   }
 
   const selectableTypes = AGENT_TYPES;

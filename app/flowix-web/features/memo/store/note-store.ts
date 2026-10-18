@@ -139,8 +139,8 @@ export interface NoteLibraryStore {
   selectedNotebookId: string | null;
   // UI filter/sort
   middleColumnView: MiddleColumnView;
-  /** 个人 Agent 视图当前在右列打开的目标：某个身份卡 / 新建 / 未打开。 */
-  agentProfileViewTarget: { agentId: string } | { creating: true } | null;
+  /** 个人 Agent 视图当前在右列打开的目标：某个身份卡 / 新建 / 收件箱 / 未打开。 */
+  agentProfileViewTarget: { agentId: string } | { creating: true } | { inbox: true } | null;
   /** 身份卡数据版本：创建/保存/删除后自增，驱动中列列表刷新。 */
   agentProfilesVersion: number;
   activeFilter: ExtendedFilterType;
@@ -177,7 +177,7 @@ export interface NoteLibraryStore {
    */
   reorderNotebooks: (nextOrderIds: string[]) => Promise<void>;
   setMiddleColumnView: (view: MiddleColumnView) => void;
-  setAgentProfileViewTarget: (target: { agentId: string } | { creating: true } | null) => void;
+  setAgentProfileViewTarget: (target: { agentId: string } | { creating: true } | { inbox: true } | null) => void;
   bumpAgentProfiles: () => void;
   setActiveFilter: (filter: ExtendedFilterType) => void;
   setActiveCustomFilter: (filterId: string | null) => void;
