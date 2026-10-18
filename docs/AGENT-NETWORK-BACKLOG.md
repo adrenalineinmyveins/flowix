@@ -20,7 +20,7 @@
 | F6 脱敏 | M1 规则地基 | ✅ 验收过 | `flowix-redaction` crate：对抗样本命中率 100%、占位符防毒化 |
 | F6 脱敏 | M2 蒸馏 + L3 复扫 | ✅ 验收过 | `redaction/mod.rs`：注入样本拦截 100%、回炉上限 2 |
 | F6 脱敏 | M3 确认门 + outbox | ✅ 验收过 | `redaction/outbox.rs`：UNCONFIRMED_SEND_BLOCKED 兜底、byte-equal、FIFO 200 |
-| F5 网络互咨 | 客户端传输切片 | 🟡 | `redaction/transport.rs`（2026-10-18）：唯一出口取字节投递中继 + relay_url 配置 + 失败可重试；对端协议/云端（FD-10）未启动 |
+| F5 网络互咨 | 客户端传输切片 + FD-10 M1/M2/M3a | 🟡 | `redaction/transport.rs`（2026-10-18）：唯一出口取字节投递中继 + relay_url 配置 + 失败可重试；FD-10 立项（2026-10-19）：`docs/F5-NETWORK-RELAY.md` 协议 v1（信封/中继 API/hops 消费契约）+ `flowix-relay` 参考实现（14 测试）+ 入站收件 M3a（`.flowix/redaction-inbound/` 留档 + 4 IPC，44 测试）。待做：M3b 出站 wire 化、前端收件 UI、M3c 接受→F4 编排→回程、M4 双端联调 |
 
 ## 2. P0 —— 端到端闭环缺口
 
