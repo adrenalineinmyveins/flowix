@@ -76,10 +76,16 @@ pub(super) fn extract_archive(bytes: &[u8], destination: &Path) -> Result<(), St
 }
 
 pub(super) fn safe_archive_path(path: &Path) -> Result<PathBuf, String> {
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|component| matches!(component, Component::ParentDir))
+    // 按组件判定跨平台一致：Windows 上 "/etc/passwd" 无盘符不算 is_absolute，
+    // 但带 RootDir 组件，必须同样拒绝（tar 条目以 / 开头即逃逸意图）。
+    if path
+        .components()
+        .any(|component| {
+            matches!(
+                component,
+                Component::Prefix(_) | Component::RootDir | Component::ParentDir
+            )
+        })
     {
         return Err(format!("unsafe DSH archive path: {}", path.display()));
     }

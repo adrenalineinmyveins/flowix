@@ -92,5 +92,20 @@ fn main() {
         );
     }
 
+    // cargo 的 lib 单测二进制不带 tauri-build 为 bin 嵌入的 manifest，Windows
+    // 上装载器会把 comctl32.dll 解析到 v5（缺 TaskDialogIndirect /
+    // SetWindowSubclass 入口点），lib test 启动即 STATUS_ENTRYPOINT_NOT_FOUND。
+    // rustc-link-arg 覆盖所有目标（含单测）；对 bin 而言内嵌 manifest 优先，
+    // 此处追加的依赖声明无行为影响。
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
+        println!(
+            "cargo:rustc-link-arg=/MANIFESTDEPENDENCY:type='win32' \
+             name='Microsoft.Windows.Common-Controls' version='6.0.0.0' \
+             publicKeyToken='6595b64144ccf1df' language='*' processorArchitecture='*'"
+        );
+    }
+
     tauri_build::build()
 }

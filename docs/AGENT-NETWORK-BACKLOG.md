@@ -13,36 +13,50 @@
 
 | 域 | 里程碑 | 状态 | 关键落点 |
 | --- | --- | --- | --- |
-| F1 Profile | 数据模型 + 接线 | ✅ | `flowix-core/src/agent/`、`.agents/` 双数据面、AgentState 记账（token 除外） |
+| F1 Profile | 数据模型 + 接线 + 卡片 UI | ✅ | `flowix-core/src/agent/`、`.agents/` 双数据面、AgentState 记账（含 token，2026-10-18 接线）；卡片 UI（2026-10-17）：`agent_profile_update` 扩展隐私边界/model 可选参数，前端 `agent-profile-cards.tsx` 列表+详情+隐私三字段编辑，入口在会话标题栏「个人 Agent…」 |
 | F2 喂养 | N1-N3 + 多 agent 映射 | ✅ | `nurture/{mod,runner}.rs`、disclosure_scope 门控、水位增量 |
-| F3 技能 | manifest v3 + knowledgeScope | ✅（运行时消费见 P1-2） | `flowix-plugin-runtime/src/manifest.rs`、skill_registry |
-| F4 本机互咨 | mailbox + BudgetGuard + AskBackGate + DSH 编排 | ✅ | `consult/{mod,orchestrator}.rs`、`commands/consult.rs` |
+| F3 技能 | manifest v3 + knowledgeScope + P2 导入导出 + P4 执法 | ✅ | `flowix-plugin-runtime/src/manifest.rs`、skill_registry；P2（2026-10-18）：`plugin_export/plugin_import`（zip 往返 byte-equal + zip-slip 防护）；P4：`ToolPolicy` 类别级黑名单执行器（越权 tool_call 终止 run 留痕）+ `effective_target_level` 与 preview 联动 |
+| F4 本机互咨 | mailbox + BudgetGuard + AskBackGate + DSH 编排 + 咨询记账 | ✅ | `consult/{mod,orchestrator}.rs`、`commands/consult.rs`；被咨询次数/lastConsultedAt 落 AgentState |
 | F6 脱敏 | M1 规则地基 | ✅ 验收过 | `flowix-redaction` crate：对抗样本命中率 100%、占位符防毒化 |
 | F6 脱敏 | M2 蒸馏 + L3 复扫 | ✅ 验收过 | `redaction/mod.rs`：注入样本拦截 100%、回炉上限 2 |
 | F6 脱敏 | M3 确认门 + outbox | ✅ 验收过 | `redaction/outbox.rs`：UNCONFIRMED_SEND_BLOCKED 兜底、byte-equal、FIFO 200 |
-| F5 网络互咨 | 协议 + 传输 | ⛔ 未启动 | 解锁条件已满足（原门槛「F6 M1-M3 验收」已过） |
+| F5 网络互咨 | 客户端传输切片 | 🟡 | `redaction/transport.rs`（2026-10-18）：唯一出口取字节投递中继 + relay_url 配置 + 失败可重试；对端协议/云端（FD-10）未启动 |
 
 ## 2. P0 —— 端到端闭环缺口
 
 ### 2.1 前端确认门卡片与 scope 选择器
 
+- **状态**：✅ 已实现（2026-10-17，真机全流程点检待做）
 - **现状**：IPC 全部就绪——`redaction_preview`（question/scope/level 全管线）、
   `redaction_confirm`、`redaction_confirm_wait`（gate 挂起）、`redaction_send`
   （唯一出口）、`redaction_outbox_list`、`redaction_config_get/set`、
   `redaction_l1_preview`（诊断）。
-- **待做**：确认门卡片（复用审批卡片交互：最终载荷全文 + 占位符/规则命中清单 +
-  目标等级 + 收件方卡片）；scope 选择器扩展标签档（`AgentAccessKind::Tag`）。
-- **完成判据**：真机上 preview → 人审 → confirm → send 全程可点，取消/超时
-  卡片状态正确回落。
+- **已落地**：
+  - 类型镜像与 8 个 IPC 绑定：`lib/types/redaction.ts`、
+    `platform/tauri/client/redaction.ts`；
+  - 确认门对话框 `features/agent/components/redaction-send-gate.tsx`
+    （compose → preview 报告卡片 → 确认/取消 → send；倒计时到 0 自动按拒绝
+    结算、draft 留档重开可恢复、错误码归一文案），入口在会话标题栏
+    更多菜单「脱敏发送…」；
+  - scope 选择器标签档：`AgentAccessKind` 补 `"tag"` + `tagPath` 字段，
+    store 新增 `addTagScope`（乐观写 + already-tracked 去重），对话框内
+    可从笔记本标签树添加标签级授权；
+  - 测试：`redaction-gate-logic.test.ts` / `redaction-send-gate.test.tsx`
+    （preview→confirm→send、取消回落、draft 恢复、超时自动取消、错误展示）/
+    `agent-access-store.test.ts`（addTagScope 四例）。全量 vitest 中该批
+    全绿（Windows 环境另有 42 个与本线无关的既有失败，基线对照一致）。
+- **待做（真机）**：真机上 preview → 人审 → confirm → send 全程可点，
+  取消/超时卡片状态正确回落；需 dsh-appserver 可用（见 §2.3）。
 
 ### 2.2 F5 网络传输层
 
-- **现状**：发送唯一出口已定——`redaction_send` → `take_confirmed_payload`
-  （`UNCONFIRMED_SEND_BLOCKED` 兜底、字节与留档 byte-equal）。信封结构
-  `RedactionEnvelope`（receiptId/payload/targetLevel/ruleSetVersion/createdAt）
-  已确定性序列化。
-- **待做**：按 AGENT-NETWORK-PLAN §5 实现对端协议与传输；发送路径只允许接在
-  上述出口；`disclosure.hopsRemaining` 的消费契约（见 §4 未决 3）。
+- **现状**：客户端传输切片已落地（2026-10-18）——`redaction_transmit` IPC →
+  `redaction/transport.rs`：从唯一出口 `take_confirmed_payload` 取字节 POST 到
+  `redaction/config.json` 的 `relayUrl`；draft 沿 `UNCONFIRMED_SEND_BLOCKED` 兜底，
+  投递失败留档保持 confirmed（幂等可重试）。确认门 UI 在 relay 配置后提供
+  「投递到中继 / 重试投递」。
+- **待做**：对端协议与云端中继建设（AGENT-NETWORK-PLAN §5 / FD-10 立项）；
+  `disclosure.hopsRemaining` 的消费契约（见 §4 未决 3）；FD-7 approval 类别。
 
 ### 2.3 dsh-appserver 构建与模型凭证
 
@@ -54,25 +68,29 @@
 
 ### 3.1 token 用量 → AgentState 记账
 
-`AgentState.record_tokens` 已就位，等待 `agent-chunk` usage 事件接线后灌入
-（当前 runs/consultations/recentThreadIds 已记账，tokensIn/tokensOut 恒 0）。
+✅ 已接线（2026-10-18）：`run_distill_once` 在删除蒸馏线程前取 DSH 会话
+usage，nurture 喂养落账 `record_tokens`；咨询完成对专家落
+`consultations_received / last_consulted_at`。非 DSH 运行时暂无会话级
+usage 查询，不计。
 
 ### 3.2 manifest v3 运行时消费
 
-`toolGrants` / `minRedactionLevel` 已在 manifest 校验层落地（R1-R3 校验、
-工具白名单、shell+confirm 需 allowlist），运行时尚未消费：
-- `minRedactionLevel` 应与 `redaction_preview` 的 `target_level` 联动取 max；
-- `toolGrants` 应在插件工具调用处做执法。
+✅ 已接线（2026-10-18）：
+- `minRedactionLevel` 经 `redaction_preview` 新参数 `min_levels` 与
+  `target_level` 取 max（`effective_target_level`，大小写归一）；
+- `toolGrants` 在 `plugin_run` 事件层执法（`ToolPolicy` 类别级黑名单：
+  已识别类别未授权 → 终止 run + `TOOL_GRANT_VIOLATION` 留痕；未识别类别
+  放行避免误杀）。confirm 档逐命令 allowlist 执法待 DSH approval 集成。
 
 ### 3.3 DSH approval 的 disclosure 审批类别（规格 §9 未决 1）
 
 新增 disclosure 类别 vs 复用 permissions 类别——影响 dsh-appserver 改动面，
-实施 F5 时定。
+实施 F5 对端协议时定。
 
 ### 3.4 蒸馏 Agent 类型选择（规格 §9 未决 4）
 
-当前硬编码 `deepseek-harness`。建议：跟随用户当前默认 Agent，
-`redaction/config.json` 可覆盖（可加 `distillAgentType` 字段）。
+✅ FD-8 已落地（2026-10-18）：`redaction/config.json` 新增
+`distillAgentType` 字段，空 = 默认 deepseek-harness，可覆盖。
 
 ### 3.5 占位符「查看回填」本地预览（规格 §9 未决 2）
 

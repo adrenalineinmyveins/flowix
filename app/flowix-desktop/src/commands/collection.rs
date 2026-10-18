@@ -893,7 +893,10 @@ fn mutate_locked(
         if blocked { return Err("COLLECTION_RECOVERY_BLOCKED".into()); }
         let (item, path, source, mut document) = catalog.read(&request.collection_id)?;
         if let Some(locked_path) = locked_path {
-            if dunce::canonicalize(&path).map_err(|error| error.to_string())? != locked_path {
+            // 与锁系统同一 canonical 形比较：file_write 的 stable path 用
+            // std::fs::canonicalize（Windows 带 \\?\ 前缀），dunce 形式在
+            // Windows 上与之永不相等，会误报 COLLECTION_PATH_CHANGED。
+            if std::fs::canonicalize(&path).map_err(|error| error.to_string())? != locked_path {
                 return Err("COLLECTION_PATH_CHANGED".into());
             }
         }

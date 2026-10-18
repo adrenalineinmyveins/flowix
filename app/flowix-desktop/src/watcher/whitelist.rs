@@ -192,43 +192,49 @@ mod tests {
             Err(DropReason::InternalDirectory)
         );
     }
-
+    /// Since 6d128448 the default has no path-level file blacklist (skip_files
+    /// empty) and watches hidden files; non-md entries are rejected by the
+    /// extension whitelist, custom blacklists still apply.
     #[test]
-    fn default_skips_blacklisted_files() {
+    fn default_has_no_file_blacklist_filtering_by_extension() {
         let w = WhitelistConfig::default();
         assert_eq!(
-            w.allows(Path::new("/x/.DS_Store")),
-            Err(DropReason::PathNotWhitelisted) // 闅愯棌鏂囦欢浼樺厛
+            w.allows(Path::new("/x/notes.tmp")),
+            Err(DropReason::ExtensionMismatch)
         );
-        // 非隐藏的黑名单文�?- *.tmp �?���?".tmp" 结尾, ".tmp.md" 不匹�?        // (临时文件场景�? 用户�?*.tmp.md 这�?带后缀�? 行为应当放�?�?watcher 重命名�?�?
+        assert_eq!(
+            w.allows(Path::new("/x/.DS_Store")),
+            Err(DropReason::ExtensionMismatch)
+        );
+        // Suffixed temporary files pass through (watcher rename finalize).
         assert!(w.allows(Path::new("/x/notes.tmp.md")).is_ok());
-        // �?.tmp 命中
+        // A custom blacklist restores path-level rejection.
+        let mut w = WhitelistConfig::default();
+        w.skip_files.push("*.tmp".into());
         assert_eq!(
             w.allows(Path::new("/x/notes.tmp")),
             Err(DropReason::PathBlacklisted)
         );
     }
 
+    /// Hidden files are gated by watch_hidden: watched by default
+    /// (file-backed semantics), rejected when disabled; .flowix is always
+    /// dropped regardless of the switch.
     #[test]
-    fn default_skips_hidden() {
+    fn hidden_controlled_by_watch_hidden() {
         let w = WhitelistConfig::default();
+        assert!(w.allows(Path::new("/x/.hidden.md")).is_ok());
+
+        let mut w = WhitelistConfig::default();
+        w.watch_hidden = false;
         assert_eq!(
             w.allows(Path::new("/x/.hidden.md")),
             Err(DropReason::PathNotWhitelisted)
         );
-    }
-
-    #[test]
-    fn watch_hidden_true_allows_dots() {
-        let mut w = WhitelistConfig::default();
-        w.watch_hidden = true;
-        // .DS_Store 仍然黑名�?
         assert_eq!(
-            w.allows(Path::new("/x/.DS_Store")),
-            Err(DropReason::PathBlacklisted)
+            w.allows(Path::new("/x/.flowix/versions/memo/v_1.md")),
+            Err(DropReason::InternalDirectory)
         );
-        // �?��隐�?.md 放�?
-        assert!(w.allows(Path::new("/x/.hidden.md")).is_ok());
     }
 
     #[test]
