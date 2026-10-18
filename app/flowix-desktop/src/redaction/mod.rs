@@ -20,16 +20,18 @@ use flowix_redaction::{
     RedactionReport,
 };
 
-use crate::config::access::AgentAccessEntry;
+use crate::config::access::{AgentAccessEntry, AgentAccessKind};
 use crate::nurture::should_accept_event_in_notebook;
 
 pub mod outbox;
+pub mod transport;
 
 pub use outbox::{
     draft_from_preview, list_records, new_receipt_id, outbox_dir, read_record, settle,
     status_name, take_confirmed_payload, write_record, OutboxStatus, RedactionEnvelope,
-    RedactionOutboxRecord, OUTBOX_LIMIT,
+    RedactionOutboxRecord, OUTBOX_LIMIT
 };
+pub use transport::{deliver_confirmed_envelope, validate_relay_url, RelayDeliverResult};
 
 pub const REDACTION_LEVELS: &[&str] = &["r1", "r2", "r3"];
 /// L3 复扫回炉上限（初次蒸馏之外最多重写次数），对应规格 §3.4「上限 2 次」。
@@ -211,6 +213,35 @@ fn level_spec(level: &str) -> Result<&'static str, RedactionPipelineError> {
         ),
         other => Err(RedactionPipelineError::InvalidLevel(other.to_string())),
     }
+}
+
+/// P1-2 / F6 联动：技能（manifest v3 `minRedactionLevel`）或身份卡声明的
+/// 最低脱敏等级，与用户目标等级取 max（更严者胜）。接受 r1/R1 大小写，
+/// 返回小写规范形；任何一方非法返回 `InvalidLevel`。
+pub fn effective_target_level(
+    user_level: &str,
+    declared_levels: &[String],
+) -> Result<String, RedactionPipelineError> {
+    fn rank(raw: &str) -> Option<u8> {
+        match raw.trim().to_lowercase().as_str() {
+            "r1" => Some(1),
+            "r2" => Some(2),
+            "r3" => Some(3),
+            _ => None,
+        }
+    }
+    let mut best = rank(user_level)
+        .ok_or_else(|| RedactionPipelineError::InvalidLevel(user_level.to_string()))?;
+    for declared in declared_levels {
+        let value = rank(declared)
+            .ok_or_else(|| RedactionPipelineError::InvalidLevel(declared.clone()))?;
+        best = best.max(value);
+    }
+    Ok(match best {
+        1 => "r1".to_string(),
+        2 => "r2".to_string(),
+        _ => "r3".to_string(),
+    })
 }
 
 /// 蒸馏提示词：三段拼装（等级定义与改写规则 / L1 文本 / 输出契约）。
@@ -558,10 +589,18 @@ pub async fn preview_full(
 
     let root_for_distill = notebook_root.clone();
     let app_for_distill = app.clone();
+    // FD-8：蒸馏 Agent 类型可经 redaction/config.json 的 distillAgentType
+    // 覆盖；空 = 默认 deepseek-harness。
+    let distill_agent_type = if config.distill_agent_type.trim().is_empty() {
+        "deepseek-harness".to_string()
+    } else {
+        config.distill_agent_type.trim().to_string()
+    };
     let distill = move |prompt: &str| {
         let app = app_for_distill.clone();
         let root = root_for_distill.clone();
         let prompt = prompt.to_string();
+        let agent_type = distill_agent_type.clone();
         async move {
             let state = app.state::<crate::app::state::AppState>();
             crate::nurture::run_distill_once(
@@ -569,11 +608,11 @@ pub async fn preview_full(
                 &state,
                 &root,
                 &prompt,
-                "deepseek-harness",
+                &agent_type,
                 "redaction:distill",
             )
             .await
-            .map(|(answer, _)| answer)
+            .map(|(answer, _, _)| answer)
         }
     };
 
@@ -612,12 +651,20 @@ pub async fn preview_full(
         target_level: target_level.to_string(),
         rule_set_version: l1::RULE_CATALOG_VERSION.to_string(),
     };
-    let record = draft_from_preview(
+    let mut record = draft_from_preview(
         question,
         scope_entry_ids,
         &report,
         chrono::Utc::now().timestamp_millis(),
     );
+    // F5 披露标记：当次授权范围进信封 disclosure.allowedScopes。
+    record.allowed_scopes = scopes
+        .iter()
+        .map(|entry| match entry.kind {
+            AgentAccessKind::Tag => format!("tag:{}", entry.tag_path.clone().unwrap_or_default()),
+            _ => format!("path:{}", entry.path),
+        })
+        .collect();
     write_record(&notebook_root, &record).map_err(RedactionPipelineError::DistillFailed)?;
     report.receipt_id = record.receipt_id;
     Ok(report)
@@ -932,6 +979,28 @@ mod tests {
         assert!(prompt.contains("文本 ⟦PHONE-1⟧"));
         assert!(prompt.contains("一个不能少、一个不能改"));
         assert!(build_distill_prompt("t", "r9").is_err());
+    }
+
+    /// P1-2 联动：技能/身份卡声明的最低等级与用户等级取 max（更严者胜），
+    /// 大小写归一，任何一方非法报 InvalidLevel。
+    #[test]
+    fn effective_target_level_takes_stricter_max() {
+        use super::effective_target_level;
+        assert_eq!(effective_target_level("r1", &[]).unwrap(), "r1");
+        assert_eq!(
+            effective_target_level("r1", &["R2".to_string()]).unwrap(),
+            "r2"
+        );
+        assert_eq!(
+            effective_target_level("r3", &["R1".to_string(), "R2".to_string()]).unwrap(),
+            "r3"
+        );
+        assert_eq!(
+            effective_target_level("r2", &["  r3  ".to_string()]).unwrap(),
+            "r3"
+        );
+        assert!(effective_target_level("r9", &[]).is_err());
+        assert!(effective_target_level("r1", &["R4".to_string()]).is_err());
     }
 
     #[test]

@@ -18,6 +18,10 @@ use serde::{Deserialize, Serialize};
 pub const OUTBOX_DIR_NAME: &str = "redaction-outbox";
 /// 留档上限（FIFO 清理阈值）。
 pub const OUTBOX_LIMIT: usize = 200;
+/// F5 披露标记默认值（REDACTION-PIPELINE §5.1）：对端转咨深度与载荷寿命。
+pub const DISCLOSURE_MAX_HOPS: u32 = 2;
+/// 载荷默认 7 天过期（毫秒）。
+pub const DISCLOSURE_TTL_MS: i64 = 7 * 24 * 3600 * 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -26,6 +30,19 @@ pub enum OutboxStatus {
     Confirmed,
     Cancelled,
     Failed,
+}
+
+/// 披露标记（信封 disclosure 段）：对端消费的转咨/过期/范围约束。
+/// 本端只负责签发；对端执法契约属 F5 云端协议（FD-10）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvelopeDisclosure {
+    pub redaction_level: String,
+    pub max_hops: u32,
+    pub hops_remaining: u32,
+    pub expires_at: i64,
+    /// 形如 `tag:finance/财报` / `path:/notes/book` 的范围标签。
+    pub allowed_scopes: Vec<String>,
 }
 
 /// 出设备信封：发送字节 = 该结构的确定性 JSON 序列化。
@@ -38,6 +55,7 @@ pub struct RedactionEnvelope {
     pub target_level: String,
     pub rule_set_version: String,
     pub created_at: i64,
+    pub disclosure: EnvelopeDisclosure,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -49,6 +67,9 @@ pub struct RedactionOutboxRecord {
     pub settled_at: Option<i64>,
     pub question: String,
     pub scope_entry_ids: Vec<String>,
+    /// 当次授权范围标签（tag:/path: 前缀），进信封 disclosure.allowedScopes。
+    #[serde(default)]
+    pub allowed_scopes: Vec<String>,
     pub target_level: String,
     pub rule_set_version: String,
     pub payload: String,
@@ -82,6 +103,13 @@ impl RedactionOutboxRecord {
             target_level: self.target_level.clone(),
             rule_set_version: self.rule_set_version.clone(),
             created_at: self.created_at,
+            disclosure: EnvelopeDisclosure {
+                redaction_level: self.target_level.clone(),
+                max_hops: DISCLOSURE_MAX_HOPS,
+                hops_remaining: DISCLOSURE_MAX_HOPS,
+                expires_at: self.created_at + DISCLOSURE_TTL_MS,
+                allowed_scopes: self.allowed_scopes.clone(),
+            },
         }
     }
 
@@ -106,6 +134,7 @@ pub fn draft_from_preview(
         settled_at: None,
         question: question.to_string(),
         scope_entry_ids: scope_entry_ids.to_vec(),
+        allowed_scopes: Vec::new(),
         target_level: report.target_level.clone(),
         rule_set_version: report.rule_set_version.clone(),
         payload: report.final_text.clone(),
@@ -291,6 +320,30 @@ mod tests {
         write_record(root.path(), &record).unwrap();
         let loaded = read_record(root.path(), &record.receipt_id).unwrap();
         assert_eq!(loaded, record);
+    }
+
+    /// F5 披露标记：信封序列化携带 disclosure 段（等级/hops/过期/范围），
+    /// 且确定性序列化保持 byte-equal 纪律。
+    #[test]
+    fn envelope_carries_disclosure_block() {
+        let mut record = draft_from_preview("q", &["e1".to_string()], &report("x"), 1000);
+        record.allowed_scopes = vec!["tag:finance/财报".to_string()];
+        let envelope = record.envelope();
+        assert_eq!(envelope.disclosure.redaction_level, "r2");
+        assert_eq!(envelope.disclosure.max_hops, DISCLOSURE_MAX_HOPS);
+        assert_eq!(envelope.disclosure.hops_remaining, DISCLOSURE_MAX_HOPS);
+        assert_eq!(
+            envelope.disclosure.expires_at,
+            1000 + DISCLOSURE_TTL_MS
+        );
+        assert_eq!(envelope.disclosure.allowed_scopes, vec!["tag:finance/财报"]);
+        let raw = String::from_utf8(record.envelope_bytes()).unwrap();
+        assert!(raw.contains("\"disclosure\""));
+        assert!(raw.contains("\"allowedScopes\""));
+        // 旧档（无 allowedScopes 字段）仍可读，scope 为空。
+        let legacy = draft_from_preview("q", &[], &report("y"), 1);
+        assert!(legacy.allowed_scopes.is_empty());
+        assert!(legacy.envelope().disclosure.allowed_scopes.is_empty());
     }
 
     #[test]

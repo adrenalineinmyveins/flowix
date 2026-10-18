@@ -49,6 +49,14 @@ pub struct RedactionConfig {
     pub strict_luhn: bool,
     #[serde(default = "default_true")]
     pub rewrite_absolute_time: bool,
+    /// FD-8：蒸馏 Agent 类型覆盖。空 = 默认 deepseek-harness；
+    /// 非法值在蒸馏派发时报 agent_type_invalid。
+    #[serde(default)]
+    pub distill_agent_type: String,
+    /// F5：平台中继地址（如 https://relay.flowix.cc/v1/consult）。
+    /// 空 = 未配置，transmit 返回 RELAY_NOT_CONFIGURED。
+    #[serde(default)]
+    pub relay_url: String,
 }
 
 impl Default for RedactionConfig {
@@ -61,6 +69,8 @@ impl Default for RedactionConfig {
             confirm_timeout_secs: default_confirm_timeout_secs(),
             strict_luhn: false,
             rewrite_absolute_time: true,
+            distill_agent_type: String::new(),
+            relay_url: String::new(),
         }
     }
 }
@@ -79,9 +89,11 @@ fn words_file(dir: &Path) -> PathBuf {
 }
 
 pub(crate) fn read_config_from(dir: &Path) -> RedactionConfig {
+    // 真机点检发现：PowerShell 等工具写出的 UTF-8 BOM 会让 serde_json
+    // 解析失败而静默回退默认值（relayUrl 等覆盖丢失）。读入时剥 BOM。
     fs::read_to_string(config_file(dir))
         .ok()
-        .and_then(|raw| serde_json::from_str::<RedactionConfig>(&raw).ok())
+        .and_then(|raw| serde_json::from_str::<RedactionConfig>(raw.trim_start_matches('\u{feff}')).ok())
         .unwrap_or_default()
 }
 
@@ -202,6 +214,9 @@ pub fn redaction_l1_preview(text: String) -> Result<RedactionPreview, String> {
 /// L2 蒸馏（DSH agent 会话）→ L3 复扫回炉。返回未确认态报告；
 /// 错误码 scope_empty / payload_too_large / distill_failed /
 /// rule_hit_after_distill / placeholder_broken / invalid_level。
+///
+/// `min_levels`：参与技能/身份卡声明的最低脱敏等级（P1-2 联动），
+/// 与 target_level 取 max 后生效；省略 = 仅用户等级。
 #[tauri::command]
 pub async fn redaction_preview(
     app_handle: tauri::AppHandle,
@@ -209,6 +224,7 @@ pub async fn redaction_preview(
     question: String,
     scope_entry_ids: Vec<String>,
     target_level: String,
+    min_levels: Option<Vec<String>>,
 ) -> Result<crate::redaction::RedactionPreviewReport, String> {
     if question.trim().is_empty() {
         return Err("QUESTION_REQUIRED".to_string());
@@ -217,15 +233,17 @@ pub async fn redaction_preview(
     if !root.is_absolute() || !root.is_dir() {
         return Err("INVALID_CWD".to_string());
     }
-    if !REDACTION_LEVELS.contains(&target_level.as_str()) {
-        return Err(format!("INVALID_LEVEL:{target_level}"));
-    }
+    let effective = crate::redaction::effective_target_level(
+        &target_level,
+        &min_levels.unwrap_or_default(),
+    )
+    .map_err(|error| error.to_ipc_error())?;
     crate::redaction::preview_full(
         &app_handle,
         &cwd,
         &question,
         &scope_entry_ids,
-        &target_level,
+        &effective,
     )
     .await
     .map_err(|error| error.to_ipc_error())
@@ -310,6 +328,19 @@ pub fn redaction_outbox_list(
     Ok(crate::redaction::list_records(&root))
 }
 
+/// F5 客户端传输层：把 confirmed 信封从唯一出口投递到配置的平台中继。
+/// 中继未配置返回 RELAY_NOT_CONFIGURED；未过确认门沿 UNCONFIRMED_SEND_BLOCKED
+/// 兜底；投递失败留档保持 confirmed（take 幂等，可重试）。
+#[tauri::command]
+pub async fn redaction_transmit(
+    cwd: String,
+    receipt_id: String,
+) -> Result<crate::redaction::RelayDeliverResult, String> {
+    let root = notebook_root(&cwd)?;
+    let config = load_config()?;
+    crate::redaction::deliver_confirmed_envelope(&root, &receipt_id, &config.relay_url).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +358,21 @@ mod tests {
     }
 
     #[test]
+    fn config_tolerates_utf8_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = RedactionConfig {
+            relay_url: "http://127.0.0.1:8787/v1".to_string(),
+            ..RedactionConfig::default()
+        };
+        write_config_to(dir.path(), &config).unwrap();
+        // 模拟 PowerShell Set-Content 写出的带 BOM 文件：剥 BOM 后仍可读。
+        let raw = std::fs::read(config_file(dir.path())).unwrap();
+        let bom_raw = [b'\xEF', b'\xBB', b'\xBF'].iter().chain(raw.iter()).cloned().collect::<Vec<u8>>();
+        std::fs::write(config_file(dir.path()), bom_raw).unwrap();
+        assert_eq!(read_config_from(dir.path()), config);
+    }
+
+    #[test]
     fn config_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let config = RedactionConfig {
@@ -336,6 +382,8 @@ mod tests {
             confirm_timeout_secs: 90,
             strict_luhn: true,
             rewrite_absolute_time: false,
+            distill_agent_type: "deepseek-harness".to_string(),
+            relay_url: "https://relay.example/v1".to_string(),
             schema_version: 0,
         };
         write_config_to(dir.path(), &config).unwrap();

@@ -1,7 +1,7 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { ChevronLeft, ChevronRight, MoreHorizontal } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ChevronLeft, ChevronRight, MoreHorizontal, ShieldCheck, Fingerprint } from 'lucide-react';
 import {
   ArchiveIcon,
   FileTextIcon,
@@ -24,6 +24,9 @@ import {
 import { DEFAULT_AGENT_TYPE_KEY, getAgentType } from '@/lib/agent-types';
 import { useAgentSessionStore } from '@features/agent/store/agent-session-store';
 import { useAgentAccessStore } from '@features/agent/store/agent-access-store';
+import { useNoteStore } from '@features/memo/store/note-store';
+import { RedactionSendGateDialogController } from '@features/agent/components/redaction-send-gate';
+import { AgentProfileCardsDialogController } from '@features/agent/components/agent-profile-cards';
 import { openNoteByNotebookPath, openNoteByPhysicalPath } from '@features/memo/use-cases/open-by-target';
 import { openExternalTarget } from '@features/workspace/use-cases/workspace-navigation';
 import { getAgentConversationPresentation } from '@features/agent/conversation-presentation';
@@ -133,6 +136,49 @@ function AgentConversationHeader({ instanceId }: { instanceId: string }) {
     setTitleDraft(target.title?.trim() || '');
     setIsEditingTitle(true);
   }, []);
+
+  // 笔记本级对话框共用的路径/ID 解析（snapshot → note store → 选中笔记本）。
+  const redactionGateRef = useRef<RedactionSendGateDialogController | null>(null);
+  const profileCardsRef = useRef<AgentProfileCardsDialogController | null>(null);
+  useEffect(
+    () => () => {
+      redactionGateRef.current?.close();
+      profileCardsRef.current?.close();
+    },
+    [],
+  );
+  const resolveNotebookContext = useCallback(() => {
+    const runtimeConfig = instance?.runtimeConfig;
+    const notebookId = runtimeConfig?.notebookId
+      ?? runtimeConfig?.workspaceSnapshot?.notebookId
+      ?? instance?.source.notebookId
+      ?? null;
+    const noteState = useNoteStore.getState();
+    const notebookPath = runtimeConfig?.workspaceSnapshot?.notebookPath?.trim()
+      || (notebookId ? noteState.notebooks.find((item) => item.id === notebookId)?.path : undefined)
+      || noteState.selectedNotebook?.path;
+    if (!notebookPath) return null;
+    const resolvedNotebookId = notebookId
+      ?? noteState.notebooks.find((item) => item.path === notebookPath)?.id
+      ?? '';
+    return { notebookId: resolvedNotebookId, notebookPath };
+  }, [instance]);
+
+  // 脱敏发送确认门（F6 disclosure scope）：cwd 必须是笔记本根目录。
+  const onOpenRedactionGate = useCallback(() => {
+    const context = resolveNotebookContext();
+    if (!context) return;
+    redactionGateRef.current ??= new RedactionSendGateDialogController();
+    redactionGateRef.current.open(context.notebookId, context.notebookPath);
+  }, [resolveNotebookContext]);
+
+  // 个人 Agent 身份卡（F1 profile 卡片 UI）。
+  const onOpenProfileCards = useCallback(() => {
+    const context = resolveNotebookContext();
+    if (!context) return;
+    profileCardsRef.current ??= new AgentProfileCardsDialogController();
+    profileCardsRef.current.open(context.notebookPath);
+  }, [resolveNotebookContext]);
 
   const onOpenSourceDocument = useCallback(() => {
     if (!instance || !presentation?.hasSourceDocument) return;
@@ -260,6 +306,12 @@ function AgentConversationHeader({ instanceId }: { instanceId: string }) {
               </DropdownMenuItem>
               <DropdownMenuItem onClick={() => onRename(instance)} className="group h-7 items-center gap-2 rounded-lg px-2 py-0 hover:bg-[var(--brand)] hover:text-[var(--primary-foreground)]">
                 <PencilSimpleIcon className="h-4 w-4" /> {t('agent.chat.conversation.rename')}
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={onOpenProfileCards} className="group h-7 items-center gap-2 rounded-lg px-2 py-0 hover:bg-[var(--brand)] hover:text-[var(--primary-foreground)]">
+                <Fingerprint className="h-4 w-4" /> 个人 Agent…
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={onOpenRedactionGate} className="group h-7 items-center gap-2 rounded-lg px-2 py-0 hover:bg-[var(--brand)] hover:text-[var(--primary-foreground)]">
+                <ShieldCheck className="h-4 w-4" /> 脱敏发送…
               </DropdownMenuItem>
               <DropdownMenuItem onClick={() => void onRemove(instance, 'archive')} className="group h-7 items-center gap-2 rounded-lg px-2 py-0 hover:bg-[var(--brand)] hover:text-[var(--primary-foreground)]">
                 <ArchiveIcon className="h-4 w-4" /> {t('document.agent.archiveConversation')}

@@ -62,6 +62,18 @@ export interface AgentAccessState {
     | { ok: false; code: AgentAccessErrorCode }
   >;
 
+  /**
+   * 加一个标签级授权 entry (kind="tag", scope 为 tagPath 及其子树)。
+   * 已有同 tagPath 的 tag entry 时返回 already-tracked, 不写盘。
+   * 给脱敏 scope 选择器 (F6 disclosure scope) 使用。
+   */
+  addTagScope: (
+    tagPath: string,
+  ) => Promise<
+    | { ok: true; entry: AgentAccessEntry }
+    | { ok: false; code: AgentAccessErrorCode }
+  >;
+
   setDefaultRuntime: (
     agentType: AgentTypeKey,
     patch: AgentAccessDefaultRuntime,
@@ -162,6 +174,34 @@ export const useAgentAccessStore = create<AgentAccessState>((set, get) => ({
         return { ok: false, code: "already-tracked" };
       }
       logger.error("agentAccess.addFolder failed, rolling back:", { error: e });
+      await get().loadInitial();
+      return { ok: false, code: "save-failed" };
+    }
+  },
+
+  addTagScope: async (tagPath: string) => {
+    const trimmed = tagPath.trim().replace(/^\/+|\/+$/g, "");
+    if (!trimmed) {
+      return { ok: false, code: "not-selected" };
+    }
+    const prev = get().config;
+    const existing = prev.entries.find(
+      (entry) => entry.kind === "tag" && entry.tagPath === trimmed,
+    );
+    if (existing) {
+      return { ok: false, code: "already-tracked" };
+    }
+    const entry = makeLocalTagEntry(trimmed);
+    const optimistic = {
+      ...prev,
+      entries: [...prev.entries, entry],
+    };
+    set({ config: optimistic });
+    try {
+      await agentAccess.set(optimistic);
+      return { ok: true, entry };
+    } catch (e) {
+      logger.error("agentAccess.addTagScope failed, rolling back:", { error: e });
       await get().loadInitial();
       return { ok: false, code: "save-failed" };
     }
@@ -270,6 +310,23 @@ function makeLocalFolderEntry(path: string, name?: string): AgentAccessEntry {
     kind: "folder",
     path: trimmed,
     name: derived,
+    enabled: true,
+    addedAt: now,
+    updatedAt: now,
+    missing: false,
+  };
+}
+
+/** 在前端构造一条 Tag entry ── kind="tag"、path 留空、范围存 tagPath,
+ * 与后端 access.rs 的 Tag 变体契约一致 (missing 恒 false)。 */
+function makeLocalTagEntry(tagPath: string): AgentAccessEntry {
+  const now = Date.now();
+  return {
+    id: `tag_${now}_${Math.random().toString(36).slice(2, 6)}`,
+    kind: "tag",
+    path: "",
+    name: tagPath,
+    tagPath,
     enabled: true,
     addedAt: now,
     updatedAt: now,

@@ -213,3 +213,73 @@ describe("agent-access-store workspace selection", () => {
     expect(useAgentAccessStore.getState().config.defaults?.files).toBeUndefined();
   });
 });
+
+describe("agent-access-store tag scope", () => {
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    agentAccessMock.config = { version: 1, entries: [] };
+    agentAccessMock.get.mockImplementation(async () => agentAccessMock.config);
+    agentAccessMock.set.mockImplementation(async (config) => {
+      agentAccessMock.config = config;
+    });
+    const { useAgentAccessStore } =
+      await import("@features/agent/store/agent-access-store");
+    useAgentAccessStore.setState({
+      config: { version: 1, entries: [] },
+      isLoading: false,
+      hasLoaded: false,
+      loadError: null,
+    });
+  });
+
+  it("addTagScope creates a tag entry (kind=tag, path empty, tagPath set) and persists", async () => {
+    const { useAgentAccessStore } =
+      await import("@features/agent/store/agent-access-store");
+    const result = await useAgentAccessStore.getState().addTagScope("finance/财报");
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    const entries = useAgentAccessStore.getState().config.entries;
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      kind: "tag",
+      path: "",
+      tagPath: "finance/财报",
+      name: "finance/财报",
+      enabled: true,
+      missing: false,
+    });
+    expect(agentAccessMock.set).toHaveBeenCalledTimes(1);
+  });
+
+  it("addTagScope trims slashes and rejects empty paths", async () => {
+    const { useAgentAccessStore } =
+      await import("@features/agent/store/agent-access-store");
+    expect((await useAgentAccessStore.getState().addTagScope("  ")).ok).toBe(false);
+    const result = await useAgentAccessStore.getState().addTagScope("/finance/财报/");
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.entry.tagPath).toBe("finance/财报");
+  });
+
+  it("addTagScope returns already-tracked for a duplicate tagPath without writing", async () => {
+    const { useAgentAccessStore } =
+      await import("@features/agent/store/agent-access-store");
+    const first = await useAgentAccessStore.getState().addTagScope("finance/财报");
+    expect(first.ok).toBe(true);
+    const second = await useAgentAccessStore.getState().addTagScope("finance/财报");
+    expect(second).toMatchObject({ ok: false, code: "already-tracked" });
+    expect(useAgentAccessStore.getState().config.entries).toHaveLength(1);
+    expect(agentAccessMock.set).toHaveBeenCalledTimes(1);
+  });
+
+  it("addTagScope rolls back the optimistic entry when the write fails", async () => {
+    const { useAgentAccessStore } =
+      await import("@features/agent/store/agent-access-store");
+    agentAccessMock.set.mockRejectedValueOnce(new Error("disk full"));
+    const result = await useAgentAccessStore.getState().addTagScope("industry/电商");
+    expect(result).toMatchObject({ ok: false, code: "save-failed" });
+    // 回滚走 loadInitial, 内存回到磁盘真值 (空 entries)。
+    expect(useAgentAccessStore.getState().config.entries).toHaveLength(0);
+  });
+});
