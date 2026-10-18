@@ -51,9 +51,13 @@ pub fn dispatch_trigger_event(event: NurtureTriggerEvent) {
 /// 启动触发器订阅 task：每次事件从 AppState 解析授权条目、根路径与该
 /// notebook 的全部 profile，对每个「全局闸 + per-agent 闸」都命中的 agent
 /// 独立计数，达阈值入队（job 携带真实 agent_id）。由 bootstrap 调用一次。
-pub fn start_trigger(app: tauri::AppHandle) -> tokio::task::JoinHandle<()> {
+///
+/// 注意：bootstrap 的 setup 闭包运行在非 Tokio 线程，必须用
+/// `tauri::async_runtime::spawn`（内部进入全局 runtime）；裸 `tokio::spawn`
+/// 会因 "no reactor running" 直接 panic。
+pub fn start_trigger(app: tauri::AppHandle) -> tauri::async_runtime::JoinHandle<()> {
     let mut rx = trigger_channel().subscribe();
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         while let Ok(event) = rx.recv().await {
             let Some((notebook_root, scopes)) = notebook_scopes(&app, &event.notebook_id)
             else {

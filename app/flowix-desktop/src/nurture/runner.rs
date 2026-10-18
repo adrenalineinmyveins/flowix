@@ -186,7 +186,7 @@ async fn run_inner(
     } else {
         profile.agent_type.clone()
     };
-    let (answer, thread_id_for_state) = run_distill_once(
+    let (answer, thread_id_for_state, distill_usage) = run_distill_once(
         app,
         &state,
         &notebook_root,
@@ -212,12 +212,15 @@ async fn run_inner(
     nurture_state.consecutive_failures = 0;
     nurture_state.paused = false;
     write_nurture_state(&notebook_root, &profile.agent_id, &nurture_state);
-    // F1 运行状态记账：runs +1、lastRunAt、distill thread 进 FIFO。
-    // token 用量待 usage 事件接线（F4），当前不计。
+    // F1 运行状态记账：runs +1、lastRunAt、distill thread 进 FIFO；
+    // token 用量按会话 usage 记（DSH，P1-3.1 接线）。
     {
         let mut agent_state =
             crate::commands::agent_profile::read_state_or_new(&notebook_root, &profile.agent_id);
         agent_state.record_run(&thread_id_for_state, now);
+        if let Some((tokens_in, tokens_out)) = distill_usage {
+            agent_state.record_tokens(tokens_in, tokens_out);
+        }
         let _ = crate::commands::agent_profile::write_state(&notebook_root, &agent_state);
     }
     append_log_line(
@@ -260,8 +263,10 @@ fn find_first_profile(root: &Path) -> Result<Option<(AgentProfile, String)>, Str
     Ok(None)
 }
 
-/// 发起一次蒸馏 agent run 并等待完成，返回 (最终 assistant 文本, threadId)。
-/// threadId 供调用方做运行状态记账（线程本身已删除）。
+/// 发起一次蒸馏 agent run 并等待完成，返回 (最终 assistant 文本, threadId,
+/// token 用量)。threadId 供调用方做运行状态记账（线程本身已删除）；
+/// usage 为 (tokensIn, tokensOut)，仅 DSH 运行时在删除线程前取到，
+/// 其他 runtime 暂无会话级 usage 查询（None = 不计）。
 ///
 /// 线程模式与 `plugin_run` 一致：create → listen stream_end → dispatch →
 /// 读输出 → 删除线程。F6 脱敏蒸馏共用（title 区分审计来源）。
@@ -272,7 +277,7 @@ pub(crate) async fn run_distill_once(
     prompt: &str,
     agent_type: &str,
     title: &str,
-) -> Result<(String, String), String> {
+) -> Result<(String, String, Option<(u64, u64)>), String> {
     let runtime = crate::agent_external::runtime_registry::ExternalRuntimeKind::parse(agent_type)
         .map_err(|e| format!("agent_type_invalid: {e}"))?;
     let runtime_key = runtime.key().to_string();
@@ -370,6 +375,22 @@ pub(crate) async fn run_distill_once(
     }
     .await;
 
+    // P1-3.1 token 记账：DSH 在线程删除前取会话 usage（外部会话映射随
+    // 线程删除失效，取不到则不计）。
+    let usage = if result.is_ok()
+        && runtime_key == crate::agent_external::deepseek_harness::AGENT_TYPE
+    {
+        state
+            .deepseek_harness
+            .session_usage(&thread.thread_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|usage| (usage.input_tokens, usage.output_tokens))
+    } else {
+        None
+    };
+
     app.unlisten(listener);
     if let Err(error) = state
         .thread_manager
@@ -378,7 +399,7 @@ pub(crate) async fn run_distill_once(
     {
         tracing::warn!(thread_id = %thread.thread_id, "clean up distill thread failed: {error}");
     }
-    result
+    result.map(|(answer, thread_id)| (answer, thread_id, usage))
 }
 
 fn read_memories(root: &Path, agent_id: &str) -> String {

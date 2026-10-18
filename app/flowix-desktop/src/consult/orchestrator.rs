@@ -106,6 +106,17 @@ pub async fn orchestrate(app: &AppHandle, notebook_root: &Path, mut meta: Consul
     let result = run_consult_cycle(&*host, &mut meta, notebook_root, &prompt).await;
     match result {
         Ok(answer) => {
+            // F1 记账：专家被咨询 +1（本地 state；无 state 文件则新建）。
+            {
+                let mut expert_state = crate::commands::agent_profile::read_state_or_new(
+                    notebook_root,
+                    &meta.to_agent_id,
+                );
+                expert_state.consultations_received =
+                    expert_state.consultations_received.saturating_add(1);
+                expert_state.last_consulted_at = Some(chrono::Utc::now().timestamp_millis());
+                let _ = crate::commands::agent_profile::write_state(notebook_root, &expert_state);
+            }
             let updated = finish(&meta, ConsultStatus::Completed);
             let event = ConsultEvent::Result { answer, artifact_suggestion: None };
             push_event(&updated.consult_id, event.clone());
