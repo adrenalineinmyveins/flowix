@@ -13,7 +13,7 @@
 
 | 域 | 里程碑 | 状态 | 关键落点 |
 | --- | --- | --- | --- |
-| F1 Profile | 数据模型 + 接线 + 卡片 UI | ✅ | `flowix-core/src/agent/`、`.agents/` 双数据面、AgentState 记账（含 token，2026-10-18 接线）；卡片 UI（2026-10-17）：`agent_profile_update` 扩展隐私边界/model 可选参数，前端 `agent-profile-cards.tsx` 列表+详情+隐私三字段编辑，入口在会话标题栏「个人 Agent…」 |
+| F1 Profile | 数据模型 + 接线 + 卡片 UI | ✅ | `flowix-core/src/agent/`、`.agents/` 双数据面、AgentState 记账（含 token，2026-10-18 接线）；卡片 UI（2026-10-17）：`agent_profile_update` 扩展隐私边界/model 可选参数，前端 `agent-profile-cards.tsx` 列表+详情+隐私三字段编辑，入口在会话标题栏「个人 Agent…」；（2026-10-18）面板并入中列视图切换组第四 tab，与访问空间/卡片/对话并列，并对齐中列统一格式（--list-bg、避让标题行、OverlayScrollbar、i18n、Radix 删除确认、@[440px] 容器查询），全视图标题避让 pl-[100px]→pl-[126px] |
 | F2 喂养 | N1-N3 + 多 agent 映射 | ✅ | `nurture/{mod,runner}.rs`、disclosure_scope 门控、水位增量 |
 | F3 技能 | manifest v3 + knowledgeScope + P2 导入导出 + P4 执法 | ✅ | `flowix-plugin-runtime/src/manifest.rs`、skill_registry；P2（2026-10-18）：`plugin_export/plugin_import`（zip 往返 byte-equal + zip-slip 防护）；P4：`ToolPolicy` 类别级黑名单执行器（越权 tool_call 终止 run 留痕）+ `effective_target_level` 与 preview 联动 |
 | F4 本机互咨 | mailbox + BudgetGuard + AskBackGate + DSH 编排 + 咨询记账 | ✅ | `consult/{mod,orchestrator}.rs`、`commands/consult.rs`；被咨询次数/lastConsultedAt 落 AgentState |

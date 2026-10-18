@@ -24,6 +24,7 @@ import {
 } from '@features/memo/store/note-store';
 import { useMemoLibraryMetadataStore } from '@features/memo/store/memo-library-metadata-store';
 import { useCustomFilterStore } from '@features/memo/store/custom-filter-store';
+import { MEMO_LIST_VIEW_HEADER_INSET_CLASS } from '@features/memo/components/memo-list-view-tabs';
 import { setDocumentProperties } from '@features/document/public/path-properties';
 import { useTagStore } from '@features/memo/store/tag-store';
 import {
@@ -1177,7 +1178,7 @@ export function MemoList({
         onLoadStart={handleMemoListLoadStart}
         onLoadSuccess={handleMemoListLoadSuccess}
       />
-      <div className="flex min-w-0 items-center gap-2 pb-2 pl-[126px] pr-3">
+      <div className={`flex min-w-0 items-center gap-2 pb-2 ${MEMO_LIST_VIEW_HEADER_INSET_CLASS} pr-3`}>
         <div className="min-w-0 flex-1">
           {!showFolderView && (
           <MemoNavigationDropdown

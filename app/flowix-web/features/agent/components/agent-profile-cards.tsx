@@ -13,6 +13,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } f
 import { OverlayScrollbar } from '@shared/ui/overlay-scrollbar';
 import { ListSurfaceLoadingState } from '@shared/ui/list-surface';
 import { useI18n, type I18nKey } from '@/lib/i18n';
+import { MEMO_LIST_VIEW_HEADER_INSET_CLASS } from '@features/memo/components/memo-list-view-tabs';
 import { cn } from '@/lib/utils';
 
 /** 披露等级下拉文案走 i18n（原 lib 硬编码中文映射随本面板迁移）。 */
@@ -273,7 +274,7 @@ export function AgentProfileCardsPanel({
       <div
         className={cn(
           'flex shrink-0 items-center justify-between gap-2 pb-2 pr-3',
-          embedded ? 'pl-[126px]' : 'pl-4',
+          embedded ? MEMO_LIST_VIEW_HEADER_INSET_CLASS : 'pl-4',
         )}
       >
         <span className="min-w-0 truncate text-[15px] font-medium text-[var(--foreground)]">

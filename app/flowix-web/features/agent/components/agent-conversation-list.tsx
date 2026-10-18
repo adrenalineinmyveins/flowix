@@ -39,6 +39,7 @@ import {
   toggleFavoriteConversation,
 } from '@features/agent/conversation-favorites';
 import { useI18n } from '@/lib/i18n';
+import { MEMO_LIST_VIEW_HEADER_INSET_CLASS } from '@features/memo/components/memo-list-view-tabs';
 import { OverlayScrollbar } from '@shared/ui/overlay-scrollbar';
 import {
   ListSurfaceInlineLoadingState,
@@ -481,7 +482,7 @@ export function AgentConversationList({ isActive = true }: AgentConversationList
     <section className="relative flex h-full min-h-0 flex-1 flex-col bg-[var(--list-bg)]" aria-label={t('memo.navigation.conversations')}>
       {/* 标题行 ── 与 MemoList / FolderFileTree 共用同一套中间列头部结构:
           左侧标题占据剩余空间, 右侧保留本列表自己的筛选控件。 */}
-      <div className="flex items-center justify-between gap-2 pb-2 pl-[126px] pr-3">
+      <div className={`flex items-center justify-between gap-2 pb-2 ${MEMO_LIST_VIEW_HEADER_INSET_CLASS} pr-3`}>
           <div className="flex min-w-0 flex-1 items-center gap-2">
             <span className="min-w-0 truncate text-[15px] font-medium text-[var(--foreground)]">
               {t('memo.navigation.conversations')}

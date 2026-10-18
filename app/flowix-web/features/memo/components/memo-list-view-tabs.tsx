@@ -10,6 +10,13 @@ import { NotebookTreeFileIcon } from '@features/memo/components/notebook-tree-fi
 
 export type MemoListViewTab = 'folders' | 'cards' | 'conversations' | 'agents';
 
+/**
+ * 中列各视图标题行的左避让 class：12px 切换器边距 + tabs 总宽（每 tab 26px 步进，
+ * 当前 4 个 = 108px 含边框内边距）+ 6px 间隙 = 126px。
+ * 增删 tab 后需按公式同步此值（MemoList / AgentConversationList / AgentProfileCardsPanel 共用）。
+ */
+export const MEMO_LIST_VIEW_HEADER_INSET_CLASS = 'pl-[126px]';
+
 interface MemoListViewTabsProps {
   activeTab: MemoListViewTab;
   onChange: (tab: MemoListViewTab) => void;
