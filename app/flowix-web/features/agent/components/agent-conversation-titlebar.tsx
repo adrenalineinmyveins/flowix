@@ -26,7 +26,6 @@ import { useAgentSessionStore } from '@features/agent/store/agent-session-store'
 import { useAgentAccessStore } from '@features/agent/store/agent-access-store';
 import { useNoteStore } from '@features/memo/store/note-store';
 import { RedactionSendGateDialogController } from '@features/agent/components/redaction-send-gate';
-import { AgentProfileCardsDialogController } from '@features/agent/components/agent-profile-cards';
 import { openNoteByNotebookPath, openNoteByPhysicalPath } from '@features/memo/use-cases/open-by-target';
 import { openExternalTarget } from '@features/workspace/use-cases/workspace-navigation';
 import { getAgentConversationPresentation } from '@features/agent/conversation-presentation';
@@ -139,11 +138,9 @@ function AgentConversationHeader({ instanceId }: { instanceId: string }) {
 
   // 笔记本级对话框共用的路径/ID 解析（snapshot → note store → 选中笔记本）。
   const redactionGateRef = useRef<RedactionSendGateDialogController | null>(null);
-  const profileCardsRef = useRef<AgentProfileCardsDialogController | null>(null);
   useEffect(
     () => () => {
       redactionGateRef.current?.close();
-      profileCardsRef.current?.close();
     },
     [],
   );
@@ -172,13 +169,10 @@ function AgentConversationHeader({ instanceId }: { instanceId: string }) {
     redactionGateRef.current.open(context.notebookId, context.notebookPath);
   }, [resolveNotebookContext]);
 
-  // 个人 Agent 身份卡（F1 profile 卡片 UI）。
+  // 个人 Agent 身份卡：切到中列「个人 Agent」视图统一管理。
   const onOpenProfileCards = useCallback(() => {
-    const context = resolveNotebookContext();
-    if (!context) return;
-    profileCardsRef.current ??= new AgentProfileCardsDialogController();
-    profileCardsRef.current.open(context.notebookPath);
-  }, [resolveNotebookContext]);
+    useNoteStore.getState().setMiddleColumnView('agents');
+  }, []);
 
   const onOpenSourceDocument = useCallback(() => {
     if (!instance || !presentation?.hasSourceDocument) return;

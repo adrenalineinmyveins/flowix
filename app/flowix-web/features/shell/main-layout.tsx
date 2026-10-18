@@ -32,7 +32,7 @@ import {
   type Notebook,
 } from '@features/memo/public/shell-api';
 import { AgentConversationTitlebar } from '@features/agent/public/shell-api';
-import { AgentProfileCardsPanel } from '@features/agent/components/agent-profile-cards';
+import { AgentProfileListPanel, AgentProfileTitlebar, AgentProfileEditor } from '@features/agent/components/agent-profile-cards';
 import { useSettingsStore } from '@/lib/store/settings-store';
 import { useShallow } from 'zustand/react/shallow';
 import {
@@ -202,6 +202,8 @@ export function MainLayout({
   const memoListView = useMemoListViewPreference();
   const isAgentConversationView = middleColumnView === 'conversations';
   const isAgentsView = middleColumnView === 'agents';
+  /** 个人 Agent 视图占据右列（列表在中列，编辑页 + 标题栏替换整个工作列）。 */
+  const agentProfileSurfaceActive = isAgentsView && Boolean(selectedNotebook?.path);
   const {
     currentDocumentPath,
     activeExternalSession,
@@ -732,7 +734,7 @@ export function MainLayout({
                 {isAgentsView && (
                   <div className="absolute inset-0 z-10">
                     {selectedNotebook?.path
-                      ? <AgentProfileCardsPanel notebookPath={selectedNotebook.path} embedded />
+                      ? <AgentProfileListPanel notebookPath={selectedNotebook.path} />
                       : (
                         <div className="flex h-full items-center justify-center px-6 text-center text-sm text-[var(--muted-foreground)]">
                           {t('status.agent.noNotebookForAgents')}
@@ -767,7 +769,7 @@ export function MainLayout({
           {/* Memo detail */}
             <div
               className="relative h-full min-w-0 flex flex-col bg-[var(--document-bg)]"
-              style={browserColumnVisible
+              style={(browserColumnVisible && !agentProfileSurfaceActive)
                 ? {
                     minWidth: DOCUMENT_PANEL_MIN_WIDTH,
                     flex: `0 0 ${browserColumnLayout.mainColumnWidth}px`,
@@ -800,7 +802,13 @@ export function MainLayout({
               </button>
             )}
             {/* Fixed top navigation bar */}
-            {workColumnPresentation.header.kind === 'agent' ? (
+            {agentProfileSurfaceActive ? (
+              <AgentProfileTitlebar
+                reserveWindowsControls={!browserColumnVisible}
+                isSidebarCollapsed={isMemoListHidden}
+                onExpandSidebar={handleToggleMemoList}
+              />
+            ) : workColumnPresentation.header.kind === 'agent' ? (
               <AgentConversationTitlebar
                 instanceId={workColumnPresentation.header.instanceId}
                 reserveWindowsControls={!browserColumnVisible}
@@ -862,6 +870,11 @@ export function MainLayout({
                 </div>
               )}
               <WorkColumnContentHost content={workColumnPresentation.content} />
+              {agentProfileSurfaceActive && (
+                <div className="absolute inset-0 z-[45]">
+                  <AgentProfileEditor key={selectedNotebook!.path} notebookPath={selectedNotebook!.path} />
+                </div>
+              )}
               {(isDocumentTransitioning
                 || (navigationState.phase === 'loading' && navigationState.showWorkColumnLoading)) && (
                 <CenteredLoadingSpinner
@@ -873,7 +886,7 @@ export function MainLayout({
               )}
             </div>
           </div>
-          {browserColumnVisible && (
+          {browserColumnVisible && !agentProfileSurfaceActive && (
             <Suspense fallback={null}>
               <BrowserColumn
                 width={browserColumnLayout.browserColumnWidth}

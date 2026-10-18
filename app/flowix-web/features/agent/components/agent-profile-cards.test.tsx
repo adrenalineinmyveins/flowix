@@ -17,7 +17,11 @@ vi.mock('@platform/tauri/client', async (importOriginal) => ({
 }));
 
 import type { AgentProfile } from '@/lib/types/agent-profile';
-import { AgentProfileCardsDialog } from '@features/agent/components/agent-profile-cards';
+import { useNoteStore } from '@features/memo/store/note-store';
+import {
+  AgentProfileListPanel,
+  AgentProfileEditor,
+} from '@features/agent/components/agent-profile-cards';
 
 const CWD = '/notes/book';
 
@@ -43,9 +47,9 @@ const FIRST = profile();
 let host: HTMLDivElement;
 let root: Root;
 
-async function mount() {
+async function mount(element: React.ReactElement) {
   await act(async () => {
-    root.render(<AgentProfileCardsDialog notebookPath={CWD} onClose={() => {}} />);
+    root.render(element);
   });
 }
 
@@ -60,6 +64,15 @@ function button(text: string): HTMLButtonElement {
 
 async function click(text: string) {
   await act(async () => button(text).click());
+}
+
+// 列表卡片按钮的文本是名称 + 类型/专长两行拼接，按包含匹配。
+async function clickCard(name: string) {
+  const element = [...document.body.querySelectorAll('button')].find(
+    (node) => node.textContent?.includes(name),
+  );
+  expect(element, `card ${name}`).toBeDefined();
+  await act(async () => element!.click());
 }
 
 function selects(): HTMLSelectElement[] {
@@ -84,6 +97,10 @@ function setValue(
   // text input 只监听 input 事件, select 只监听 change —— 两个都派发。
   element.dispatchEvent(new Event('input', { bubbles: true }));
   element.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+function storeTarget() {
+  return useNoteStore.getState().agentProfileViewTarget;
 }
 
 beforeEach(() => {
@@ -118,6 +135,7 @@ beforeEach(() => {
       }),
   );
   agentProfileMock.delete.mockResolvedValue(undefined);
+  useNoteStore.setState({ agentProfileViewTarget: null, agentProfilesVersion: 0 });
   host = document.createElement('div');
   document.body.appendChild(host);
   root = createRoot(host);
@@ -128,22 +146,53 @@ afterEach(async () => {
   host.remove();
 });
 
-describe('agent profile cards', () => {
-  it('loads the card list, shows detail form and local run state', async () => {
-    await mount();
+describe('agent profile list panel', () => {
+  it('loads the card list and opens the editor on click', async () => {
+    await mount(<AgentProfileListPanel notebookPath={CWD} />);
 
     expect(agentProfileMock.list).toHaveBeenCalledWith(CWD);
     expect(host.textContent).toContain('财报解读助手');
-    // 详情表单：名称输入框带卡片名。
-    const nameInput = host.querySelector<HTMLInputElement>('input:not([type="checkbox"])')!;
-    expect(nameInput.value).toBe('财报解读助手');
-    // 本地运行状态面板。
-    expect(agentProfileMock.getState).toHaveBeenCalledWith(CWD, FIRST.flowix_agent_id);
-    expect(host.textContent).toContain('3');
+
+    await clickCard('财报解读助手');
+    expect(storeTarget()).toEqual({ agentId: FIRST.flowix_agent_id });
   });
 
-  it('saves privacy boundary fields through update', async () => {
-    await mount();
+  it('opens the creator from the new-card button', async () => {
+    await mount(<AgentProfileListPanel notebookPath={CWD} />);
+
+    await click('新建身份卡');
+    expect(storeTarget()).toEqual({ creating: true });
+  });
+
+  it('reloads when the profiles version bumps', async () => {
+    await mount(<AgentProfileListPanel notebookPath={CWD} />);
+    expect(agentProfileMock.list).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      useNoteStore.getState().bumpAgentProfiles();
+    });
+    expect(agentProfileMock.list).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('agent profile editor', () => {
+  it('shows the placeholder when no target is selected', async () => {
+    await mount(<AgentProfileEditor notebookPath={CWD} />);
+
+    expect(host.textContent).toContain('从左侧选择一张身份卡');
+    expect(agentProfileMock.get).not.toHaveBeenCalled();
+  });
+
+  it('loads the selected card and saves privacy fields', async () => {
+    await act(async () => {
+      useNoteStore.setState({ agentProfileViewTarget: { agentId: FIRST.flowix_agent_id } });
+    });
+    await mount(<AgentProfileEditor notebookPath={CWD} />);
+
+    expect(agentProfileMock.get).toHaveBeenCalledWith(CWD, FIRST.flowix_agent_id);
+    expect(agentProfileMock.getState).toHaveBeenCalledWith(CWD, FIRST.flowix_agent_id);
+    const nameInput = host.querySelector<HTMLInputElement>('input:not([type="checkbox"])')!;
+    expect(nameInput.value).toBe('财报解读助手');
 
     await act(async () => {
       const toggle = host.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
@@ -167,11 +216,15 @@ describe('agent profile cards', () => {
         model: '',
       }),
     );
+    // 保存成功后列表版本自增（驱动中列刷新）。
+    expect(useNoteStore.getState().agentProfilesVersion).toBe(1);
   });
 
-  it('creates a new card from the create form', async () => {
-    await mount();
-    await click('新建身份卡');
+  it('creates a new card and selects it', async () => {
+    await act(async () => {
+      useNoteStore.setState({ agentProfileViewTarget: { creating: true } });
+    });
+    await mount(<AgentProfileEditor notebookPath={CWD} />);
 
     await act(async () => {
       const input = host.querySelector<HTMLInputElement>('input:not([type="checkbox"])')!;
@@ -184,18 +237,23 @@ describe('agent profile cards', () => {
       CWD,
       expect.objectContaining({ displayName: '电商观察员', agentType: 'pi', bio: '', expertise: [] }),
     );
-    // 创建后刷新列表并退出新建态。
-    expect(agentProfileMock.list.mock.calls.length).toBeGreaterThanOrEqual(2);
-    expect(host.textContent).not.toContain('新建个人 Agent');
+    // 创建成功后目标切到新卡片并 bump 列表版本。
+    expect(storeTarget()).toEqual({ agentId: 'agt_new0000000002' });
+    expect(useNoteStore.getState().agentProfilesVersion).toBe(1);
   });
 
   it('deletes the selected card after confirmation dialog', async () => {
-    await mount();
+    await act(async () => {
+      useNoteStore.setState({ agentProfileViewTarget: { agentId: FIRST.flowix_agent_id } });
+    });
+    await mount(<AgentProfileEditor notebookPath={CWD} />);
     await click('删除');
 
     // 确认对话框（Portal）出现后再确认删除。
     await click('删除身份卡');
 
     expect(agentProfileMock.delete).toHaveBeenCalledWith(CWD, FIRST.flowix_agent_id);
+    expect(storeTarget()).toBeNull();
+    expect(useNoteStore.getState().agentProfilesVersion).toBe(1);
   });
 });

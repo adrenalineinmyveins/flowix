@@ -139,6 +139,10 @@ export interface NoteLibraryStore {
   selectedNotebookId: string | null;
   // UI filter/sort
   middleColumnView: MiddleColumnView;
+  /** 个人 Agent 视图当前在右列打开的目标：某个身份卡 / 新建 / 未打开。 */
+  agentProfileViewTarget: { agentId: string } | { creating: true } | null;
+  /** 身份卡数据版本：创建/保存/删除后自增，驱动中列列表刷新。 */
+  agentProfilesVersion: number;
   activeFilter: ExtendedFilterType;
   activePluginId: string | null;
   activeCustomFilterId: string | null;
@@ -173,6 +177,8 @@ export interface NoteLibraryStore {
    */
   reorderNotebooks: (nextOrderIds: string[]) => Promise<void>;
   setMiddleColumnView: (view: MiddleColumnView) => void;
+  setAgentProfileViewTarget: (target: { agentId: string } | { creating: true } | null) => void;
+  bumpAgentProfiles: () => void;
   setActiveFilter: (filter: ExtendedFilterType) => void;
   setActiveCustomFilter: (filterId: string | null) => void;
   setActivePluginId: (pluginId: string | null) => void;
@@ -272,6 +278,8 @@ export const useNoteStore = create<NoteLibraryStore>()(
       selectedNotebook: null,
       selectedNotebookId: null,
       middleColumnView: 'notes',
+      agentProfileViewTarget: null,
+      agentProfilesVersion: 0,
       activeFilter: 'all',
       activePluginId: null,
       activeCustomFilterId: null,
@@ -349,6 +357,12 @@ export const useNoteStore = create<NoteLibraryStore>()(
             ? { activeFilter: 'all', activeCustomFilterId: null, activePluginId: null }
             : {}),
         });
+      },
+      setAgentProfileViewTarget: (target) => {
+        set({ agentProfileViewTarget: target });
+      },
+      bumpAgentProfiles: () => {
+        set((state) => ({ agentProfilesVersion: state.agentProfilesVersion + 1 }));
       },
       setActiveFilter: (filter) => {
         const previous = get();
