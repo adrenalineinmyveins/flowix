@@ -1,0 +1,20 @@
+[package]
+name = "flowix-relay"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# F5 网络中继参考实现（FD-10 M2）。
+# 契约见 docs/F5-NETWORK-RELAY.md；可独立部署：cargo run -p flowix-relay。
+
+[dependencies]
+axum = "0.7"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
+uuid = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile = { workspace = true }

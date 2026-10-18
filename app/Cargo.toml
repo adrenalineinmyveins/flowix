@@ -3,8 +3,10 @@ resolver = "2"
 members = [
     "flowix-desktop",
     "flowix-core",
+    "flowix-mobile",
     "flowix-plugin-runtime",
     "flowix-redaction",
+    "flowix-relay",
     "flowix-sync",
     "flowix-cli",
     "flowix-installer-helper",
@@ -53,7 +55,10 @@ shell-words = "1.1"
 # Win32_Foundation 必须开: SetConsoleCP/SetConsoleOutputCP 返回 BOOL, 被该 feature 门控。
 windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_Foundation"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
-reqwest = { version = "0.12", features = ["json"] }
+# rustls 而非默认 native-tls：native-tls 拉入 openssl-sys，无法交叉编译到 Android。
+# 必须用 webpki-roots（内置 CA 包）：Android 无 /etc/ssl/certs，rustls-native-certs
+# 在 Android 上得到空根证书库导致 TLS 握手失败；公共 CA 端点行为无差异。
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
 tokio = { version = "1", features = ["sync", "time"] }
 
 # ── 生产体积优化（release 专用，不影响 dev 调试）──────────────────────────────
