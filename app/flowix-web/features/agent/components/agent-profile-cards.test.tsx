@@ -42,7 +42,6 @@ const FIRST = profile();
 
 let host: HTMLDivElement;
 let root: Root;
-let confirmSpy: ReturnType<typeof vi.spyOn>;
 
 async function mount() {
   await act(async () => {
@@ -50,8 +49,9 @@ async function mount() {
   });
 }
 
+// 删除确认走 Radix Dialog（Portal 挂到 document.body），因此按 body 范围查找。
 function button(text: string): HTMLButtonElement {
-  const element = [...host.querySelectorAll('button')].find(
+  const element = [...document.body.querySelectorAll('button')].find(
     (node) => node.textContent?.trim() === text,
   );
   expect(element, `button ${text}`).toBeDefined();
@@ -118,7 +118,6 @@ beforeEach(() => {
       }),
   );
   agentProfileMock.delete.mockResolvedValue(undefined);
-  confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
   host = document.createElement('div');
   document.body.appendChild(host);
   root = createRoot(host);
@@ -127,7 +126,6 @@ beforeEach(() => {
 afterEach(async () => {
   await act(async () => root.unmount());
   host.remove();
-  confirmSpy.mockRestore();
 });
 
 describe('agent profile cards', () => {
@@ -191,11 +189,13 @@ describe('agent profile cards', () => {
     expect(host.textContent).not.toContain('新建个人 Agent');
   });
 
-  it('deletes the selected card after confirmation', async () => {
+  it('deletes the selected card after confirmation dialog', async () => {
     await mount();
     await click('删除');
 
-    expect(confirmSpy).toHaveBeenCalled();
+    // 确认对话框（Portal）出现后再确认删除。
+    await click('删除身份卡');
+
     expect(agentProfileMock.delete).toHaveBeenCalledWith(CWD, FIRST.flowix_agent_id);
   });
 });

@@ -38,12 +38,5 @@ export interface AgentState {
   localPreferences: unknown;
 }
 
-/** 被咨询时允许的最高披露等级（空 = 拒答）。 */
+/** 被咨询时允许的最高披露等级（空 = 拒答）。文案见 i18n agent.profile.level.*。 */
 export const PROFILE_REDACTION_LEVELS = ['', 'R1', 'R2', 'R3'] as const;
-
-export const PROFILE_REDACTION_LEVEL_LABELS: Record<string, string> = {
-  '': '未设置（拒绝被咨询）',
-  R1: 'R1 · 事实摘要',
-  R2: 'R2 · 泛化摘要',
-  R3: 'R3 · 领域抽象',
-};

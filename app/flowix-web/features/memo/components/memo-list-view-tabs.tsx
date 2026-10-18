@@ -8,7 +8,7 @@ import { cn } from '@/lib/utils';
 import folderIcon from '@/assets/folder-outline.svg?raw';
 import { NotebookTreeFileIcon } from '@features/memo/components/notebook-tree-file-icon';
 
-export type MemoListViewTab = 'cards' | 'folders' | 'conversations';
+export type MemoListViewTab = 'folders' | 'cards' | 'conversations' | 'agents';
 
 interface MemoListViewTabsProps {
   activeTab: MemoListViewTab;
@@ -60,6 +60,22 @@ const TABS: ReadonlyArray<{
         className="h-full w-full"
       >
         <path d="M172,112a8,8,0,0,1-8,8H96a8,8,0,0,1,0-16h68A8,8,0,0,1,172,112Zm-8,24H96a8,8,0,0,0,0,16h68a8,8,0,0,0,0-16Zm68-12A100.11,100.11,0,0,1,132,224H48a16,16,0,0,1-16-16V124a100,100,0,0,1,200,0Zm-16,0a84,84,0,0,0-168,0v84h84A84.09,84.09,0,0,0,216,124Z" />
+      </svg>
+    ),
+  },
+  {
+    value: 'agents',
+    labelKey: 'memo.list.viewAgents',
+    icon: () => (
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        width="32"
+        height="32"
+        viewBox="0 0 256 256"
+        fill="currentColor"
+        className="h-full w-full"
+      >
+        <path d="M216,96V56a16,16,0,0,0-16-16H56A16,16,0,0,0,40,56V96a16,16,0,0,0,0,32v72a24,24,0,0,0,24,24H96a24,24,0,0,0,24-24V160h16v40a24,24,0,0,0,24,24h32a24,24,0,0,0,24-24V128a16,16,0,0,0,0-32ZM56,112H48a8,8,0,0,1,0-16h8ZM208,96v24a8,8,0,0,1-8,8H160a8,8,0,0,1-8-8V64h40a8,8,0,0,1,8,8ZM56,64h8v56a8,8,0,0,0,8,8h40a8,8,0,0,0,8-8V64h32v96H64a8,8,0,0,1-8-8Zm40,136a8,8,0,0,1-8,8H64a8,8,0,0,1-8-8V176h40Zm96,8H160a8,8,0,0,1-8-8V176h40v24A8,8,0,0,1,192,208Z" />
       </svg>
     ),
   },

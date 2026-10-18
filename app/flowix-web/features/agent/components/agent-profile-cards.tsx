@@ -2,14 +2,26 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { Bot, Fingerprint, Loader2, Plus, Save, Trash2, X } from 'lucide-react';
+import { Bot, Fingerprint, Loader2, Plus, Save, Trash2 } from 'lucide-react';
 
 import { agentProfile } from '@platform/tauri/client';
 import type { AgentProfile, AgentState } from '@/lib/types/agent-profile';
-import { PROFILE_REDACTION_LEVELS, PROFILE_REDACTION_LEVEL_LABELS } from '@/lib/types/agent-profile';
+import { PROFILE_REDACTION_LEVELS } from '@/lib/types/agent-profile';
 import { AGENT_TYPES } from '@/lib/agent-types';
 import { Button } from '@shared/ui/button';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@shared/ui/dialog';
+import { OverlayScrollbar } from '@shared/ui/overlay-scrollbar';
+import { ListSurfaceLoadingState } from '@shared/ui/list-surface';
+import { useI18n, type I18nKey } from '@/lib/i18n';
 import { cn } from '@/lib/utils';
+
+/** 披露等级下拉文案走 i18n（原 lib 硬编码中文映射随本面板迁移）。 */
+const LEVEL_LABEL_KEYS: Record<string, I18nKey> = {
+  '': 'agent.profile.level.unset',
+  R1: 'agent.profile.level.r1',
+  R2: 'agent.profile.level.r2',
+  R3: 'agent.profile.level.r3',
+};
 
 const inputClass =
   'h-9 w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 text-sm text-[var(--foreground)] outline-none transition-colors placeholder:text-[var(--muted-foreground)] focus:border-[var(--primary)] focus:ring-2 focus:ring-[color-mix(in_oklch,var(--primary)_16%,transparent)]';
@@ -92,13 +104,18 @@ function StateChip({ label, value }: { label: string; value: string }) {
   );
 }
 
-export function AgentProfileCardsDialog({
+/**
+ * 嵌入式身份卡面板：中列「个人 Agent」视图与对话框共用主体。
+ * embedded=true 时按中列格式渲染（标题避让左上角悬浮视图切换器）。
+ */
+export function AgentProfileCardsPanel({
   notebookPath,
-  onClose,
+  embedded = false,
 }: {
   notebookPath: string;
-  onClose: () => void;
+  embedded?: boolean;
 }) {
+  const { t } = useI18n();
   const [profiles, setProfiles] = useState<AgentProfile[] | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [form, setForm] = useState<ProfileForm | null>(null);
@@ -108,6 +125,7 @@ export function AgentProfileCardsDialog({
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null);
   const disposedRef = useRef(false);
 
   const refresh = useCallback(async (keepId?: string | null) => {
@@ -220,98 +238,68 @@ export function AgentProfileCardsDialog({
     } finally {
       setSaving(false);
     }
-  }, [createForm, creating, notebookPath, refresh]);
+  }, [createForm, saving, notebookPath, refresh]);
 
-  const remove = useCallback(async () => {
-    const selected = profiles?.find((profile) => profile.flowix_agent_id === selectedId);
-    if (!selected || saving) return;
-    if (!window.confirm(`确定删除「${selected.flowix_display_name}」？将级联清理其记忆与本地运行数据。`)) return;
+  const remove = useCallback(async (target: { id: string; name: string }) => {
+    if (saving) return;
     setSaving(true);
     setError(null);
     try {
-      await agentProfile.delete(notebookPath, selectedId!);
+      await agentProfile.delete(notebookPath, target.id);
       if (disposedRef.current) return;
+      setDeleteTarget(null);
       await refresh();
     } catch (cause) {
       if (!disposedRef.current) setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       setSaving(false);
     }
-  }, [profiles, selectedId, saving, notebookPath, refresh]);
-
-  const requestClose = useCallback(() => onClose(), [onClose]);
-
-  useEffect(() => {
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        event.preventDefault();
-        requestClose();
-      }
-    };
-    document.addEventListener('keydown', handleKeyDown);
-    return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [requestClose]);
+  }, [saving, notebookPath, refresh]);
 
   const selectableTypes = AGENT_TYPES;
   const typeLabel = (key: string) => selectableTypes.find((type) => type.key === key)?.name ?? key;
 
-  return (
-    <div
-      className="fixed inset-0 z-[135] flex items-center justify-center bg-black/50 p-3"
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget) requestClose();
-      }}
-    >
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label="个人 Agent 身份卡"
-        className="flex h-[min(720px,calc(100vh-80px))] w-full max-w-[920px] flex-col overflow-hidden rounded-2xl bg-[var(--background)] shadow-2xl"
-      >
-        <header className="flex shrink-0 items-center gap-3 border-b border-[var(--divider)] px-5 py-3">
-          <Fingerprint className="h-5 w-5 shrink-0 text-[var(--primary)]" />
-          <div className="min-w-0 flex-1">
-            <h1 className="truncate text-base font-semibold tracking-[-0.02em] text-[var(--foreground)]">
-              个人 Agent 身份卡
-            </h1>
-            <p className="truncate text-xs text-[var(--muted-foreground)]" title={notebookPath}>
-              身份卡存于笔记本 .agents/ 目录，随云同步；隐私边界决定 F5 互咨时的披露范围。
-            </p>
-          </div>
-          <button
-            type="button"
-            aria-label="关闭"
-            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-[var(--muted-foreground)] transition-colors hover:bg-[var(--muted)] hover:text-[var(--foreground)]"
-            onClick={requestClose}
-          >
-            <X className="h-4 w-4" strokeWidth={1.8} />
-          </button>
-        </header>
+  const startCreating = () => {
+    setCreating(true);
+    setForm(null);
+    setSelectedId(null);
+    setAgentState(null);
+    setCreateForm({ displayName: '', agentType: 'codex' });
+  };
 
-        <div className="flex min-h-0 flex-1 flex-col md:flex-row">
-          <nav className="flex shrink-0 flex-col border-b border-[var(--divider)] bg-[color-mix(in_oklch,var(--card)_45%,transparent)] p-3 md:w-64 md:border-b-0 md:border-r" aria-label="Agent 列表">
-            <Button
-              type="button"
-              variant="outline"
-              className="mb-2 h-8 w-full gap-1 rounded-lg px-2 text-xs"
-              onClick={() => {
-                setCreating(true);
-                setForm(null);
-                setSelectedId(null);
-                setAgentState(null);
-                setCreateForm({ displayName: '', agentType: 'codex' });
-              }}
-            >
-              <Plus className="h-3.5 w-3.5" />
-              新建身份卡
-            </Button>
-            <div className="min-h-0 flex-1 space-y-1 overflow-y-auto">
-              {loading && (
-                <p className="px-2 py-4 text-center text-xs text-[var(--muted-foreground)]">加载中…</p>
-              )}
+  return (
+    <div className="flex h-full min-h-0 flex-col bg-[var(--list-bg)]">
+      {/* 中列统一头部行：embedded 时标题避让左上角悬浮的视图切换器。 */}
+      <div
+        className={cn(
+          'flex shrink-0 items-center justify-between gap-2 pb-2 pr-3',
+          embedded ? 'pl-[126px]' : 'pl-4',
+        )}
+      >
+        <span className="min-w-0 truncate text-[15px] font-medium text-[var(--foreground)]">
+          {t('agent.profile.title')}
+        </span>
+        <Button
+          type="button"
+          variant="outline"
+          className="h-7 shrink-0 gap-1 rounded-lg px-2 text-xs"
+          onClick={startCreating}
+        >
+          <Plus className="h-3.5 w-3.5" />
+          {t('agent.profile.newCard')}
+        </Button>
+      </div>
+
+      <div className="@container flex min-h-0 flex-1 flex-col @[440px]:flex-row">
+        <nav
+          className="flex max-h-[45%] min-h-0 shrink-0 flex-col gap-2 border-b border-[var(--divider)] p-2 @[440px]:max-h-none @[440px]:w-56 @[440px]:border-b-0 @[440px]:border-r"
+          aria-label={t('agent.profile.listLabel')}
+        >
+          <OverlayScrollbar className="min-h-0 flex-1" scrollerClassName="h-full overflow-y-auto px-0.5 py-0.5">
+            <div className="space-y-1">
               {!loading && profiles?.length === 0 && (
                 <p className="px-2 py-4 text-center text-xs text-[var(--muted-foreground)]">
-                  还没有个人 Agent，点击上方新建。
+                  {t('agent.profile.empty')}
                 </p>
               )}
               {profiles?.map((profile) => {
@@ -338,7 +326,7 @@ export function AgentProfileCardsDialog({
                           'h-1.5 w-1.5 shrink-0 rounded-full',
                           profile.flowix_consultable ? 'bg-[var(--primary)]' : 'bg-[var(--muted-foreground)]',
                         )}
-                        title={profile.flowix_consultable ? '可被咨询' : '未开放咨询'}
+                        title={profile.flowix_consultable ? t('agent.profile.consultableOn') : t('agent.profile.consultableOff')}
                         aria-hidden="true"
                       />
                     </span>
@@ -350,183 +338,263 @@ export function AgentProfileCardsDialog({
                 );
               })}
             </div>
-          </nav>
+          </OverlayScrollbar>
+        </nav>
 
-          <main className="min-h-0 flex-1 overflow-y-auto px-5 py-4 [scrollbar-gutter:stable]">
-            {error && <div className="mb-3"><InlineError message={error} /></div>}
+        <main className="relative min-h-0 flex-1">
+          {loading ? (
+            <ListSurfaceLoadingState label={t('agent.profile.loading')} className="h-full w-full" />
+          ) : (
+            <OverlayScrollbar className="h-full" scrollerClassName="h-full overflow-y-auto px-5 py-4">
+              {error && <div className="mb-3"><InlineError message={error} /></div>}
 
-            {creating && (
-              <div className="space-y-4">
-                <h2 className="text-sm font-semibold text-[var(--foreground)]">新建个人 Agent</h2>
-                <Field label="名称">
-                  <input
-                    className={inputClass}
-                    value={createForm.displayName}
-                    onChange={(event) => setCreateForm((current) => ({ ...current, displayName: event.target.value }))}
-                    placeholder="例如：财报解读助手"
-                    autoFocus
-                  />
-                </Field>
-                <Field label="Agent 类型">
-                  <select
-                    className={cn(inputClass, 'py-0')}
-                    value={createForm.agentType}
-                    onChange={(event) => setCreateForm((current) => ({ ...current, agentType: event.target.value }))}
-                  >
-                    {selectableTypes.map((type) => (
-                      <option key={type.key} value={type.key}>{type.name}</option>
-                    ))}
-                  </select>
-                </Field>
-                <div className="flex justify-end gap-2 pt-2">
-                  <Button type="button" variant="ghost" onClick={() => void refresh(selectedId)}>取消</Button>
-                  <Button type="button" disabled={!createForm.displayName.trim() || saving} onClick={() => void create()}>
-                    {saving ? <Loader2 className="animate-spin" /> : <Plus />}
-                    创建
-                  </Button>
-                </div>
-              </div>
-            )}
-
-            {!creating && form && selectedId && (
-              <div className="space-y-5">
-                <section className="space-y-4">
-                  <h2 className="text-sm font-semibold text-[var(--foreground)]">基本信息</h2>
-                  <div className="grid gap-4 sm:grid-cols-2">
-                    <Field label="名称">
-                      <input
-                        className={inputClass}
-                        value={form.displayName}
-                        onChange={(event) => patchForm({ displayName: event.target.value })}
-                      />
-                    </Field>
-                    <Field label="Agent 类型">
-                      <select
-                        className={cn(inputClass, 'py-0')}
-                        value={form.agentType}
-                        onChange={(event) => patchForm({ agentType: event.target.value })}
-                      >
-                        {selectableTypes.map((type) => (
-                          <option key={type.key} value={type.key}>{type.name}</option>
-                        ))}
-                      </select>
-                    </Field>
-                  </div>
-                  <Field label="简介" hint="≤500 字，F2 喂养可自动改写">
-                    <textarea
-                      className={textareaClass}
-                      value={form.bio}
-                      onChange={(event) => patchForm({ bio: event.target.value })}
-                      placeholder="一句话说明这个 Agent 擅长什么"
+              {creating && (
+                <div className="space-y-4">
+                  <h2 className="text-sm font-semibold text-[var(--foreground)]">{t('agent.profile.createTitle')}</h2>
+                  <Field label={t('agent.profile.name')}>
+                    <input
+                      className={inputClass}
+                      value={createForm.displayName}
+                      onChange={(event) => setCreateForm((current) => ({ ...current, displayName: event.target.value }))}
+                      placeholder={t('agent.profile.namePlaceholder')}
+                      autoFocus
                     />
                   </Field>
-                  <div className="grid gap-4 sm:grid-cols-2">
-                    <Field label="专长标签" hint="每行一个标签路径">
-                      <textarea
-                        className={cn(textareaClass, 'min-h-16 font-mono text-xs leading-5')}
-                        value={form.expertise}
-                        onChange={(event) => patchForm({ expertise: event.target.value })}
-                        placeholder={'finance/财报\nindustry/电商'}
-                      />
-                    </Field>
-                    <Field label="模型覆盖" hint="留空跟随类型默认">
-                      <input
-                        className={inputClass}
-                        value={form.model}
-                        onChange={(event) => patchForm({ model: event.target.value })}
-                        placeholder="默认模型"
-                      />
-                    </Field>
+                  <Field label={t('agent.profile.agentType')}>
+                    <select
+                      className={cn(inputClass, 'py-0')}
+                      value={createForm.agentType}
+                      onChange={(event) => setCreateForm((current) => ({ ...current, agentType: event.target.value }))}
+                    >
+                      {selectableTypes.map((type) => (
+                        <option key={type.key} value={type.key}>{type.name}</option>
+                      ))}
+                    </select>
+                  </Field>
+                  <div className="flex justify-end gap-2 pt-2">
+                    <Button type="button" variant="ghost" onClick={() => void refresh(selectedId)}>{t('dialog.cancel')}</Button>
+                    <Button type="button" disabled={!createForm.displayName.trim() || saving} onClick={() => void create()}>
+                      {saving ? <Loader2 className="animate-spin" /> : <Plus />}
+                      {t('agent.profile.create')}
+                    </Button>
                   </div>
-                </section>
+                </div>
+              )}
 
-                <section className="space-y-3 rounded-xl border border-[var(--border)] bg-[color-mix(in_oklch,var(--card)_82%,var(--background))] p-4">
-                  <h2 className="text-sm font-semibold text-[var(--foreground)]">隐私边界（F5 网络互咨时生效）</h2>
-                  <Toggle
-                    checked={form.consultable}
-                    onChange={(consultable) => patchForm({ consultable })}
-                    label="允许被其他 Agent 咨询"
-                  />
-                  <div className="grid gap-4 sm:grid-cols-2">
-                    <Field label="最高披露等级">
-                      <select
-                        className={cn(inputClass, 'py-0')}
-                        value={form.redactionLevel}
-                        onChange={(event) => patchForm({ redactionLevel: event.target.value })}
-                      >
-                        {PROFILE_REDACTION_LEVELS.map((level) => (
-                          <option key={level} value={level}>
-                            {PROFILE_REDACTION_LEVEL_LABELS[level]}
-                          </option>
-                        ))}
-                      </select>
-                    </Field>
-                    <Field label="披露范围" hint="标签路径，每行一个">
-                      <textarea
-                        className={cn(textareaClass, 'min-h-16 font-mono text-xs leading-5')}
-                        value={form.disclosureScope}
-                        onChange={(event) => patchForm({ disclosureScope: event.target.value })}
-                        placeholder={'finance/财报'}
-                      />
-                    </Field>
-                  </div>
-                  <p className="text-xs leading-5 text-[var(--muted-foreground)]">
-                    喂养取材范围与对外披露范围共用同一字段；等级未设置时按设计将拒绝被咨询。
-                  </p>
-                </section>
-
-                <section className="space-y-2">
-                  <h2 className="text-sm font-semibold text-[var(--foreground)]">本地运行状态</h2>
-                  {agentState ? (
-                    <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-                      <StateChip label="运行次数" value={String(agentState.runs)} />
-                      <StateChip label="被咨询" value={String(agentState.consultationsReceived)} />
-                      <StateChip label="tokens 入" value={String(agentState.tokensIn)} />
-                      <StateChip label="tokens 出" value={String(agentState.tokensOut)} />
+              {!creating && form && selectedId && (
+                <div className="space-y-5">
+                  <section className="space-y-4">
+                    <h2 className="text-sm font-semibold text-[var(--foreground)]">{t('agent.profile.basicInfo')}</h2>
+                    <div className="grid gap-4 sm:grid-cols-2">
+                      <Field label={t('agent.profile.name')}>
+                        <input
+                          className={inputClass}
+                          value={form.displayName}
+                          onChange={(event) => patchForm({ displayName: event.target.value })}
+                        />
+                      </Field>
+                      <Field label={t('agent.profile.agentType')}>
+                        <select
+                          className={cn(inputClass, 'py-0')}
+                          value={form.agentType}
+                          onChange={(event) => patchForm({ agentType: event.target.value })}
+                        >
+                          {selectableTypes.map((type) => (
+                            <option key={type.key} value={type.key}>{type.name}</option>
+                          ))}
+                        </select>
+                      </Field>
                     </div>
-                  ) : (
-                    <p className="rounded-lg border border-[var(--border)] px-3 py-2.5 text-xs text-[var(--muted-foreground)]">
-                      尚未运行过（无本地状态）。
+                    <Field label={t('agent.profile.bio')} hint={t('agent.profile.bioHint')}>
+                      <textarea
+                        className={textareaClass}
+                        value={form.bio}
+                        onChange={(event) => patchForm({ bio: event.target.value })}
+                        placeholder={t('agent.profile.bioPlaceholder')}
+                      />
+                    </Field>
+                    <div className="grid gap-4 sm:grid-cols-2">
+                      <Field label={t('agent.profile.expertise')} hint={t('agent.profile.expertiseHint')}>
+                        <textarea
+                          className={cn(textareaClass, 'min-h-16 font-mono text-xs leading-5')}
+                          value={form.expertise}
+                          onChange={(event) => patchForm({ expertise: event.target.value })}
+                          placeholder={t('agent.profile.expertisePlaceholder')}
+                        />
+                      </Field>
+                      <Field label={t('agent.profile.model')} hint={t('agent.profile.modelHint')}>
+                        <input
+                          className={inputClass}
+                          value={form.model}
+                          onChange={(event) => patchForm({ model: event.target.value })}
+                          placeholder={t('agent.profile.modelPlaceholder')}
+                        />
+                      </Field>
+                    </div>
+                  </section>
+
+                  <section className="space-y-3 rounded-xl border border-[var(--border)] bg-[color-mix(in_oklch,var(--card)_82%,var(--background))] p-4">
+                    <h2 className="text-sm font-semibold text-[var(--foreground)]">{t('agent.profile.privacy')}</h2>
+                    <Toggle
+                      checked={form.consultable}
+                      onChange={(consultable) => patchForm({ consultable })}
+                      label={t('agent.profile.consultable')}
+                    />
+                    <div className="grid gap-4 sm:grid-cols-2">
+                      <Field label={t('agent.profile.redactionLevel')}>
+                        <select
+                          className={cn(inputClass, 'py-0')}
+                          value={form.redactionLevel}
+                          onChange={(event) => patchForm({ redactionLevel: event.target.value })}
+                        >
+                          {PROFILE_REDACTION_LEVELS.map((level) => (
+                            <option key={level} value={level}>
+                              {t(LEVEL_LABEL_KEYS[level])}
+                            </option>
+                          ))}
+                        </select>
+                      </Field>
+                      <Field label={t('agent.profile.disclosureScope')} hint={t('agent.profile.disclosureScopeHint')}>
+                        <textarea
+                          className={cn(textareaClass, 'min-h-16 font-mono text-xs leading-5')}
+                          value={form.disclosureScope}
+                          onChange={(event) => patchForm({ disclosureScope: event.target.value })}
+                          placeholder={t('agent.profile.disclosureScopePlaceholder')}
+                        />
+                      </Field>
+                    </div>
+                    <p className="text-xs leading-5 text-[var(--muted-foreground)]">
+                      {t('agent.profile.privacyHint')}
                     </p>
-                  )}
-                </section>
-              </div>
-            )}
+                  </section>
 
-            {!creating && !form && !loading && profiles?.length === 0 && (
-              <div className="flex min-h-full flex-col items-center justify-center py-16 text-center">
-                <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-[color-mix(in_oklch,var(--muted)_72%,var(--background))] text-[var(--muted-foreground)]">
-                  <Fingerprint className="h-5 w-5" />
-                </span>
-                <p className="mt-4 max-w-[36ch] text-sm leading-6 text-[var(--muted-foreground)]">
-                  从左侧新建第一张身份卡。卡片数据存于笔记本 .agents/ 目录，可手动编辑 profile.md。
-                </p>
-              </div>
-            )}
-          </main>
-        </div>
+                  <section className="space-y-2">
+                    <h2 className="text-sm font-semibold text-[var(--foreground)]">{t('agent.profile.runtime')}</h2>
+                    {agentState ? (
+                      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                        <StateChip label={t('agent.profile.runs')} value={String(agentState.runs)} />
+                        <StateChip label={t('agent.profile.consultations')} value={String(agentState.consultationsReceived)} />
+                        <StateChip label={t('agent.profile.tokensIn')} value={String(agentState.tokensIn)} />
+                        <StateChip label={t('agent.profile.tokensOut')} value={String(agentState.tokensOut)} />
+                      </div>
+                    ) : (
+                      <p className="rounded-lg border border-[var(--border)] px-3 py-2.5 text-xs text-[var(--muted-foreground)]">
+                        {t('agent.profile.noState')}
+                      </p>
+                    )}
+                  </section>
+                </div>
+              )}
 
-        {!creating && form && selectedId && (
-          <footer className="flex shrink-0 items-center justify-between gap-3 border-t border-[var(--divider)] bg-[color-mix(in_oklch,var(--background)_92%,var(--card))] px-5 py-3">
+              {!creating && !form && profiles?.length === 0 && (
+                <div className="flex min-h-full flex-col items-center justify-center py-16 text-center">
+                  <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-[color-mix(in_oklch,var(--muted)_72%,var(--background))] text-[var(--muted-foreground)]">
+                    <Fingerprint className="h-5 w-5" />
+                  </span>
+                  <p className="mt-4 max-w-[36ch] text-sm leading-6 text-[var(--muted-foreground)]">
+                    {t('agent.profile.emptyHint')}
+                  </p>
+                </div>
+              )}
+            </OverlayScrollbar>
+          )}
+        </main>
+      </div>
+
+      {!creating && form && selectedId && (
+        <footer className="flex shrink-0 items-center justify-between gap-3 border-t border-[var(--divider)] px-5 py-3">
+          <Button
+            type="button"
+            variant="ghost"
+            className="gap-1 text-[var(--destructive)] hover:bg-[color-mix(in_oklch,var(--destructive)_8%,transparent)]"
+            disabled={saving}
+            onClick={() => {
+              const selected = profiles?.find((profile) => profile.flowix_agent_id === selectedId);
+              if (selected) setDeleteTarget({ id: selected.flowix_agent_id, name: selected.flowix_display_name });
+            }}
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+            {t('dialog.delete')}
+          </Button>
+          <div className="flex items-center gap-2">
+            <Button type="button" disabled={saving || !form.displayName.trim()} onClick={() => void save()}>
+              {saving ? <Loader2 className="animate-spin" /> : <Save />}
+              {t('agent.profile.save')}
+            </Button>
+          </div>
+        </footer>
+      )}
+
+      <Dialog
+        open={deleteTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setDeleteTarget(null);
+        }}
+      >
+        <DialogContent className="rounded-xl border border-[var(--border-popup)] bg-[var(--card)] shadow-[0_4px_24px_-3px_rgb(0_0_0_/_0.24)]">
+          <DialogHeader>
+            <DialogTitle>{t('agent.profile.deleteTitle')}</DialogTitle>
+            <DialogDescription>
+              {t('agent.profile.deleteDescription', { name: deleteTarget?.name ?? '' })}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="mt-4 flex justify-end gap-2">
             <Button
               type="button"
               variant="ghost"
-              className="gap-1 text-[var(--destructive)] hover:bg-[color-mix(in_oklch,var(--destructive)_8%,transparent)]"
-              disabled={saving}
-              onClick={() => void remove()}
+              className="h-8 px-3 text-sm"
+              onClick={() => setDeleteTarget(null)}
             >
-              <Trash2 className="h-3.5 w-3.5" />
-              删除
+              {t('dialog.cancel')}
             </Button>
-            <div className="flex items-center gap-2">
-              <Button type="button" variant="ghost" onClick={requestClose}>关闭</Button>
-              <Button type="button" disabled={saving || !form.displayName.trim()} onClick={() => void save()}>
-                {saving ? <Loader2 className="animate-spin" /> : <Save />}
-                保存
-              </Button>
-            </div>
-          </footer>
-        )}
+            <Button
+              type="button"
+              className="h-8 rounded-lg px-3 text-sm"
+              disabled={saving}
+              onClick={() => deleteTarget && void remove(deleteTarget)}
+            >
+              {t('agent.profile.deleteTitle')}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
+/** 对话框壳：Esc/点击遮罩关闭，主体复用面板。 */
+export function AgentProfileCardsDialog({
+  notebookPath,
+  onClose,
+}: {
+  notebookPath: string;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        onClose();
+      }
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 z-[135] flex items-center justify-center bg-black/50 p-3"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="个人 Agent 身份卡"
+        className="flex h-[min(720px,calc(100vh-80px))] w-full max-w-[920px] flex-col overflow-hidden rounded-2xl bg-[var(--background)] shadow-2xl"
+      >
+        <AgentProfileCardsPanel notebookPath={notebookPath} />
       </div>
     </div>
   );

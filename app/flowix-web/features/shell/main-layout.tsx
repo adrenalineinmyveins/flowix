@@ -32,6 +32,7 @@ import {
   type Notebook,
 } from '@features/memo/public/shell-api';
 import { AgentConversationTitlebar } from '@features/agent/public/shell-api';
+import { AgentProfileCardsPanel } from '@features/agent/components/agent-profile-cards';
 import { useSettingsStore } from '@/lib/store/settings-store';
 import { useShallow } from 'zustand/react/shallow';
 import {
@@ -200,6 +201,7 @@ export function MainLayout({
   } = useShellMemoViewModel();
   const memoListView = useMemoListViewPreference();
   const isAgentConversationView = middleColumnView === 'conversations';
+  const isAgentsView = middleColumnView === 'agents';
   const {
     currentDocumentPath,
     activeExternalSession,
@@ -692,10 +694,16 @@ export function MainLayout({
             <ListColumnContent
               activeView={middleColumnView === 'conversations'
                 ? 'conversations'
-                : memoListView === 'folders' ? 'folders' : 'cards'}
+                : middleColumnView === 'agents'
+                  ? 'agents'
+                  : memoListView === 'folders' ? 'folders' : 'cards'}
               onViewChange={(view) => {
                 if (view === 'conversations') {
                   setMiddleColumnView('conversations');
+                  return;
+                }
+                if (view === 'agents') {
+                  setMiddleColumnView('agents');
                   return;
                 }
                 void setMemoListViewPreference(view === 'folders' ? 'folders' : 'detailed');
@@ -707,20 +715,31 @@ export function MainLayout({
             >
                 <div
                   className={`absolute inset-0 ${
-                    showMemoListSurface
+                    showMemoListSurface && !isAgentsView
                       ? 'visible'
                       : 'hidden'
                   }`}
-                  aria-hidden={!showMemoListSurface}
+                  aria-hidden={!showMemoListSurface || isAgentsView}
                 >
                   <MemoList
                     navigationDrawerEnabled
                     navigationDrawerOpen={noteNavigationPhase !== 'closed'}
                     onToggleNavigationDrawer={handleToggleNoteNavigation}
-                    isActive={!isAgentConversationView}
-                    dataLoadingEnabled={!isAgentConversationView}
+                    isActive={!isAgentConversationView && !isAgentsView}
+                    dataLoadingEnabled={!isAgentConversationView && !isAgentsView}
                   />
                 </div>
+                {isAgentsView && (
+                  <div className="absolute inset-0 z-10">
+                    {selectedNotebook?.path
+                      ? <AgentProfileCardsPanel notebookPath={selectedNotebook.path} embedded />
+                      : (
+                        <div className="flex h-full items-center justify-center px-6 text-center text-sm text-[var(--muted-foreground)]">
+                          {t('status.agent.noNotebookForAgents')}
+                        </div>
+                      )}
+                  </div>
+                )}
                 {shouldRenderAgentConversationList && (
                   <div
                     className={`absolute inset-0 ${

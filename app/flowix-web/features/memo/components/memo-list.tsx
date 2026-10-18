@@ -1177,7 +1177,7 @@ export function MemoList({
         onLoadStart={handleMemoListLoadStart}
         onLoadSuccess={handleMemoListLoadSuccess}
       />
-      <div className="flex min-w-0 items-center gap-2 pb-2 pl-[100px] pr-3">
+      <div className="flex min-w-0 items-center gap-2 pb-2 pl-[126px] pr-3">
         <div className="min-w-0 flex-1">
           {!showFolderView && (
           <MemoNavigationDropdown

@@ -34,7 +34,7 @@ export type ColorFilterValue = 'any' | 'none' | NoteColor;
 export type ExtendedFilterType = FilterType | 'color' | 'custom';
 
 /** Which primary surface is shown in the middle column. */
-export type MiddleColumnView = 'notes' | 'conversations';
+export type MiddleColumnView = 'notes' | 'conversations' | 'agents';
 
 export type NoteLibraryStartupPhase = 'idle' | 'loading' | 'ready' | 'error';
 
