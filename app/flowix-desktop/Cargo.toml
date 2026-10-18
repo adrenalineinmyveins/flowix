@@ -17,6 +17,7 @@ tauri-build = { version = "2", features = [] }
 flowix-core = { workspace = true }
 flowix-plugin-runtime = { workspace = true }
 flowix-redaction = { workspace = true }
+flowix-relay = { workspace = true }
 flowix-sync = { workspace = true }
 tauri = { version = "2", features = ["protocol-asset", "macos-private-api", "unstable"] }
 tauri-plugin-opener = "2"
@@ -41,7 +42,7 @@ once_cell = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = "0.3"
 thiserror = { workspace = true }
-reqwest = { version = "0.12", features = ["json", "blocking", "stream"] }
+reqwest = { workspace = true, features = ["blocking", "stream"] }
 async-trait = "0.1"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "ico", "tiff"] }

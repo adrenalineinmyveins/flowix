@@ -1343,6 +1343,7 @@ dependencies = [
  "flowix-installer-helper",
  "flowix-plugin-runtime",
  "flowix-redaction",
+ "flowix-relay",
  "flowix-sync",
  "fs2",
  "futures",

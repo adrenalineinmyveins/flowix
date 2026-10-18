@@ -23,9 +23,14 @@ use flowix_redaction::{
 use crate::config::access::{AgentAccessEntry, AgentAccessKind};
 use crate::nurture::should_accept_event_in_notebook;
 
+pub mod inbound;
 pub mod outbox;
 pub mod transport;
 
+pub use inbound::{
+    inbound_dir, list_inbound, poll_agent_inbox, register_device, relay_endpoint,
+    set_inbound_status, store_inbound, InboundRecord, InboundStatus, PollSummary,
+};
 pub use outbox::{
     draft_from_preview, list_records, new_receipt_id, outbox_dir, read_record, settle,
     status_name, take_confirmed_payload, write_record, OutboxStatus, RedactionEnvelope,

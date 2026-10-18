@@ -271,9 +271,18 @@ pub fn run() {
                         tracing::warn!("failed to emit cloud state notification: {error}");
                     }
                 });
+            // 开发/自建云覆盖：FLOWIX_CLOUD_API_BASE 环境变量（如 http://192.168.3.248:8787）
+            let cloud_api_base = std::env::var("FLOWIX_CLOUD_API_BASE")
+                .ok()
+                .map(|value| value.trim().trim_end_matches('/').to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| flowix_sync::DEFAULT_CLOUD_API_BASE.to_string());
+            if cloud_api_base != flowix_sync::DEFAULT_CLOUD_API_BASE {
+                tracing::info!("cloud sync API base overridden: {cloud_api_base}");
+            }
             let cloud_sync_for_state = Arc::new(
                 flowix_sync::SyncManager::new_with_session_dependencies(
-                    flowix_sync::DEFAULT_CLOUD_API_BASE,
+                    &cloud_api_base,
                     user_config_dir_for_device.join("sync.db"),
                     user_config_for_state.clone(),
                     cloud_state_notifier.clone(),
@@ -283,7 +292,7 @@ pub fn run() {
                         "failed to initialize cloud sync database: {error}; using a temporary database"
                     );
                     flowix_sync::SyncManager::new_with_session_dependencies(
-                        flowix_sync::DEFAULT_CLOUD_API_BASE,
+                        &cloud_api_base,
                         std::env::temp_dir().join(format!("flowix-sync-{}.db", std::process::id())),
                         user_config_for_state.clone(),
                         cloud_state_notifier.clone(),
@@ -478,6 +487,10 @@ pub fn run() {
             commands::redaction::redaction_send,
             commands::redaction::redaction_outbox_list,
             commands::redaction::redaction_transmit,
+            commands::redaction::redaction_inbox_register,
+            commands::redaction::redaction_inbox_poll,
+            commands::redaction::redaction_inbox_list,
+            commands::redaction::redaction_inbox_set_status,
             commands::artifact::artifact_resolve,
             commands::settings::get_preference,
             commands::settings::patch_preference,
