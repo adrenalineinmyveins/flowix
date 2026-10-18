@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use tauri::{AppHandle, Listener, State};
+use tauri::{AppHandle, Listener, Manager, State};
 
 use crate::agent_session::ThreadManager;
 use crate::agent_wire::{AgentRuntimeConfig, AgentUserMessage, RuntimePathConfig};
@@ -59,6 +59,23 @@ pub fn plugin_uninstall(plugin_id: String, app_handle: AppHandle) -> Result<(), 
     plugin::emit_catalog_changed(&app_handle)
 }
 
+/// P2 导出：已安装插件 → `flowix-plugin-<id>-<version>.zip`，返回 zip 路径。
+#[tauri::command]
+pub fn plugin_export(plugin_id: String, dest_directory: String) -> Result<String, String> {
+    plugin::export_plugin_to(&plugin_id, &dest_directory)
+}
+
+/// P2 导入：zip → 解压校验 → 走既有安装管线（integrity + semver 规则不变）。
+#[tauri::command]
+pub fn plugin_import(
+    archive_path: String,
+    app_handle: AppHandle,
+) -> Result<plugin::PluginDescriptor, String> {
+    let descriptor = plugin::import_plugin_from(&archive_path)?;
+    plugin::emit_catalog_changed(&app_handle)?;
+    Ok(descriptor)
+}
+
 #[tauri::command]
 pub fn plugin_get(plugin_id: String) -> Result<PluginDescriptor, String> {
     plugin::get_plugin(&plugin_id)
@@ -89,9 +106,10 @@ pub async fn plugin_run(
 ) -> Result<plugin::PluginRunStarted, String> {
     let agent_type = plugin::resolve_agent_type(&plugin_id, &agent_type)?;
     let params = params.unwrap_or_default();
+    let descriptor = plugin::get_plugin(&plugin_id)?;
     // P2 knowledgeScope：声明了知识绑定的插件（manifest v3），运行时按
     // 标签检索最新 20 条、100 KB 截断、围栏化后替换调用方传入的 context。
-    let knowledge_scope = plugin::get_plugin(&plugin_id)?.manifest.knowledge_scope;
+    let knowledge_scope = descriptor.manifest.knowledge_scope.clone();
     let context = if knowledge_scope.is_empty() {
         context
     } else {
@@ -180,23 +198,81 @@ pub async fn plugin_run(
         conversation_title: Some(format!("plugin:{plugin_id}")),
     };
     let plugin_id_for_task = plugin_id.clone();
+    // P4 toolGrants 运行时执法：声明了授权的插件（manifest v3），越权
+    // 工具调用即终止 run 并留痕（事件层黑名单执行器）。
+    let tool_policy = plugin::ToolPolicy::from_grants(&descriptor.manifest.tool_grants);
     let (stream_end_tx, stream_end_rx) = tokio::sync::mpsc::unbounded_channel();
     let stream_end_run_id = run_id.clone();
+    let enforce_app = app_handle.clone();
+    let enforce_runs = plugin_runs.clone();
+    let enforce_run_id = run_id.clone();
+    let enforce_plugin_id = plugin_id.clone();
+    let enforce_agent_type = agent_type.clone();
     let stream_end_listener = app.listen("agent-chunk", move |event| {
         let Ok(payload) = serde_json::from_str::<serde_json::Value>(event.payload()) else {
             return;
         };
         if payload.get("run_id").and_then(serde_json::Value::as_str)
             != Some(stream_end_run_id.as_str())
-            || payload.get("kind").and_then(serde_json::Value::as_str) != Some("stream_end")
         {
             return;
         }
-        let reason = payload
-            .get("reason")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        let _ = stream_end_tx.send(reason);
+        let kind = payload.get("kind").and_then(serde_json::Value::as_str);
+        if kind == Some("stream_end") {
+            let reason = payload
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let _ = stream_end_tx.send(reason);
+            return;
+        }
+        // P4：tool_call 越权检查（未声明 grants 的插件不执法）。
+        if kind == Some("tool_call") {
+            let Some(policy) = tool_policy.as_ref() else { return };
+            let Some(name) = payload.get("name").and_then(serde_json::Value::as_str) else {
+                return;
+            };
+            if !policy.violates(name) {
+                return;
+            }
+            let app = enforce_app.clone();
+            let runs = enforce_runs.clone();
+            let run_id = enforce_run_id.clone();
+            let plugin_id = enforce_plugin_id.clone();
+            let agent_type = enforce_agent_type.clone();
+            let tool = name.to_string();
+            tauri::async_runtime::spawn(async move {
+                let state = app.state::<crate::app::state::AppState>();
+                let violation = format!("TOOL_GRANT_VIOLATION:{tool}");
+                // 与 plugin_run_stop 相同的终止契约：cancel 先摘除协调器
+                // 条目，等待 task 检测到摘除后不再二次发失败事件。
+                let Some(info) = runs.cancel(&run_id).await else {
+                    return;
+                };
+                if let Some(thread_id) = info.thread_id.as_deref() {
+                    let _ = stop_any_runtime_chat(thread_id, &state, &app).await;
+                    if let Err(error) = state
+                        .thread_manager
+                        .delete_thread_with_agent_conversations(thread_id)
+                        .await
+                    {
+                        tracing::warn!(thread_id, "clean up violating plugin thread failed: {error}");
+                    }
+                }
+                tracing::warn!(
+                    plugin = %plugin_id,
+                    tool = %tool,
+                    "plugin tool grant violated; run terminated"
+                );
+                let _ = plugin::emit_run_failed(
+                    &run_id,
+                    &plugin_id,
+                    &agent_type,
+                    &violation,
+                    &app,
+                );
+            });
+        }
     });
     if let Err(error) = start_plugin_chat(&state, &thread.thread_id, state_agent, &app).await {
         app.unlisten(stream_end_listener);

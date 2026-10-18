@@ -492,6 +492,12 @@ export const plugins = {
   install: (sourceDirectory: string) =>
     invoke<PluginDescriptor>('plugin_install', { sourceDirectory }),
   uninstall: (pluginId: string) => invoke<void>('plugin_uninstall', { pluginId }),
+  /** P2 导出：插件 → zip，返回 zip 路径。 */
+  export: (pluginId: string, destDirectory: string) =>
+    invoke<string>('plugin_export', { pluginId, destDirectory }),
+  /** P2 导入：zip → 走既有安装管线（integrity + semver 规则不变）。 */
+  import: (archivePath: string) =>
+    invoke<PluginDescriptor>('plugin_import', { archivePath }),
   setEnabled: (pluginId: string, enabled: boolean) =>
     invoke<void>('plugin_set_enabled', { pluginId, enabled }),
   diagnostics: () => invoke<PluginDiagnostic[]>('plugin_diagnostics'),

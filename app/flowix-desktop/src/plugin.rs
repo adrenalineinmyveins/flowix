@@ -493,6 +493,65 @@ pub fn install_from_directory(source_directory: &str) -> Result<PluginDescriptor
     Ok(descriptor)
 }
 
+// ---------------------------------------------------------------------------
+// P4 toolGrants 运行时执法（桌面事件层黑名单执行器）
+// ---------------------------------------------------------------------------
+
+/// 由 manifest v3 `toolGrants` 派生的工具类别白名单。
+///
+/// 语义（保守口径）：
+/// - 未声明 grants（v1/v2 插件）→ `from_grants` 返回 None，不执法；
+/// - 声明了 grants → 已识别类别的工具调用若未授权即违规（violation），
+///   调用方应终止 run 并留痕；
+/// - 未识别类别的工具名（agent 内部机制等）放行，避免误杀。
+///
+/// access 三档（read/write/confirm）在类别级不区分——confirm 档的
+/// 逐命令 allowlist 执法属 DSH approval 集成，后续里程碑接入。
+#[derive(Debug, Clone)]
+pub struct ToolPolicy {
+    granted: std::collections::HashSet<String>,
+}
+
+impl ToolPolicy {
+    pub fn from_grants(grants: &[flowix_plugin_runtime::PluginToolGrant]) -> Option<Self> {
+        if grants.is_empty() {
+            return None;
+        }
+        Some(Self {
+            granted: grants.iter().map(|grant| grant.tool.clone()).collect(),
+        })
+    }
+
+    /// 该工具调用是否越权（已识别类别 + 未授权）。
+    pub fn violates(&self, tool_name: &str) -> bool {
+        match classify_tool(tool_name) {
+            Some(category) => !self.granted.contains(category),
+            None => false,
+        }
+    }
+}
+
+/// 把运行时工具名归类到 toolGrants 的四个类别之一；无法识别返回 None。
+fn classify_tool(tool_name: &str) -> Option<&'static str> {
+    let name = tool_name.trim().to_lowercase();
+    if name.is_empty() {
+        return None;
+    }
+    if name.starts_with("memo") {
+        return Some("flowix.memo");
+    }
+    if name.contains("notebook") {
+        return Some("flowix.notebook");
+    }
+    if name.contains("shell") || name.contains("exec") || name.contains("bash") || name.contains("terminal") {
+        return Some("shell");
+    }
+    if name.contains("artifact") {
+        return Some("artifact");
+    }
+    None
+}
+
 pub fn uninstall(id: &str) -> Result<(), String> {
     if !valid_plugin_id(id) {
         return Err("invalid plugin id".to_string());
@@ -511,6 +570,136 @@ pub fn uninstall(id: &str) -> Result<(), String> {
     let mut state = read_plugin_state_result()?;
     if state.disabled.remove(id) {
         write_plugin_state(&state)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// P2 导入导出
+// ---------------------------------------------------------------------------
+
+/// P2 导出：把已安装插件打包为 `flowix-plugin-<id>-<version>.zip` 写入
+/// dest_directory，返回 zip 完整路径。条目为插件根的相对路径（'/' 分隔），
+/// Stored 不压缩（zip crate 未启用压缩 feature）。
+pub fn export_plugin_to(id: &str, dest_directory: &str) -> Result<String, String> {
+    let root = plugin_root()?;
+    let plugin_path = root.join(id);
+    let descriptor = read_plugin(&plugin_path)?;
+    fs::create_dir_all(dest_directory)
+        .map_err(|error| format!("create export destination: {error}"))?;
+    let zip_path = Path::new(dest_directory).join(format!(
+        "flowix-plugin-{}-{}.zip",
+        descriptor.manifest.id, descriptor.manifest.version
+    ));
+    write_plugin_zip(&plugin_path, &zip_path)?;
+    Ok(zip_path.to_string_lossy().to_string())
+}
+
+/// P2 导入：解压导出的 zip（拒绝路径逃逸条目）到插件根下的临时 staging
+/// 目录，再走既有安装管线（validate → publish；integrity 校验与 semver
+/// 规则不变）。
+pub fn import_plugin_from(archive_path: &str) -> Result<PluginDescriptor, String> {
+    ensure_builtin_plugins()?;
+    let root = plugin_root()?;
+    let staging = root.join(format!(".import-{}", uuid::Uuid::new_v4()));
+    if let Err(error) = extract_plugin_zip(Path::new(archive_path), &staging) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    let result = install_from_directory(&staging.to_string_lossy());
+    let _ = fs::remove_dir_all(&staging);
+    result
+}
+
+pub(crate) fn write_plugin_zip(plugin_path: &Path, zip_path: &Path) -> Result<(), String> {
+    let mut files = Vec::new();
+    collect_relative_files(plugin_path, plugin_path, &mut files)?;
+    files.sort();
+    let file =
+        fs::File::create(zip_path).map_err(|error| format!("create plugin archive: {error}"))?;
+    let mut writer = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored);
+    for relative in &files {
+        let name = relative.to_string_lossy().replace('\\', "/");
+        writer
+            .start_file(name.clone(), options)
+            .map_err(|error| format!("append {name} to plugin archive: {error}"))?;
+        let bytes = fs::read(plugin_path.join(relative))
+            .map_err(|error| format!("read {name} for plugin archive: {error}"))?;
+        std::io::Write::write_all(&mut writer, &bytes)
+            .map_err(|error| format!("write {name} into plugin archive: {error}"))?;
+    }
+    writer
+        .finish()
+        .map_err(|error| format!("finalize plugin archive: {error}"))?;
+    Ok(())
+}
+
+/// 递归收集插件目录内全部普通文件的相对路径，纪律与
+/// `validate_plugin_tree` 一致（拒绝符号链接与特殊条目）。
+fn collect_relative_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    for entry in
+        fs::read_dir(dir).map_err(|error| format!("read plugin directory: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("read plugin directory entry: {error}"))?;
+        let path = entry.path();
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|error| format!("inspect plugin file: {error}"))?;
+        if metadata.file_type().is_symlink() {
+            return Err("plugin source cannot contain symbolic links".to_string());
+        }
+        if metadata.is_dir() {
+            collect_relative_files(root, &path, out)?;
+        } else if metadata.is_file() {
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|error| format!("compute plugin file path: {error}"))?;
+            out.push(relative.to_path_buf());
+        } else {
+            return Err("plugin source contains an unsupported filesystem entry".to_string());
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn extract_plugin_zip(archive: &Path, dest_root: &Path) -> Result<(), String> {
+    fs::create_dir_all(dest_root)
+        .map_err(|error| format!("create import staging: {error}"))?;
+    let file =
+        fs::File::open(archive).map_err(|error| format!("open plugin archive: {error}"))?;
+    let mut zip_archive =
+        zip::ZipArchive::new(file).map_err(|error| format!("read plugin archive: {error}"))?;
+    for index in 0..zip_archive.len() {
+        let mut entry = zip_archive
+            .by_index(index)
+            .map_err(|error| format!("read plugin archive entry: {error}"))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry.name().to_string();
+        // zip-slip 防护：只接受由普通组件构成的相对路径。
+        let relative = Path::new(&name);
+        let safe = !relative.is_absolute()
+            && relative
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)));
+        if !safe || relative.components().next().is_none() {
+            return Err(format!("plugin archive contains unsafe path: {name}"));
+        }
+        let target = dest_root.join(relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("create import directory: {error}"))?;
+        }
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut bytes)
+            .map_err(|error| format!("read plugin archive entry {name}: {error}"))?;
+        if bytes.len() > 64 * 1024 * 1024 {
+            return Err(format!("plugin archive entry is too large: {name}"));
+        }
+        fs::write(&target, &bytes)
+            .map_err(|error| format!("write plugin archive entry {name}: {error}"))?;
     }
     Ok(())
 }
@@ -1271,5 +1460,126 @@ mod tests {
 
         let plugin = read_plugin_source(&source).expect("source manifest determines plugin id");
         assert_eq!(plugin.manifest.id, "mindmap");
+    }
+
+    // -----------------------------------------------------------------
+    // P2 导入导出
+    // -----------------------------------------------------------------
+
+    fn write_roundtrip_plugin(source: &std::path::Path) {
+        std::fs::create_dir_all(source.join("assets")).unwrap();
+        // 只替换 id 字段，避免误伤 "mindmap-markdown" 等合法值。
+        let manifest = MINDMAP_MANIFEST.replace("\"id\": \"mindmap\"", "\"id\": \"p2-roundtrip\"");
+        std::fs::write(source.join("plugin.json"), manifest).unwrap();
+        std::fs::write(source.join("SKILL.md"), MINDMAP_SKILL).unwrap();
+        std::fs::write(source.join("assets").join("data.bin"), [0u8, 1, 2, 254, 255]).unwrap();
+    }
+
+    fn relative_tree(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        super::collect_relative_files(root, root, &mut files).unwrap();
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn export_then_import_keeps_content_identical() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("plugin");
+        write_roundtrip_plugin(&source);
+        assert!(super::validate_plugin_directory(&source.to_string_lossy()).is_ok());
+
+        // 导出 → （等价于卸载后的）导入恢复目录。
+        let zip_path = temp.path().join("p2.zip");
+        super::write_plugin_zip(&source, &zip_path).expect("export plugin zip");
+        let restored = temp.path().join("restored");
+        super::extract_plugin_zip(&zip_path, &restored).expect("import plugin zip");
+
+        // 文件树与逐文件字节一致（P2 验收：导出→删除→导入内容一致）。
+        assert_eq!(relative_tree(&source), relative_tree(&restored));
+        for relative in relative_tree(&source) {
+            let original = std::fs::read(source.join(&relative)).unwrap();
+            let recovered = std::fs::read(restored.join(&relative)).unwrap();
+            assert_eq!(original, recovered, "content differs: {}", relative.display());
+        }
+
+        // 恢复后的目录仍是一份可安装的合法插件（manifest 语义不变）。
+        let before = read_plugin_source(&source).unwrap();
+        let after = read_plugin_source(&restored).unwrap();
+        assert_eq!(
+            serde_json::to_value(&before.manifest).unwrap(),
+            serde_json::to_value(&after.manifest).unwrap()
+        );
+        assert_eq!(after.manifest.id, "p2-roundtrip");
+    }
+
+    #[test]
+    fn plugin_archive_rejects_path_escape_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("evil.zip");
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("../evil.txt", options).unwrap();
+        std::io::Write::write_all(&mut writer, b"escape").unwrap();
+        writer.finish().unwrap();
+
+        let dest = temp.path().join("out");
+        let error = super::extract_plugin_zip(&zip_path, &dest).unwrap_err();
+        assert!(error.contains("unsafe path"), "{error}");
+        assert!(!temp.path().join("evil.txt").exists());
+    }
+
+    // -----------------------------------------------------------------
+    // P4 toolGrants 运行时执法
+    // -----------------------------------------------------------------
+
+    fn grant(tool: &str, access: &str) -> flowix_plugin_runtime::PluginToolGrant {
+        flowix_plugin_runtime::PluginToolGrant {
+            tool: tool.into(),
+            access: access.into(),
+            allowlist: vec![],
+        }
+    }
+
+    /// 黑名单执行器回归：已识别类别未授权 → 违规；授权类别与未识别
+    /// 类别（agent 内部机制）放行。验收口径「未授权工具调用穿透数 0」。
+    #[test]
+    fn tool_policy_blocks_unauthorized_categories() {
+        let policy = super::ToolPolicy::from_grants(&[grant("flowix.memo", "read")])
+            .expect("declared grants enforce");
+
+        assert!(policy.violates("shell_exec"));
+        assert!(policy.violates("run_bash_command"));
+        assert!(policy.violates("write_artifact"));
+        assert!(policy.violates("notebook_read_all"));
+        // 授权类别放行。
+        assert!(!policy.violates("memo_search"));
+        assert!(!policy.violates("memo_write_note"));
+        // 未识别类别放行（避免误杀 agent 内部机制）。
+        assert!(!policy.violates("think"));
+        assert!(!policy.violates("update_plan"));
+        assert!(!policy.violates(""));
+    }
+
+    #[test]
+    fn tool_policy_inactive_without_grants() {
+        // v1/v2 插件未声明 grants：不执法。
+        assert!(super::ToolPolicy::from_grants(&[]).is_none());
+    }
+
+    #[test]
+    fn tool_policy_all_categories_pass_when_granted() {
+        let policy = super::ToolPolicy::from_grants(&[
+            grant("flowix.memo", "read"),
+            grant("flowix.notebook", "read"),
+            grant("shell", "confirm"),
+            grant("artifact", "write"),
+        ])
+        .expect("declared grants enforce");
+        for tool in ["memo_search", "notebook_list", "shell_exec", "save_artifact"] {
+            assert!(!policy.violates(tool), "{tool} should be granted");
+        }
     }
 }
