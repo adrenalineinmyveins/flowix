@@ -534,6 +534,7 @@ pub async fn preview_full(
     question: &str,
     scope_entry_ids: &[String],
     target_level: &str,
+    parties: Option<(outbox::AgentParty, outbox::AgentParty)>,
 ) -> Result<RedactionPreviewReport, RedactionPipelineError> {
     use tauri::Manager;
 
@@ -662,6 +663,10 @@ pub async fn preview_full(
         &report,
         chrono::Utc::now().timestamp_millis(),
     );
+    // F5 wire v1 路由：显式咨询目标（缺省 local → manual 手动投递语义）。
+    if let Some((from, to)) = parties {
+        record = record.with_parties(from, to);
+    }
     // F5 披露标记：当次授权范围进信封 disclosure.allowedScopes。
     record.allowed_scopes = scopes
         .iter()

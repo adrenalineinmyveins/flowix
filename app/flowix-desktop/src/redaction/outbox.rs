@@ -20,8 +20,26 @@ pub const OUTBOX_DIR_NAME: &str = "redaction-outbox";
 pub const OUTBOX_LIMIT: usize = 200;
 /// F5 披露标记默认值（REDACTION-PIPELINE §5.1）：对端转咨深度与载荷寿命。
 pub const DISCLOSURE_MAX_HOPS: u32 = 2;
-/// 载荷默认 7 天过期（毫秒）。
-pub const DISCLOSURE_TTL_MS: i64 = 7 * 24 * 3600 * 1000;
+/// 载荷默认 7 天过期（秒；wire v1 契约统一 Unix 秒）。
+pub const DISCLOSURE_TTL_SECS: i64 = 7 * 24 * 3600;
+
+/// wire v1 路由方（from/to）。serde 与 flowix_relay::envelope::AgentRef 同形。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentParty {
+    pub agent_id: String,
+    #[serde(default)]
+    pub display_name: String,
+}
+
+fn default_from_agent() -> AgentParty {
+    AgentParty { agent_id: "local".to_string(), display_name: String::new() }
+}
+
+fn default_to_agent() -> AgentParty {
+    // 无显式收件人 = 手动投递语义；网络投递时中继按 RECIPIENT_UNKNOWN 拒。
+    AgentParty { agent_id: "manual".to_string(), display_name: String::new() }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -32,31 +50,10 @@ pub enum OutboxStatus {
     Failed,
 }
 
-/// 披露标记（信封 disclosure 段）：对端消费的转咨/过期/范围约束。
-/// 本端只负责签发；对端执法契约属 F5 云端协议（FD-10）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EnvelopeDisclosure {
-    pub redaction_level: String,
-    pub max_hops: u32,
-    pub hops_remaining: u32,
-    pub expires_at: i64,
-    /// 形如 `tag:finance/财报` / `path:/notes/book` 的范围标签。
-    pub allowed_scopes: Vec<String>,
-}
-
-/// 出设备信封：发送字节 = 该结构的确定性 JSON 序列化。
-/// 只含对端需要的内容 + 可解释性元数据（ruleSetVersion 供旧留档解释）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RedactionEnvelope {
-    pub receipt_id: String,
-    pub payload: String,
-    pub target_level: String,
-    pub rule_set_version: String,
-    pub created_at: i64,
-    pub disclosure: EnvelopeDisclosure,
-}
+/// 出设备信封（wire v1 `flowix.consult.v1`）：发送字节 = 该结构的确定性
+/// JSON 序列化。类型复用 flowix-relay（协议单一来源）；结构校验在
+/// 中继入口执行，本端构造保证字段完备。
+pub type RedactionEnvelope = flowix_relay::envelope::WireEnvelope;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -80,6 +77,60 @@ pub struct RedactionOutboxRecord {
     pub attempts: u32,
     pub used_fallback: bool,
     pub truncated: bool,
+    /// F5 wire v1 路由：发起方（本机 agent），缺省 local。
+    #[serde(default = "default_from_agent")]
+    pub from_agent: AgentParty,
+    /// F5 wire v1 路由：收件方，缺省 manual（手动投递语义）。
+    #[serde(default = "default_to_agent")]
+    pub to_agent: AgentParty,
+}
+
+impl RedactionOutboxRecord {
+    /// 设置 wire v1 路由双方（preview 编排层按咨询目标填入）。
+    pub fn with_parties(mut self, from: AgentParty, to: AgentParty) -> Self {
+        self.from_agent = from;
+        self.to_agent = to;
+        self
+    }
+
+    pub fn envelope(&self) -> RedactionEnvelope {
+        use flowix_relay::envelope::{
+            AgentRef, WireDisclosure, WirePayload, WireProvenance, ENVELOPE_VERSION,
+        };
+        // created_at 为毫秒；wire v1 契约统一 Unix 秒。
+        let created_secs = self.created_at / 1000;
+        RedactionEnvelope {
+            envelope: ENVELOPE_VERSION.to_string(),
+            from: AgentRef {
+                agent_id: self.from_agent.agent_id.clone(),
+                display_name: self.from_agent.display_name.clone(),
+            },
+            to: AgentRef {
+                agent_id: self.to_agent.agent_id.clone(),
+                display_name: self.to_agent.display_name.clone(),
+            },
+            in_reply_to: None,
+            disclosure: WireDisclosure {
+                redaction_level: self.target_level.clone(),
+                max_hops: DISCLOSURE_MAX_HOPS,
+                hops_remaining: DISCLOSURE_MAX_HOPS,
+                expires_at: created_secs + DISCLOSURE_TTL_SECS,
+                allowed_scopes: self.allowed_scopes.clone(),
+            },
+            payload: WirePayload {
+                kind: "consultation".to_string(),
+                text: self.payload.clone(),
+            },
+            provenance: WireProvenance {
+                pipeline_version: "1".to_string(),
+                rule_set_version: self.rule_set_version.clone(),
+                used_fallback: self.used_fallback,
+                confirmed_by: "user".to_string(),
+                confirmed_at: created_secs,
+                receipt_id: self.receipt_id.clone(),
+            },
+        }
+    }
 }
 
 pub fn new_receipt_id() -> String {
@@ -96,23 +147,6 @@ fn record_path(dir: &Path, receipt_id: &str) -> PathBuf {
 }
 
 impl RedactionOutboxRecord {
-    pub fn envelope(&self) -> RedactionEnvelope {
-        RedactionEnvelope {
-            receipt_id: self.receipt_id.clone(),
-            payload: self.payload.clone(),
-            target_level: self.target_level.clone(),
-            rule_set_version: self.rule_set_version.clone(),
-            created_at: self.created_at,
-            disclosure: EnvelopeDisclosure {
-                redaction_level: self.target_level.clone(),
-                max_hops: DISCLOSURE_MAX_HOPS,
-                hops_remaining: DISCLOSURE_MAX_HOPS,
-                expires_at: self.created_at + DISCLOSURE_TTL_MS,
-                allowed_scopes: self.allowed_scopes.clone(),
-            },
-        }
-    }
-
     /// 确定性序列化：serde_json 对固定字段的 struct 输出稳定，
     /// 同一留档重读后再次序列化逐字节一致（byte-equal 验收依据）。
     pub fn envelope_bytes(&self) -> Vec<u8> {
@@ -145,6 +179,8 @@ pub fn draft_from_preview(
         attempts: report.attempts,
         used_fallback: report.used_fallback,
         truncated: report.truncated,
+        from_agent: default_from_agent(),
+        to_agent: default_to_agent(),
     }
 }
 
@@ -322,27 +358,40 @@ mod tests {
         assert_eq!(loaded, record);
     }
 
-    /// F5 披露标记：信封序列化携带 disclosure 段（等级/hops/过期/范围），
-    /// 且确定性序列化保持 byte-equal 纪律。
+    /// F5 披露标记：wire v1 信封携带 disclosure 段（等级/hops/过期/范围）
+    /// 与 from/to 路由，且确定性序列化保持 byte-equal 纪律。
     #[test]
     fn envelope_carries_disclosure_block() {
         let mut record = draft_from_preview("q", &["e1".to_string()], &report("x"), 1000);
         record.allowed_scopes = vec!["tag:finance/财报".to_string()];
+        record = record.with_parties(
+            AgentParty { agent_id: "agt_a".to_string(), display_name: "甲".to_string() },
+            AgentParty { agent_id: "agt_b".to_string(), display_name: "乙".to_string() },
+        );
         let envelope = record.envelope();
+        assert_eq!(envelope.envelope, "flowix.consult.v1");
+        assert_eq!(envelope.from.agent_id, "agt_a");
+        assert_eq!(envelope.to.agent_id, "agt_b");
+        assert_eq!(envelope.payload.kind, "consultation");
+        assert_eq!(envelope.payload.text, record.payload);
+        assert_eq!(envelope.provenance.receipt_id, record.receipt_id);
         assert_eq!(envelope.disclosure.redaction_level, "r2");
         assert_eq!(envelope.disclosure.max_hops, DISCLOSURE_MAX_HOPS);
         assert_eq!(envelope.disclosure.hops_remaining, DISCLOSURE_MAX_HOPS);
-        assert_eq!(
-            envelope.disclosure.expires_at,
-            1000 + DISCLOSURE_TTL_MS
-        );
+        // created_at 毫秒 → wire 秒制：1000ms = 1s。
+        assert_eq!(envelope.disclosure.expires_at, 1 + DISCLOSURE_TTL_SECS);
         assert_eq!(envelope.disclosure.allowed_scopes, vec!["tag:finance/财报"]);
         let raw = String::from_utf8(record.envelope_bytes()).unwrap();
         assert!(raw.contains("\"disclosure\""));
         assert!(raw.contains("\"allowedScopes\""));
-        // 旧档（无 allowedScopes 字段）仍可读，scope 为空。
+        // wire v1 全键在场（中继结构校验的输入形态）。
+        assert!(raw.contains("\"flowix.consult.v1\""));
+        assert!(raw.contains("\"provenance\""));
+        // 旧档（无 allowedScopes/路由字段）仍可读，scope 为空、路由取默认。
         let legacy = draft_from_preview("q", &[], &report("y"), 1);
         assert!(legacy.allowed_scopes.is_empty());
+        assert_eq!(legacy.from_agent.agent_id, "local");
+        assert_eq!(legacy.to_agent.agent_id, "manual");
         assert!(legacy.envelope().disclosure.allowed_scopes.is_empty());
     }
 
@@ -390,9 +439,10 @@ mod tests {
         assert_eq!(sent, take_confirmed_payload(root.path(), &draft.receipt_id).unwrap());
 
         let envelope: RedactionEnvelope = serde_json::from_slice(&sent).unwrap();
-        assert_eq!(envelope.receipt_id, draft.receipt_id);
-        assert_eq!(envelope.payload, draft.payload);
-        assert_eq!(envelope.target_level, "r2");
+        assert_eq!(envelope.provenance.receipt_id, draft.receipt_id);
+        assert_eq!(envelope.payload.text, draft.payload);
+        assert_eq!(envelope.payload.kind, "consultation");
+        assert_eq!(envelope.disclosure.redaction_level, "r2");
     }
 
     #[test]

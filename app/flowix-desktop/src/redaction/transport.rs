@@ -10,6 +10,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use super::inbound::relay_endpoint;
 use super::outbox::take_confirmed_payload;
 
 #[derive(Debug, Clone, Serialize)]
@@ -53,8 +54,10 @@ pub async fn deliver_confirmed_envelope(
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|error| format!("RELAY_CLIENT_INIT_FAILED:{error}"))?;
+    // relayUrl 兼容 base / base/v1 两种配置写法（wire v1 端点固定 /v1/outbox）。
+    let outbox_url = relay_endpoint(relay_url, "/v1/outbox");
     let response = client
-        .post(relay_url.trim())
+        .post(outbox_url)
         .header("content-type", "application/json")
         .header("x-flowix-envelope", "flowix.consult.v1")
         .body(bytes)

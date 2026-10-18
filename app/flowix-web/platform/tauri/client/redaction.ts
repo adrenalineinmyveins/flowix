@@ -1,7 +1,10 @@
 import { invoke } from '@tauri-apps/api/core';
 
 import type {
+  AgentParty,
   ConfirmGateResult,
+  InboundRecord,
+  InboxPollSummary,
   RedactionConfig,
   RedactionL1Preview,
   RedactionOutboxRecord,
@@ -24,12 +27,23 @@ export const redaction = {
     invoke<RedactionL1Preview>('redaction_l1_preview', { text }),
 
   /** 完整 preview：L0 scope 组装 → L1 规则 → L2 蒸馏 → L3 复扫。返回 draft 态报告。 */
-  preview: (cwd: string, question: string, scopeEntryIds: string[], targetLevel: string) =>
+  preview: (
+    cwd: string,
+    question: string,
+    scopeEntryIds: string[],
+    targetLevel: string,
+    options?: { minLevels?: string[]; sender?: AgentParty; recipient?: AgentParty },
+  ) =>
     invoke<RedactionPreviewReport>('redaction_preview', {
       cwd,
       question,
       scopeEntryIds,
       targetLevel,
+      minLevels: options?.minLevels,
+      senderAgentId: options?.sender?.agentId,
+      senderDisplayName: options?.sender?.displayName,
+      recipientAgentId: options?.recipient?.agentId,
+      recipientDisplayName: options?.recipient?.displayName,
     }),
 
   /** 确认门决定：approved → confirmed；否则 cancelled（超时语义同拒绝）。 */
@@ -51,4 +65,20 @@ export const redaction = {
   /** 出站留档列表（createdAt 升序），确认门 draft 恢复与审计共用。 */
   outboxList: (cwd: string) =>
     invoke<RedactionOutboxRecord[]>('redaction_outbox_list', { cwd }),
+
+  /** F5 入站：向中继注册本机 agent 收件通道（凭据落 config）。 */
+  inboxRegister: (agentIds: string[]) =>
+    invoke<RedactionConfig>('redaction_inbox_register', { agentIds }),
+
+  /** F5 入站：拉取全部已注册 agent 的收件队列（校验 → 留档 → ack）。 */
+  inboxPoll: (cwd: string) =>
+    invoke<InboxPollSummary>('redaction_inbox_poll', { cwd }),
+
+  /** F5 入站：留档列表（receivedAt 降序）。 */
+  inboxList: (cwd: string) =>
+    invoke<InboundRecord[]>('redaction_inbox_list', { cwd }),
+
+  /** F5 入站：接受 / 拒绝一条 pending 咨询。 */
+  inboxSetStatus: (cwd: string, receiptId: string, accepted: boolean) =>
+    invoke<void>('redaction_inbox_set_status', { cwd, receiptId, accepted }),
 };

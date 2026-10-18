@@ -233,6 +233,10 @@ pub async fn redaction_preview(
     scope_entry_ids: Vec<String>,
     target_level: String,
     min_levels: Option<Vec<String>>,
+    sender_agent_id: Option<String>,
+    sender_display_name: Option<String>,
+    recipient_agent_id: Option<String>,
+    recipient_display_name: Option<String>,
 ) -> Result<crate::redaction::RedactionPreviewReport, String> {
     if question.trim().is_empty() {
         return Err("QUESTION_REQUIRED".to_string());
@@ -246,12 +250,27 @@ pub async fn redaction_preview(
         &min_levels.unwrap_or_default(),
     )
     .map_err(|error| error.to_ipc_error())?;
+    // F5 wire v1 路由：给定收件人才算网络咨询；缺省 local → manual。
+    let parties = recipient_agent_id
+        .map(|agent_id| {
+            (
+                crate::redaction::outbox::AgentParty {
+                    agent_id: sender_agent_id.unwrap_or_else(|| "local".to_string()),
+                    display_name: sender_display_name.unwrap_or_default(),
+                },
+                crate::redaction::outbox::AgentParty {
+                    agent_id,
+                    display_name: recipient_display_name.unwrap_or_default(),
+                },
+            )
+        });
     crate::redaction::preview_full(
         &app_handle,
         &cwd,
         &question,
         &scope_entry_ids,
         &effective,
+        parties,
     )
     .await
     .map_err(|error| error.to_ipc_error())

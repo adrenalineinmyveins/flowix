@@ -33,6 +33,10 @@ export interface RedactionConfig {
   distillAgentType: string;
   /** F5：平台中继地址，空 = 未配置（transmit 返回 RELAY_NOT_CONFIGURED）。 */
   relayUrl: string;
+  /** F5：本机在中继的收件通道凭据（redaction_inbox_register 写入）。 */
+  deviceToken?: string | null;
+  /** F5：已注册到中继的本机 agent。 */
+  registeredAgents?: string[];
 }
 
 export interface RelayDeliverResult {
@@ -78,6 +82,12 @@ export interface RedactionPreviewReport {
 
 export type OutboxStatus = "draft" | "confirmed" | "cancelled" | "failed";
 
+/** wire v1 路由方（serde 与 flowix-relay AgentRef 同形）。 */
+export interface AgentParty {
+  agentId: string;
+  displayName?: string;
+}
+
 export interface RedactionOutboxRecord {
   receiptId: string;
   status: OutboxStatus;
@@ -88,6 +98,10 @@ export interface RedactionOutboxRecord {
   scopeEntryIds: string[];
   /** 当次授权范围标签（tag:/path: 前缀），进信封 disclosure.allowedScopes。旧档无此字段。 */
   allowedScopes?: string[];
+  /** F5 wire v1 路由：发起方，缺省 local。旧档无此字段。 */
+  fromAgent?: AgentParty;
+  /** F5 wire v1 路由：收件方，缺省 manual（手动投递语义）。旧档无此字段。 */
+  toAgent?: AgentParty;
   targetLevel: string;
   ruleSetVersion: string;
   payload: string;
@@ -98,6 +112,43 @@ export interface RedactionOutboxRecord {
   attempts: number;
   usedFallback: boolean;
   truncated: boolean;
+}
+
+/** F5 入站留档状态机（`.flowix/redaction-inbound/`）。 */
+export type InboundStatus = "pending" | "accepted" | "rejected";
+
+/** wire v1 disclosure 段（镜像 flowix-relay WireDisclosure）。 */
+export interface WireDisclosure {
+  redactionLevel: string;
+  maxHops: number;
+  hopsRemaining: number;
+  /** Unix 秒。 */
+  expiresAt: number;
+  allowedScopes?: string[];
+}
+
+export interface InboundRecord {
+  receiptId: string;
+  queueId: string;
+  fromAgentId: string;
+  fromDisplayName: string;
+  toAgentId: string;
+  /** `consultation` | `reply`。 */
+  payloadKind: string;
+  payloadText: string;
+  /** 入站校验拒绝码（status=rejected 时有值）。 */
+  rejectCode?: string | null;
+  inReplyTo?: string | null;
+  disclosure: WireDisclosure;
+  receivedAt: number;
+  status: InboundStatus;
+}
+
+/** redaction_inbox_poll 汇总。 */
+export interface InboxPollSummary {
+  stored: number;
+  duplicates: number;
+  rejected: number;
 }
 
 export type ConfirmGateResult =
