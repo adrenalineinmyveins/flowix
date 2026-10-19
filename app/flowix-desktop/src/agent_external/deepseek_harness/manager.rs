@@ -63,6 +63,9 @@ pub struct DeepSeekHarnessManager {
     /// The lock is per Flowix thread, so unrelated conversations still start
     /// concurrently while `/goal` and `/skill` cannot create two DSH logs.
     command_session_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Serializes the empty-describe bootstrap so concurrent model config
+    /// readers cannot race the same `model/settings/update` revision.
+    model_settings_bootstrap: tokio::sync::Mutex<()>,
 }
 
 pub(crate) const HARNESS_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -136,6 +139,7 @@ impl DeepSeekHarnessManager {
             runs: RunCoordinator::default(),
             lifecycle_gate: tokio::sync::Mutex::new(()),
             command_session_locks: tokio::sync::Mutex::new(HashMap::new()),
+            model_settings_bootstrap: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -1184,6 +1188,35 @@ impl DeepSeekHarnessManager {
     }
 
     pub async fn dsh_model_configs(&self) -> Result<Vec<AiConfigFile>, String> {
+        let configs = self.describe_model_configs().await?;
+        if !configs.is_empty() {
+            return Ok(configs);
+        }
+        // Host 冷启动后，DSH 对 settings.yaml 的一次性 legacy 导入（rename
+        // 成 .imported，dsh-settings 在 Loader settle 后才执行）与首个
+        // model/config/read 存在竞态，describe 可能读到空 providers。此时把
+        // 本地持久配置经 model/settings/update 主动推入 host，不赌导入时机。
+        let _guard = self.model_settings_bootstrap.lock().await;
+        let configs = self.describe_model_configs().await?;
+        if !configs.is_empty() {
+            return Ok(configs);
+        }
+        let Some(file) = self
+            .user_config
+            .read_deepseek_harness_settings()
+            .ok()
+            .flatten()
+        else {
+            return Ok(configs);
+        };
+        for (route, provider) in &file.llm_pi_ai.providers {
+            let config = DeepSeekHarnessSettingsFile::to_ai_config_for_route(route, provider);
+            self.persist_dsh_model_config(&config, true).await?;
+        }
+        self.describe_model_configs().await
+    }
+
+    async fn describe_model_configs(&self) -> Result<Vec<AiConfigFile>, String> {
         let host = self.model_host().await?;
         let result = timed_host_request(
             &host.client(),
@@ -1257,6 +1290,9 @@ impl DeepSeekHarnessManager {
 
     fn host_launch_spec(&self) -> HostLaunchSpec {
         let dsh_home = self.user_config.dsh_dir();
+        // DSH 会把 settings.yaml 导入后 rename 成 .imported；启动 host 前先恢复，
+        // 否则 host 读不到 provider 配置（蒸馏报 provider not configured）。
+        self.user_config.ensure_dsh_settings_restored();
         HostLaunchSpec {
             session_root: self.session_root.clone(),
             settings_path: self.user_config.dsh_settings_path(),

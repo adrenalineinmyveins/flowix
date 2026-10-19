@@ -120,6 +120,12 @@ pub async fn set_deepseek_harness_config(
         .persist_credential(&config.model)
         .await?;
     config.model.api_keys.clear();
+    // 双写：DSH host 内存 upsert 的落盘时机不确定（host 被 taskkill 时丢失），
+    // UserConfigStore 直写 settings.yaml 保证重启可恢复；host 路径仍负责在线生效。
+    state
+        .user_config
+        .set_deepseek_harness_config(&config)
+        .map_err(|error| error.to_string())?;
     state
         .deepseek_harness
         .persist_dsh_model_config(&config, false)
@@ -140,6 +146,11 @@ pub async fn add_deepseek_harness_model(
         .persist_credential(&config.model)
         .await?;
     config.model.api_keys.clear();
+    // 双写，同上：yaml 先落盘，host upsert 后生效。
+    state
+        .user_config
+        .add_deepseek_harness_config(&config)
+        .map_err(|error| error.to_string())?;
     state
         .deepseek_harness
         .persist_dsh_model_config(&config, true)

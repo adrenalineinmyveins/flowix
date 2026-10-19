@@ -907,9 +907,25 @@ impl UserConfigStore {
         Ok(())
     }
 
-    fn read_deepseek_harness_settings(
+    /// DSH 的 dsh-settings 会把 settings.yaml 一次性导入后 rename 成
+    /// settings.yaml.imported，导致 settings.yaml 消失、下次启动读不到。
+    /// 在读取配置或启动 DSH host 前调用，把 imported 副本恢复回 settings.yaml，
+    /// 让配置跨重启持久。
+    pub fn ensure_dsh_settings_restored(&self) {
+        let path = self.dsh_settings_path();
+        if path.exists() {
+            return;
+        }
+        let imported = path.with_extension("yaml.imported");
+        if let Ok(content) = fs::read_to_string(&imported) {
+            let _ = atomic_write_yaml(&path, &content);
+        }
+    }
+
+    pub(crate) fn read_deepseek_harness_settings(
         &self,
     ) -> Result<Option<DeepSeekHarnessSettingsFile>, UserConfigError> {
+        self.ensure_dsh_settings_restored();
         let path = self.dsh_settings_path();
         match fs::read_to_string(path) {
             Ok(content) => Ok(Some(serde_yaml::from_str(&content)?)),
