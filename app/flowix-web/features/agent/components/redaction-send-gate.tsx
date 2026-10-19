@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { Loader2, Plus, RotateCcw, Send, ShieldCheck, X } from 'lucide-react';
+import { Loader2, Plus, Reply, RotateCcw, Send, ShieldCheck, X } from 'lucide-react';
 
 import { redaction, tags } from '@platform/tauri/client';
 import type {
@@ -87,22 +87,33 @@ function ScopeRow({
 export function RedactionSendGateDialog({
   notebookId,
   notebookPath,
+  presetQuestion,
+  presetRecipient,
+  replyTo,
   onClose,
 }: {
   notebookId: string;
   notebookPath: string;
+  /** 预填文本（如收件箱回程：专家回答草稿）。 */
+  presetQuestion?: string;
+  /** 预设收件方（回程 = 原咨询发起方）。 */
+  presetRecipient?: { agentId: string; displayName?: string };
+  /** 回程语义：原 receiptId + 请求信封剩余跳数（回程 = 其 - 1）。 */
+  replyTo?: { receiptId: string; hopsRemaining: number };
   onClose: () => void;
 }) {
   const entries = useAgentAccessStore((state) => state.config.entries);
   const addTagScope = useAgentAccessStore((state) => state.addTagScope);
 
   const [config, setConfig] = useState<RedactionConfig | null>(null);
-  const [question, setQuestion] = useState('');
+  const [question, setQuestion] = useState(presetQuestion ?? '');
   const [targetLevel, setTargetLevel] = useState<string>('r2');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [scopeTab, setScopeTab] = useState<ScopeTab>('dirs');
   const [notebookTags, setNotebookTags] = useState<{ id: string; name: string }[]>([]);
   const [tagDraft, setTagDraft] = useState('');
+  /** F5 收件方：preset 锁定（回程）；否则用户可输 agentId（手动投递留空）。 */
+  const [recipientAgentId, setRecipientAgentId] = useState('');
 
   const [gate, setGate] = useState<RedactionGateView | null>(null);
   const [gateCreatedAt, setGateCreatedAt] = useState(0);
@@ -197,11 +208,25 @@ export function RedactionSendGateDialog({
     setPreviewing(true);
     setGateError(null);
     try {
+      const recipient = presetRecipient
+        ? {
+            agentId: presetRecipient.agentId,
+            displayName: presetRecipient.displayName ?? '',
+          }
+        : recipientAgentId.trim()
+          ? { agentId: recipientAgentId.trim(), displayName: '' }
+          : undefined;
       const report = await redaction.preview(
         notebookPath,
         question.trim(),
         [...selectedIds],
         targetLevel,
+        {
+          recipient,
+          inReplyTo: replyTo?.receiptId,
+          replyHopsRemaining:
+            replyTo !== undefined ? Math.max(0, replyTo.hopsRemaining - 1) : undefined,
+        },
       );
       if (disposedRef.current) return;
       const createdAt = Date.now();
@@ -214,7 +239,17 @@ export function RedactionSendGateDialog({
     } finally {
       setPreviewing(false);
     }
-  }, [previewing, question, selectedIds, targetLevel, notebookPath, confirmTimeoutSecs]);
+  }, [
+    previewing,
+    question,
+    selectedIds,
+    targetLevel,
+    notebookPath,
+    confirmTimeoutSecs,
+    presetRecipient,
+    recipientAgentId,
+    replyTo,
+  ]);
 
   const doSend = useCallback(async () => {
     if (!gate || sending || gateStage.kind !== 'confirmed') return;
@@ -359,6 +394,29 @@ export function RedactionSendGateDialog({
                   placeholder="例如：根据财报笔记，近一季复购下滑可能和什么有关？"
                 />
               </label>
+
+              {replyTo ? (
+                <div className="flex items-center gap-2 rounded-lg border border-[var(--border)] bg-[color-mix(in_oklch,var(--primary)_6%,var(--background))] px-3 py-2 text-xs text-[var(--muted-foreground)]">
+                  <Reply className="h-3.5 w-3.5 shrink-0 text-[var(--primary)]" />
+                  <span className="min-w-0 flex-1 truncate">
+                    回程信封 → {presetRecipient?.displayName || presetRecipient?.agentId || '原发起方'}
+                    （inReplyTo {replyTo.receiptId}，剩余跳数 {Math.max(0, replyTo.hopsRemaining - 1)}）
+                  </span>
+                </div>
+              ) : (
+                <label className="block space-y-1.5">
+                  <span className="text-xs font-medium text-[var(--foreground)]">
+                    收件方 Agent ID（可选，F5 网络咨询必填）
+                  </span>
+                  <input
+                    className={inputClass}
+                    value={presetRecipient ? `${presetRecipient.displayName || ''} ${presetRecipient.agentId}`.trim() : recipientAgentId}
+                    readOnly={Boolean(presetRecipient)}
+                    onChange={(event) => setRecipientAgentId(event.target.value)}
+                    placeholder="agt_…（留空 = 手动投递）"
+                  />
+                </label>
+              )}
 
               <div className="space-y-1.5">
                 <span className="text-xs font-medium text-[var(--foreground)]">目标脱敏等级</span>

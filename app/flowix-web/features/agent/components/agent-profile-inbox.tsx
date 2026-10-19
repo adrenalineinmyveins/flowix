@@ -1,11 +1,12 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Inbox, Loader2, RefreshCw, ShieldCheck } from 'lucide-react';
+import { Inbox, Loader2, RefreshCw, Send, ShieldCheck } from 'lucide-react';
 
 import { agentProfile, redaction } from '@platform/tauri/client';
 import type { InboundRecord, RedactionConfig } from '@/lib/types/redaction';
 import { useNoteStore } from '@features/memo/store/note-store';
+import { RedactionSendGateDialog } from '@features/agent/components/redaction-send-gate';
 import { Button } from '@shared/ui/button';
 import { OverlayScrollbar } from '@shared/ui/overlay-scrollbar';
 import { ListSurfaceLoadingState } from '@shared/ui/list-surface';
@@ -46,6 +47,10 @@ export function AgentProfileInbox({ notebookPath }: { notebookPath: string }) {
   const [registering, setRegistering] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** 回程草稿（receiptId -> 回答文本），仅组件态；发送走确认门后落 outbox。 */
+  const [answerDrafts, setAnswerDrafts] = useState<Record<string, string>>({});
+  /** 打开回程确认门的信封（回程 = 回答该咨询）。 */
+  const [replyingTo, setReplyingTo] = useState<InboundRecord | null>(null);
   const disposedRef = useRef(false);
 
   const reload = useCallback(async () => {
@@ -130,6 +135,7 @@ export function AgentProfileInbox({ notebookPath }: { notebookPath: string }) {
   }, [notebookPath, reload]);
 
   const setTarget = useNoteStore((state) => state.setAgentProfileViewTarget);
+  const selectedNotebookId = useNoteStore((state) => state.selectedNotebookId);
   const registeredCount = config?.registeredAgents?.length ?? 0;
 
   return (
@@ -249,6 +255,37 @@ export function AgentProfileInbox({ notebookPath }: { notebookPath: string }) {
                         </Button>
                       </div>
                     )}
+                    {record.status === 'accepted' && record.payloadKind === 'consultation' && (
+                      <div className="space-y-2 border-t border-[var(--divider)] pt-3">
+                        <label className="block space-y-1.5">
+                          <span className="text-xs font-medium text-[var(--foreground)]">
+                            {t('agent.inbox.answerLabel')}
+                          </span>
+                          <textarea
+                            className="w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2 text-sm leading-6 text-[var(--foreground)] outline-none transition-colors placeholder:text-[var(--muted-foreground)] focus:border-[var(--primary)]"
+                            value={answerDrafts[record.receiptId] ?? ''}
+                            onChange={(event) =>
+                              setAnswerDrafts((prev) => ({
+                                ...prev,
+                                [record.receiptId]: event.target.value,
+                              }))
+                            }
+                            placeholder={t('agent.inbox.answerPlaceholder')}
+                          />
+                        </label>
+                        <div className="flex justify-end">
+                          <Button
+                            type="button"
+                            className="h-7 gap-1.5 rounded-lg px-2.5 text-xs"
+                            disabled={!(answerDrafts[record.receiptId] ?? '').trim()}
+                            onClick={() => setReplyingTo(record)}
+                          >
+                            <Send className="h-3.5 w-3.5" />
+                            {t('agent.inbox.sendReply')}
+                          </Button>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 );
               })}
@@ -256,6 +293,24 @@ export function AgentProfileInbox({ notebookPath }: { notebookPath: string }) {
           </OverlayScrollbar>
         )}
       </div>
+
+      {/* F5 回程确认门：回答草稿脱敏后经确认门投回中继（kind=reply，跳数继承减一）。 */}
+      {replyingTo && selectedNotebookId && (
+        <RedactionSendGateDialog
+          notebookId={selectedNotebookId}
+          notebookPath={notebookPath}
+          presetQuestion={answerDrafts[replyingTo.receiptId] ?? ''}
+          presetRecipient={{
+            agentId: replyingTo.fromAgentId,
+            displayName: replyingTo.fromDisplayName,
+          }}
+          replyTo={{
+            receiptId: replyingTo.receiptId,
+            hopsRemaining: replyingTo.disclosure.hopsRemaining,
+          }}
+          onClose={() => setReplyingTo(null)}
+        />
+      )}
     </div>
   );
 }

@@ -237,6 +237,8 @@ pub async fn redaction_preview(
     sender_display_name: Option<String>,
     recipient_agent_id: Option<String>,
     recipient_display_name: Option<String>,
+    in_reply_to: Option<String>,
+    reply_hops_remaining: Option<u32>,
 ) -> Result<crate::redaction::RedactionPreviewReport, String> {
     if question.trim().is_empty() {
         return Err("QUESTION_REQUIRED".to_string());
@@ -264,6 +266,12 @@ pub async fn redaction_preview(
                 },
             )
         });
+    // 回程信封（对已接受咨询的回答）：inReplyTo + 继承跳数。
+    let reply = in_reply_to.map(|receipt_id| {
+        let hops = reply_hops_remaining
+            .unwrap_or(crate::redaction::outbox::DISCLOSURE_MAX_HOPS.saturating_sub(1));
+        (receipt_id, hops)
+    });
     crate::redaction::preview_full(
         &app_handle,
         &cwd,
@@ -271,6 +279,7 @@ pub async fn redaction_preview(
         &scope_entry_ids,
         &effective,
         parties,
+        reply,
     )
     .await
     .map_err(|error| error.to_ipc_error())

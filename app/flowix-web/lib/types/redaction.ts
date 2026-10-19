@@ -102,6 +102,10 @@ export interface RedactionOutboxRecord {
   fromAgent?: AgentParty;
   /** F5 wire v1 路由：收件方，缺省 manual（手动投递语义）。旧档无此字段。 */
   toAgent?: AgentParty;
+  /** F5 回程信封：指向的原 receiptId（有值时 kind=reply）。 */
+  inReplyTo?: string | null;
+  /** F5 回程信封跳数继承。 */
+  replyHopsRemaining?: number | null;
   targetLevel: string;
   ruleSetVersion: string;
   payload: string;

@@ -166,7 +166,11 @@ describe('redaction send gate', () => {
     await mount();
     await runPreview();
 
-    expect(redactionMock.preview).toHaveBeenCalledWith(CWD, '复购为什么下滑？', ['nb_1'], 'r2');
+    expect(redactionMock.preview).toHaveBeenCalledWith(CWD, '复购为什么下滑？', ['nb_1'], 'r2', {
+      recipient: undefined,
+      inReplyTo: undefined,
+      replyHopsRemaining: undefined,
+    });
     expect(host.textContent).toContain(REPORT.finalText);
     expect(host.textContent).toContain('⟦PHONE-1⟧');
     expect(host.textContent).toContain('phone × 1');

@@ -83,6 +83,12 @@ pub struct RedactionOutboxRecord {
     /// F5 wire v1 路由：收件方，缺省 manual（手动投递语义）。
     #[serde(default = "default_to_agent")]
     pub to_agent: AgentParty,
+    /// F5 回程信封：指向的原 receiptId（有值时 payload.kind=reply）。
+    #[serde(default)]
+    pub in_reply_to: Option<String>,
+    /// F5 回程信封：跳数继承（= 请求信封 hopsRemaining - 1，契约 §5）。
+    #[serde(default)]
+    pub reply_hops_remaining: Option<u32>,
 }
 
 impl RedactionOutboxRecord {
@@ -93,12 +99,26 @@ impl RedactionOutboxRecord {
         self
     }
 
+    /// 设置回程语义（对咨询的回答信封）：inReplyTo + 继承跳数。
+    pub fn with_reply(mut self, in_reply_to: String, hops_remaining: u32) -> Self {
+        self.in_reply_to = Some(in_reply_to);
+        self.reply_hops_remaining = Some(hops_remaining);
+        self
+    }
+
     pub fn envelope(&self) -> RedactionEnvelope {
         use flowix_relay::envelope::{
             AgentRef, WireDisclosure, WirePayload, WireProvenance, ENVELOPE_VERSION,
         };
         // created_at 为毫秒；wire v1 契约统一 Unix 秒。
         let created_secs = self.created_at / 1000;
+        let is_reply = self.in_reply_to.is_some();
+        let hops_remaining = match (is_reply, self.reply_hops_remaining) {
+            // 回程：继承跳数（调用方按契约已减一）。
+            (true, Some(hops)) => hops,
+            (true, None) => DISCLOSURE_MAX_HOPS.saturating_sub(1),
+            (false, _) => DISCLOSURE_MAX_HOPS,
+        };
         RedactionEnvelope {
             envelope: ENVELOPE_VERSION.to_string(),
             from: AgentRef {
@@ -109,16 +129,16 @@ impl RedactionOutboxRecord {
                 agent_id: self.to_agent.agent_id.clone(),
                 display_name: self.to_agent.display_name.clone(),
             },
-            in_reply_to: None,
+            in_reply_to: self.in_reply_to.clone(),
             disclosure: WireDisclosure {
                 redaction_level: self.target_level.clone(),
                 max_hops: DISCLOSURE_MAX_HOPS,
-                hops_remaining: DISCLOSURE_MAX_HOPS,
+                hops_remaining,
                 expires_at: created_secs + DISCLOSURE_TTL_SECS,
                 allowed_scopes: self.allowed_scopes.clone(),
             },
             payload: WirePayload {
-                kind: "consultation".to_string(),
+                kind: if is_reply { "reply" } else { "consultation" }.to_string(),
                 text: self.payload.clone(),
             },
             provenance: WireProvenance {
@@ -181,6 +201,8 @@ pub fn draft_from_preview(
         truncated: report.truncated,
         from_agent: default_from_agent(),
         to_agent: default_to_agent(),
+        in_reply_to: None,
+        reply_hops_remaining: None,
     }
 }
 
@@ -393,6 +415,28 @@ mod tests {
         assert_eq!(legacy.from_agent.agent_id, "local");
         assert_eq!(legacy.to_agent.agent_id, "manual");
         assert!(legacy.envelope().disclosure.allowed_scopes.is_empty());
+    }
+
+    /// F5 回程信封：inReplyTo 触发 kind=reply、跳数继承递减（契约 §5）。
+    #[test]
+    fn reply_envelope_carries_in_reply_to_and_reduced_hops() {
+        let mut record = draft_from_preview("answer", &[], &report("z"), 2000);
+        record = record
+            .with_parties(
+                AgentParty { agent_id: "agt_expert".to_string(), display_name: "专家".to_string() },
+                AgentParty { agent_id: "agt_asker".to_string(), display_name: "提问方".to_string() },
+            )
+            // 请求信封 hopsRemaining=2 → 回程 = 1。
+            .with_reply("rct_req_1".to_string(), 1);
+        let envelope = record.envelope();
+        assert_eq!(envelope.payload.kind, "reply");
+        assert_eq!(envelope.in_reply_to.as_deref(), Some("rct_req_1"));
+        assert_eq!(envelope.disclosure.hops_remaining, 1);
+        assert_eq!(envelope.disclosure.max_hops, DISCLOSURE_MAX_HOPS);
+        assert_eq!(envelope.to.agent_id, "agt_asker");
+        let raw = String::from_utf8(record.envelope_bytes()).unwrap();
+        assert!(raw.contains("\"kind\":\"reply\""));
+        assert!(raw.contains("\"inReplyTo\":\"rct_req_1\""));
     }
 
     #[test]

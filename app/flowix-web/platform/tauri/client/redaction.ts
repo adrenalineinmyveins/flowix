@@ -32,7 +32,15 @@ export const redaction = {
     question: string,
     scopeEntryIds: string[],
     targetLevel: string,
-    options?: { minLevels?: string[]; sender?: AgentParty; recipient?: AgentParty },
+    options?: {
+      minLevels?: string[];
+      sender?: AgentParty;
+      recipient?: AgentParty;
+      /** 回程信封：指向的原 receiptId（kind=reply）。 */
+      inReplyTo?: string;
+      /** 回程信封跳数继承（请求信封 hopsRemaining - 1）。 */
+      replyHopsRemaining?: number;
+    },
   ) =>
     invoke<RedactionPreviewReport>('redaction_preview', {
       cwd,
@@ -44,6 +52,8 @@ export const redaction = {
       senderDisplayName: options?.sender?.displayName,
       recipientAgentId: options?.recipient?.agentId,
       recipientDisplayName: options?.recipient?.displayName,
+      inReplyTo: options?.inReplyTo,
+      replyHopsRemaining: options?.replyHopsRemaining,
     }),
 
   /** 确认门决定：approved → confirmed；否则 cancelled（超时语义同拒绝）。 */

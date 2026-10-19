@@ -94,7 +94,7 @@ beforeEach(() => {
   agentProfileMock.list.mockResolvedValue([
     { flowix_agent_id: 'agt_b', flowix_display_name: '乙' },
   ]);
-  useNoteStore.setState({ agentProfileViewTarget: { inbox: true } });
+  useNoteStore.setState({ agentProfileViewTarget: { inbox: true }, selectedNotebookId: 'nb_1' });
   host = document.createElement('div');
   document.body.appendChild(host);
   root = createRoot(host);
@@ -161,5 +161,28 @@ describe('agent profile inbox', () => {
 
     expect(agentProfileMock.list).toHaveBeenCalledWith(CWD);
     expect(redactionMock.inboxRegister).toHaveBeenCalledWith(['agt_b']);
+  });
+
+  it('opens the reply send gate with preset recipient and reply context', async () => {
+    redactionMock.inboxList.mockResolvedValue([record({ status: 'accepted' })]);
+    redactionMock.configGet.mockResolvedValue(CONFIG);
+    await mount();
+
+    const textarea = document.body.querySelector('textarea') as HTMLTextAreaElement;
+    expect(textarea).toBeDefined();
+    const nativeSetter = Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype,
+      'value',
+    )?.set as ((this: HTMLTextAreaElement, value: string) => void) | undefined;
+    await act(async () => {
+      nativeSetter?.call(textarea, '复购下滑主因是履约时效恶化。');
+      textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+
+    await click('脱敏发送回答');
+    // 确认门渲染在组件树内（fixed 遮罩，非 portal）：回程徽标在场（原发起方 + inReplyTo）。
+    expect(document.body.textContent).toContain('脱敏发送确认门');
+    expect(document.body.textContent).toContain('回程信封 → 财报验证助手');
+    expect(document.body.textContent).toContain('rct_in1');
   });
 });
