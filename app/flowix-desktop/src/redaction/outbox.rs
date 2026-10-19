@@ -131,7 +131,8 @@ impl RedactionOutboxRecord {
             },
             in_reply_to: self.in_reply_to.clone(),
             disclosure: WireDisclosure {
-                redaction_level: self.target_level.clone(),
+                // wire 契约 §3 为 R1|R2|R3 大写；内部留档沿用小写配置值，仅出端口转。
+                redaction_level: self.target_level.to_uppercase(),
                 max_hops: DISCLOSURE_MAX_HOPS,
                 hops_remaining,
                 expires_at: created_secs + DISCLOSURE_TTL_SECS,
@@ -397,7 +398,8 @@ mod tests {
         assert_eq!(envelope.payload.kind, "consultation");
         assert_eq!(envelope.payload.text, record.payload);
         assert_eq!(envelope.provenance.receipt_id, record.receipt_id);
-        assert_eq!(envelope.disclosure.redaction_level, "r2");
+        // wire 契约 §3 大写；内部留档是小写配置值。
+        assert_eq!(envelope.disclosure.redaction_level, "R2");
         assert_eq!(envelope.disclosure.max_hops, DISCLOSURE_MAX_HOPS);
         assert_eq!(envelope.disclosure.hops_remaining, DISCLOSURE_MAX_HOPS);
         // created_at 毫秒 → wire 秒制：1000ms = 1s。
@@ -486,7 +488,7 @@ mod tests {
         assert_eq!(envelope.provenance.receipt_id, draft.receipt_id);
         assert_eq!(envelope.payload.text, draft.payload);
         assert_eq!(envelope.payload.kind, "consultation");
-        assert_eq!(envelope.disclosure.redaction_level, "r2");
+        assert_eq!(envelope.disclosure.redaction_level, "R2");
     }
 
     #[test]

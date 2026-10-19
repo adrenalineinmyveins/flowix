@@ -89,6 +89,7 @@ export function RedactionSendGateDialog({
   notebookPath,
   presetQuestion,
   presetRecipient,
+  presetSender,
   replyTo,
   onClose,
 }: {
@@ -98,6 +99,8 @@ export function RedactionSendGateDialog({
   presetQuestion?: string;
   /** 预设收件方（回程 = 原咨询发起方）。 */
   presetRecipient?: { agentId: string; displayName?: string };
+  /** 预设发起方（回程 = 被咨询的本机专家 agent）。 */
+  presetSender?: { agentId: string; displayName?: string };
   /** 回程语义：原 receiptId + 请求信封剩余跳数（回程 = 其 - 1）。 */
   replyTo?: { receiptId: string; hopsRemaining: number };
   onClose: () => void;
@@ -216,12 +219,20 @@ export function RedactionSendGateDialog({
         : recipientAgentId.trim()
           ? { agentId: recipientAgentId.trim(), displayName: '' }
           : undefined;
+      // 发起身份：回程用预设专家；发起侧（有网络收件方时）取本机首个注册 agent，
+      // 无注册则 local（对端无法回程，等价手动投递语义）。
+      const sender = presetSender
+        ? { agentId: presetSender.agentId, displayName: presetSender.displayName ?? '' }
+        : recipient && config?.registeredAgents?.length
+          ? { agentId: config.registeredAgents[0], displayName: '' }
+          : undefined;
       const report = await redaction.preview(
         notebookPath,
         question.trim(),
         [...selectedIds],
         targetLevel,
         {
+          sender,
           recipient,
           inReplyTo: replyTo?.receiptId,
           replyHopsRemaining:
@@ -246,6 +257,8 @@ export function RedactionSendGateDialog({
     targetLevel,
     notebookPath,
     confirmTimeoutSecs,
+    config,
+    presetSender,
     presetRecipient,
     recipientAgentId,
     replyTo,

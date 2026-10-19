@@ -300,6 +300,10 @@ export function AgentProfileInbox({ notebookPath }: { notebookPath: string }) {
           notebookId={selectedNotebookId}
           notebookPath={notebookPath}
           presetQuestion={answerDrafts[replyingTo.receiptId] ?? ''}
+          presetSender={{
+            agentId: replyingTo.toAgentId,
+            displayName: replyingTo.toAgentId,
+          }}
           presetRecipient={{
             agentId: replyingTo.fromAgentId,
             displayName: replyingTo.fromDisplayName,

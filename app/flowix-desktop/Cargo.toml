@@ -64,6 +64,8 @@ minisign-verify = { workspace = true }
 
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }
+# network_roundtrip 集成测试内嵌 flowix-relay server（M4b）。
+axum = "0.7"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 flowix-installer-helper = { path = "../flowix-installer-helper" }

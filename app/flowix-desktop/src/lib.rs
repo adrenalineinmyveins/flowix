@@ -29,7 +29,8 @@ mod memo_events;
 mod nurture;
 mod plugin;
 mod process_window;
-mod redaction;
+// pub：network_roundtrip 集成测试（M4b）需要真实 HTTP + 文件留档全链路。
+pub mod redaction;
 mod runtime_log;
 #[cfg(windows)]
 mod runtime_state;
