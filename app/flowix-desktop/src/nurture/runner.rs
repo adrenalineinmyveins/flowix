@@ -358,20 +358,23 @@ pub(crate) async fn run_distill_once(
         if let Some(reason) = reason.filter(|value| !value.trim().is_empty()) {
             return Err(format!("run_failed: {reason}"));
         }
-        let page = state
-            .thread_manager
-            .get_external_event_messages_page(&runtime_key, &thread.thread_id, None, 1)
+        // provider-owned runtime（DSH/Codex 等）的 live chunk 不落本地
+        // agent_external_events（仅 Claude 落 journal，见
+        // agent_external/shared/lifecycle.rs），蒸馏输出必须按 runtime 走
+        // 统一 history 分派读取：DSH → session/history，Claude → journal。
+        let messages = state
+            .agent_history
+            .read_page(runtime, &thread.thread_id, None, None, 10)
             .await
-            .map_err(|e| format!("read output: {e}"))?;
-        page.and_then(|page| {
-            page.messages
-                .into_iter()
-                .rev()
-                .find(|message| message.role == "assistant")
-                .map(|message| message.content)
-        })
-        .ok_or_else(|| "run_failed: no assistant output".to_string())
-        .map(|answer| (answer, thread.thread_id.clone()))
+            .map_err(|e| format!("read output: {e}"))?
+            .messages;
+        messages
+            .into_iter()
+            .rev()
+            .find(|message| message.role == "assistant")
+            .map(|message| message.content)
+            .ok_or_else(|| "run_failed: no assistant output".to_string())
+            .map(|answer| (answer, thread.thread_id.clone()))
     }
     .await;
 
