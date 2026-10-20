@@ -31,11 +31,12 @@ fn sample_envelope() -> WireEnvelope {
             confirmed_at: 1,
             receipt_id: "rct_1".into(),
         },
+        signature: None,
     }
 }
 
 async fn spawn_relay() -> String {
-    let router = flowix_relay::build_router(Arc::new(AppState { store: Store::in_memory() }));
+    let router = flowix_relay::build_router(Arc::new(AppState::new(Store::in_memory())));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {

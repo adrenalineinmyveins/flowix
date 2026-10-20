@@ -60,7 +60,7 @@ pub struct WirePayload {
     pub text: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WireProvenance {
     pub pipeline_version: String,
@@ -70,6 +70,18 @@ pub struct WireProvenance {
     pub confirmed_by: String,
     pub confirmed_at: i64,
     pub receipt_id: String,
+}
+
+/// FD-11 v2 出站签名块（wire v1 兼容扩展：缺省不序列化，旧收端忽略）。
+/// 签名范围 = `WireEnvelope`（signature 置 None）的确定性 JSON 序列化。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireSignature {
+    pub alg: String,
+    /// 签名者公钥标识（目录卡公钥，base64；亦作验签信任锚）。
+    pub key_id: String,
+    /// base64(标准) 的 64 字节 Ed25519 签名。
+    pub value: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -84,6 +96,16 @@ pub struct WireEnvelope {
     pub disclosure: WireDisclosure,
     pub payload: WirePayload,
     pub provenance: WireProvenance,
+    /// FD-11 v2：可选出站签名；无签名信封按匿名档配额（中继执法）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<WireSignature>,
+}
+
+/// 信封规范化序列化（签名计算与验签的统一字节源）。
+pub fn canonical_bytes(envelope: &WireEnvelope) -> Vec<u8> {
+    let mut unsigned = envelope.clone();
+    unsigned.signature = None;
+    serde_json::to_vec(&unsigned).expect("envelope serializable")
 }
 
 /// 结构级校验（中继入口执行；`RecipientUnknown` 由 store 判定，见 routes）。
@@ -146,6 +168,7 @@ pub(crate) mod tests {
                 confirmed_at: 1,
                 receipt_id: "rct_1".into(),
             },
+            signature: None,
         }
     }
 
