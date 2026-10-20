@@ -2,6 +2,11 @@
 //! 跨用户全链路——目录信任锚签名往返（verified）、byte-equal、
 //! hops 递减、匿名配额执法、v2 usage 端点。
 //! 验收标准见 docs/F5-CROSS-USER-NETWORK.md §8 M5。
+//!
+//! 对真中继复跑：`FLOWIX_TEST_RELAY_URL=https://relay.example.com
+//! cargo test -p flowix-desktop --test cross_user_m5`——挑战登录自动
+//! 幂等续跑；注意投递走匿名档（3/h/IP），同 IP 一小时内多次复跑需
+//! 清库或等待计量窗口。
 
 use std::sync::Arc;
 
@@ -23,14 +28,21 @@ use flowix_desktop::redaction::outbox::{
 use flowix_desktop::redaction::transport::deliver_confirmed_envelope;
 use flowix_desktop::redaction::RedactionPreviewReport;
 
-async fn spawn_relay() -> String {
+/// 默认内嵌中继；设 FLOWIX_TEST_RELAY_URL（如 https://relay.example.com）
+/// 则对真中继复跑本验收（返回 (url, 是否外部中继)）。
+/// 外部模式下：同 username 重跑自动走挑战登录；重复注册 agent 幂等移交 token；
+/// 配额断言跳过（计量窗口不可控）。
+async fn spawn_relay() -> (String, bool) {
+    if let Ok(url) = std::env::var("FLOWIX_TEST_RELAY_URL") {
+        return (url.trim_end_matches('/').to_string(), true);
+    }
     let router = flowix_relay::build_router(Arc::new(AppState::new(Store::in_memory())));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), false)
 }
 
 fn report(text: &str) -> RedactionPreviewReport {
@@ -53,7 +65,8 @@ fn party(agent_id: &str, display: &str) -> AgentParty {
     AgentParty { agent_id: agent_id.into(), display_name: display.into() }
 }
 
-/// v2 账号：注册（新 username → 201 即得 token）。
+/// v2 账号：注册（新 username → 201 即得 token）；同 username 同公钥 →
+/// 挑战登录（对真中继重复可跑）。
 async fn register_account(client: &reqwest::Client, relay: &str, username: &str, key: &SigningKey) -> String {
     let response = client
         .post(format!("{relay}/v2/accounts"))
@@ -64,7 +77,26 @@ async fn register_account(client: &reqwest::Client, relay: &str, username: &str,
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), 201, "注册 {username} 应返回 201");
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap();
+    if status == reqwest::StatusCode::CREATED {
+        return body["deviceToken"].as_str().unwrap().to_string();
+    }
+    assert_eq!(status, reqwest::StatusCode::OK, "注册/登录 {username} 应 201/200: {body}");
+    let challenge = body["challenge"].as_str().expect("登录挑战应携带 challenge").to_string();
+    let user_id = body["userId"].as_str().expect("登录挑战应携带 userId").to_string();
+    let signature = BASE64.encode(key.sign(challenge.as_bytes()).to_bytes());
+    let response = client
+        .post(format!("{relay}/v2/accounts/challenge"))
+        .json(&serde_json::json!({
+            "userId": user_id,
+            "challenge": challenge,
+            "signature": signature,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "挑战登录 {username} 应成功");
     response.json::<serde_json::Value>().await.unwrap()["deviceToken"]
         .as_str()
         .unwrap()
@@ -129,7 +161,7 @@ async fn confirm_and_deliver(
 
 #[tokio::test]
 async fn cross_user_m5_signed_roundtrip_with_directory_trust_anchor() {
-    let relay = spawn_relay().await;
+    let (relay, external_relay) = spawn_relay().await;
     let client = reqwest::Client::new();
     let root_a = tempfile::tempdir().unwrap();
     let root_b = tempfile::tempdir().unwrap();
@@ -213,37 +245,40 @@ async fn cross_user_m5_signed_roundtrip_with_directory_trust_anchor() {
     assert_eq!(reply_inbound.disclosure.hops_remaining, 1);
 
     // ---- 5. 匿名配额执法：本测试已匿名投递 2 封（咨询+回程，同 IP 桶 3/h），
-    //         第 3 封仍可投，第 4 封被 429 拒且留档保持 confirmed 可重试 ----
-    let mut filler = draft_from_preview(
-        "配额探测",
-        &["e".into()],
-        &report("配额探测 ⟦PHONE-1⟧"),
-        chrono::Utc::now().timestamp_millis(),
-    )
-    .with_parties(party("alice/researcher", ""), party("bob/observer", ""));
-    write_record(root_a.path(), &filler).unwrap();
-    let filler_receipt = filler.receipt_id.clone();
-    settle(root_a.path(), &filler_receipt, OutboxStatus::Confirmed).unwrap();
-    let third = deliver_confirmed_envelope(root_a.path(), &filler_receipt, &relay).await.unwrap();
-    assert_eq!(third.http_status, 200, "第 3 封匿名投递仍在配额内");
+    //         第 3 封仍可投，第 4 封被 429 拒且留档保持 confirmed 可重试。
+    //         外部中继的计量窗口不可控，跳过本段。 ----
+    if !external_relay {
+        let mut filler = draft_from_preview(
+            "配额探测",
+            &["e".into()],
+            &report("配额探测 ⟦PHONE-1⟧"),
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .with_parties(party("alice/researcher", ""), party("bob/observer", ""));
+        write_record(root_a.path(), &filler).unwrap();
+        let filler_receipt = filler.receipt_id.clone();
+        settle(root_a.path(), &filler_receipt, OutboxStatus::Confirmed).unwrap();
+        let third = deliver_confirmed_envelope(root_a.path(), &filler_receipt, &relay).await.unwrap();
+        assert_eq!(third.http_status, 200, "第 3 封匿名投递仍在配额内");
 
-    let mut fourth = draft_from_preview(
-        "配额触顶",
-        &["e".into()],
-        &report("配额触顶 ⟦PHONE-1⟧"),
-        chrono::Utc::now().timestamp_millis(),
-    )
-    .with_parties(party("alice/researcher", ""), party("bob/observer", ""));
-    let fourth_receipt = fourth.receipt_id.clone();
-    write_record(root_a.path(), &fourth).unwrap();
-    settle(root_a.path(), &fourth_receipt, OutboxStatus::Confirmed).unwrap();
-    let rejected = deliver_confirmed_envelope(root_a.path(), &fourth_receipt, &relay)
-        .await
-        .unwrap_err();
-    assert!(rejected.contains("RELAY_REJECTED:429"), "第 4 封应被配额拒绝: {rejected}");
-    // 429 后留档保持 confirmed（幂等可重试）。
-    let after = flowix_desktop::redaction::read_record(root_a.path(), &fourth_receipt).unwrap();
-    assert_eq!(after.status, OutboxStatus::Confirmed);
+        let mut fourth = draft_from_preview(
+            "配额触顶",
+            &["e".into()],
+            &report("配额触顶 ⟦PHONE-1⟧"),
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .with_parties(party("alice/researcher", ""), party("bob/observer", ""));
+        let fourth_receipt = fourth.receipt_id.clone();
+        write_record(root_a.path(), &fourth).unwrap();
+        settle(root_a.path(), &fourth_receipt, OutboxStatus::Confirmed).unwrap();
+        let rejected = deliver_confirmed_envelope(root_a.path(), &fourth_receipt, &relay)
+            .await
+            .unwrap_err();
+        assert!(rejected.contains("RELAY_REJECTED:429"), "第 4 封应被配额拒绝: {rejected}");
+        // 429 后留档保持 confirmed（幂等可重试）。
+        let after = flowix_desktop::redaction::read_record(root_a.path(), &fourth_receipt).unwrap();
+        assert_eq!(after.status, OutboxStatus::Confirmed);
+    }
 
     // ---- 6. v2 usage 端点可用（账号视角：本测试投递走匿名档，计量在 IP 桶） ----
     let response = client

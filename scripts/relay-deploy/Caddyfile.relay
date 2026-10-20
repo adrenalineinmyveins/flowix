@@ -1,0 +1,18 @@
+# Flowix relay v2 的 Caddy 反代片段（满足 FD-11 §6 云端强制 TLS）。
+# 用法一（独立域名）：把本文件 import 进 Caddyfile：
+#   import scripts/relay-deploy/Caddyfile.relay
+# 用法二（已有站点）：把 reverse_proxy 块并入现有站点。
+# 把 relay.example.com 换成你的域名；Caddy 自动签发/续期证书。
+relay.example.com {
+	encode zstd gzip
+
+	# 中继 JSON API 较小（留档信封 ≤ 数百 KB），无需调大限制
+	reverse_proxy 127.0.0.1:8788 {
+		header_up X-Real-IP {remote_host}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+}

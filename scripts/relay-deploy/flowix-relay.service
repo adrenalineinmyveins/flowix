@@ -1,0 +1,26 @@
+# Flowix relay v2 systemd 单元。
+# 安装：scripts/relay-deploy/install.sh（自动拷贝并 enable）
+# 手动：cp flowix-relay.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now flowix-relay
+[Unit]
+Description=Flowix relay v2 (cross-user network, SQLite state)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/flowix-relay/flowix-relay --addr 127.0.0.1:8788 --state /var/lib/flowix-relay/relay.db
+Restart=on-failure
+RestartSec=3
+
+# 加固：非特权动态用户 + 独立状态目录
+DynamicUser=yes
+StateDirectory=flowix-relay
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+
+# SQLite WAL 场景适当放开文件句柄
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target
