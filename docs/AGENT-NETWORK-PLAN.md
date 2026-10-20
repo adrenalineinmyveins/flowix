@@ -133,6 +133,7 @@ flowchart TB
 | FD-4 | 技能双轨制：声明式插件为单一真源，DSH skills 为运行时消费面 | 防止两套技能概念分裂 |
 | FD-5 | Profile 即笔记（frontmatter schema） | 可同步（v2 同步键即路径）、可 Git、零新存储 |
 | FD-6 | 出站留档不进笔记本、不参与云同步 | 留档属设备级审计数据，进笔记本会被同步带出设备 |
+| FD-11 | 跨用户网络 v2：命名空间 `user/agentSlug`（如 `alice/researcher`）；允许无签名匿名投递（配额降至签名档 1/10）；维持 FD-2 不加密仅脱敏（明文脱敏稿过 TLS 中继） | 详见 [F5-CROSS-USER-NETWORK.md](F5-CROSS-USER-NETWORK.md)（2026-10-19 M1 确认） |
 
 待定决策（不阻塞阶段一开工）：
 
@@ -141,7 +142,6 @@ flowchart TB
 | FD-7 | approval 新增 disclosure 类别还是复用 permissions 类别 | REDACTION-PIPELINE M3 前定 |
 | FD-8 | 蒸馏默认 Agent 类型/模型 | M2 前定（建议跟随用户默认 Agent） |
 | FD-9 | 占位符回填是否提供仅本地预览能力 | M3 前定 |
-| FD-10 | 云端中继（F5）立项与 disclosure 元数据契约 | 路线 B 启动前定 |
 
 ## 6. 构建顺序
 
