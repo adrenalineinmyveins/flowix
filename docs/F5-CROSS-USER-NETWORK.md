@@ -128,7 +128,24 @@ receiptId 去重）。
 | M2 | 中继多租户：账号/命名空间/SQLite 持久化/限流配额 | ✅ 2026-10-19（v1 五测 + v2 六测全绿：账号全流程 / 命名空间往返 / 配额执法 / 重启恢复） |
 | M3 | 目录：公开卡 API + 客户端卡片分享（R1 过闸）与目录 UI | ✅ 2026-10-19（中继：三档可见性搜索/详情/投递执法 + 命名空间/字段守卫 + 写限流；客户端：账号注册/挑战登录、卡发布 L1 过闸 + 确认门留档 + PUT、目录搜索 UI 挂收件箱面板） |
 | M4 | 客户端 v2 契约：命名空间寻址 + Ed25519 签名/验签 + usage UI | ✅ 2026-10-19（wire 加可选 signature 字段（旧端忽略）；确认门通过时出站签名随档固化（byte-equal）；中继经目录信任锚验签（篡改 422 SIGNATURE_INVALID、无锚放行）；入站验签结论随留档；inbox_register 账号命名空间归一；usage 面板；v1 全链零回退（roundtrip 2 测 + relay 29 测） |
-| M5 | 跨用户真机往返：两账号 × 两设备 × 云端中继 | ✅ 本机模拟验收 2026-10-19（`tests/cross_user_m5.rs`：双账号 + 命名空间 agent + 互为信任锚目录卡 → 签名咨询投递 → 收件 verified → 回程 hops 递减 verified → 匿名配额 429 留档可重试 → usage 端点；byte-equal 含签名块断言）。云端部署后同一测试可直接对真中继复跑 |
+| M5 | 跨用户真机往返：两账号 × 两设备 × 云端中继 | ✅ 本机模拟验收 2026-10-19（`tests/cross_user_m5.rs`：双账号 + 命名空间 agent + 互为信任锚目录卡 → 签名咨询投递 → 收件 verified → 回程 hops 递减 verified → 匿名配额 429 留档可重试 → usage 端点；byte-equal 含签名块断言）。**✅ 云端真中继复跑 2026-10-20**（见 §8.1 部署记录） |
+
+### 8.1 云端部署记录（2026-10-20，8.160.162.251）
+
+- 服务器：阿里云 ECS（Alibaba Cloud Linux 3，2C/3.5G，与 flowix-cloud 8787 同机）
+- 构建：服务器原生构建（精简 workspace 源码包 53KB scp 上传，`cargo build --release` 3m17s）。
+  踩坑：rsproxy 镜像当晚半死（依赖拉取挂起 40 分钟零进展），项目级 `.cargo/config.toml`
+  切**阿里云 crates 镜像**（`sparse+https://mirrors.aliyun.com/crates.io-index/`）后即恢复
+- 常驻：`/etc/systemd/system/flowix-relay.service`（`0.0.0.0:8788`，SQLite 入
+  `/var/lib/flowix-relay/relay.db`，DynamicUser + ProtectSystem 加固，enable 开机自启）
+- 网络分层：firewalld 放行 8788/tcp + 阿里云安全组入方向放行 8788/tcp（控制台操作）
+- 验收：`FLOWIX_TEST_RELAY_URL=http://8.160.162.251:8788 cargo test --test cross_user_m5`
+  两轮通过——首轮（新账号注册 201 路径）+ 次轮（挑战登录幂等换 token，账号/agent/目录卡
+  全幂等）。途中实证匿名配额执法：同 IP 一小时内第 4 封投递 429，清 `usage_events`
+  计量窗口后复验通过
+- SQLite 落库证据：accounts（alice/bob）、directory（public 卡）、WAL 活跃
+- 遗留（待办）：当前明文 HTTP（对齐 flowix-cloud 8787 先例），与 §6 云端强制 TLS 有差距；
+  后续 Cloudflare 加 `relay.*` 子域（橙云代理）补 TLS，unit 切回 `127.0.0.1` + 反代形态
 
 依赖顺序：M1 → M2 → M3/M4（可并行）→ M5。
 客户端改动面：`redaction/transport.rs`（签名+命名空间）、`outbox.rs`（地址解析）、
