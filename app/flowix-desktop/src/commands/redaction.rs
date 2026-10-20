@@ -378,6 +378,7 @@ pub async fn redaction_transmit(
 }
 
 /// F5 入站：向中继注册本机 agent 收件通道，凭据写入 config。
+/// FD-11 v2：有中继账号时裸 slug 归一到 `username/slug` 并以账号 token 注册。
 #[tauri::command]
 pub async fn redaction_inbox_register(agent_ids: Vec<String>) -> Result<RedactionConfig, String> {
     if agent_ids.is_empty() {
@@ -387,7 +388,26 @@ pub async fn redaction_inbox_register(agent_ids: Vec<String>) -> Result<Redactio
     if config.relay_url.trim().is_empty() {
         return Err("RELAY_NOT_CONFIGURED".to_string());
     }
-    let token = crate::redaction::register_device(&config.relay_url, &agent_ids).await?;
+    let account = crate::redaction::account::read_account().filter(|account| {
+        crate::redaction::inbound::relay_endpoint(&account.relay_url, "") == crate::redaction::inbound::relay_endpoint(&config.relay_url, "")
+    });
+    let (agent_ids, account_token) = match &account {
+        Some(account) => {
+            let normalized = agent_ids
+                .iter()
+                .map(|agent_id| {
+                    if agent_id.contains('/') {
+                        agent_id.clone()
+                    } else {
+                        format!("{}/{}", account.username, agent_id)
+                    }
+                })
+                .collect();
+            (normalized, Some(account.device_token.as_str()))
+        }
+        None => (agent_ids, None),
+    };
+    let token = crate::redaction::register_device(&config.relay_url, &agent_ids, account_token).await?;
     config.device_token = Some(token);
     config.registered_agents = agent_ids;
     let dir = redaction_dir()?;
@@ -438,6 +458,115 @@ pub fn redaction_inbox_set_status(
         crate::redaction::InboundStatus::Rejected
     };
     crate::redaction::set_inbound_status(&crate::redaction::inbound_dir(&root), &receipt_id, status)
+}
+
+// ----------------------------------------------------------------------
+// FD-11 v2：中继账号、目录卡、用量
+// ----------------------------------------------------------------------
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectoryPreviewResult {
+    pub draft: crate::redaction::directory::DirectoryCardDraft,
+    /// L1 脱敏前的原文（人审对比）。
+    pub original: String,
+}
+
+#[tauri::command]
+pub fn redaction_account_status(
+) -> Result<Option<crate::redaction::account::AccountPublicInfo>, String> {
+    Ok(crate::redaction::account::read_account().map(|account| account.public_info()))
+}
+
+/// 注册或登录中继账号（密钥即身份）。成功后 config.relay_url 对齐账号中继。
+#[tauri::command]
+pub async fn redaction_account_register(
+    username: String,
+    relay_url: String,
+) -> Result<crate::redaction::account::AccountPublicInfo, String> {
+    let account = crate::redaction::account::register_or_login(&username, &relay_url).await?;
+    // 账号与中继绑定：注册成功即把主中继指向账号中继，收发同源。
+    let mut config = load_config()?;
+    if config.relay_url.trim() != account.relay_url {
+        config.relay_url = account.relay_url.clone();
+        write_config_to(&redaction_dir()?, &config)?;
+    }
+    Ok(account.public_info())
+}
+
+#[tauri::command]
+pub fn redaction_account_forget() -> Result<(), String> {
+    crate::redaction::account::forget_account()
+}
+
+/// 目录卡发布预览：卡文本过 L1 规则脱敏 → draft 留档待人审。
+#[tauri::command]
+pub fn redaction_directory_preview(
+    cwd: String,
+    agent_slug: String,
+    display_name: String,
+    specialty_tags: Vec<String>,
+    visibility: String,
+    min_redaction_level: String,
+) -> Result<DirectoryPreviewResult, String> {
+    let root = notebook_root(&cwd)?;
+    let (draft, original) = crate::redaction::directory::publish_preview(
+        &root,
+        &agent_slug,
+        &display_name,
+        &specialty_tags,
+        &visibility,
+        &min_redaction_level,
+    )?;
+    Ok(DirectoryPreviewResult { draft, original })
+}
+
+/// 目录卡确认门：approved → confirmed（可发布）；否则 cancelled。
+#[tauri::command]
+pub fn redaction_directory_confirm(
+    cwd: String,
+    draft_id: String,
+    approved: bool,
+) -> Result<crate::redaction::directory::DirectoryCardDraft, String> {
+    let root = notebook_root(&cwd)?;
+    crate::redaction::directory::settle_draft(&root, &draft_id, approved)
+}
+
+/// 发布 confirmed 卡到中继目录（失败可重试，留档保持 confirmed）。
+#[tauri::command]
+pub async fn redaction_directory_publish(
+    cwd: String,
+    draft_id: String,
+) -> Result<crate::redaction::directory::DirectoryCardDraft, String> {
+    let root = notebook_root(&cwd)?;
+    crate::redaction::directory::publish_confirmed(&root, &draft_id).await
+}
+
+/// 目录搜索（public 卡）。relay_url 缺省用账号中继。
+#[tauri::command]
+pub async fn redaction_directory_search(
+    relay_url: Option<String>,
+    q: String,
+    tag: String,
+) -> Result<Vec<crate::redaction::directory::DirectoryCard>, String> {
+    crate::redaction::directory::search(relay_url.as_deref(), &q, &tag).await
+}
+
+/// 单卡详情（public/unlisted 可达；private → CARD_FETCH_REJECTED:404）。
+#[tauri::command]
+pub async fn redaction_directory_card(
+    relay_url: Option<String>,
+    user: String,
+    agent_slug: String,
+) -> Result<crate::redaction::directory::DirectoryCard, String> {
+    crate::redaction::directory::card(relay_url.as_deref(), &user, &agent_slug).await
+}
+
+/// 本账号中继用量与配额。
+#[tauri::command]
+pub async fn redaction_relay_usage(
+) -> Result<crate::redaction::directory::RelayUsage, String> {
+    crate::redaction::directory::relay_usage().await
 }
 
 #[cfg(test)]

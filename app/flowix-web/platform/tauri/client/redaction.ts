@@ -3,12 +3,17 @@ import { invoke } from '@tauri-apps/api/core';
 import type {
   AgentParty,
   ConfirmGateResult,
+  DirectoryCard,
+  DirectoryCardDraft,
+  DirectoryPreviewResult,
   InboundRecord,
   InboxPollSummary,
   RedactionConfig,
   RedactionL1Preview,
   RedactionOutboxRecord,
   RedactionPreviewReport,
+  RelayAccountInfo,
+  RelayUsage,
   RelayDeliverResult,
   SendPayload,
 } from '@/lib/types/redaction';
@@ -91,4 +96,42 @@ export const redaction = {
   /** F5 入站：接受 / 拒绝一条 pending 咨询。 */
   inboxSetStatus: (cwd: string, receiptId: string, accepted: boolean) =>
     invoke<void>('redaction_inbox_set_status', { cwd, receiptId, accepted }),
+
+  // FD-11 v2：中继账号、目录、用量。
+
+  accountStatus: () =>
+    invoke<RelayAccountInfo | null>('redaction_account_status'),
+
+  /** 注册或登录（密钥即身份）；成功后主中继对齐账号中继。 */
+  accountRegister: (username: string, relayUrl: string) =>
+    invoke<RelayAccountInfo>('redaction_account_register', { username, relayUrl }),
+
+  accountForget: () => invoke<void>('redaction_account_forget'),
+
+  /** 目录卡发布预览（L1 过闸 → draft 留档待人审）。 */
+  directoryPreview: (
+    cwd: string,
+    agentSlug: string,
+    displayName: string,
+    specialtyTags: string[],
+    visibility: string,
+    minRedactionLevel: string,
+  ) =>
+    invoke<DirectoryPreviewResult>('redaction_directory_preview', {
+      cwd, agentSlug, displayName, specialtyTags, visibility, minRedactionLevel,
+    }),
+
+  directoryConfirm: (cwd: string, draftId: string, approved: boolean) =>
+    invoke<DirectoryCardDraft>('redaction_directory_confirm', { cwd, draftId, approved }),
+
+  directoryPublish: (cwd: string, draftId: string) =>
+    invoke<DirectoryCardDraft>('redaction_directory_publish', { cwd, draftId }),
+
+  directorySearch: (q: string, tag?: string, relayUrl?: string) =>
+    invoke<DirectoryCard[]>('redaction_directory_search', { q, tag, relayUrl }),
+
+  directoryCard: (user: string, agentSlug: string, relayUrl?: string) =>
+    invoke<DirectoryCard>('redaction_directory_card', { user, agentSlug, relayUrl }),
+
+  relayUsage: () => invoke<RelayUsage>('redaction_relay_usage'),
 };

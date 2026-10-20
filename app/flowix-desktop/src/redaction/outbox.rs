@@ -89,6 +89,9 @@ pub struct RedactionOutboxRecord {
     /// F5 回程信封：跳数继承（= 请求信封 hopsRemaining - 1，契约 §5）。
     #[serde(default)]
     pub reply_hops_remaining: Option<u32>,
+    /// FD-11 v2：确认门通过时附上的出站签名（无账号 = None，匿名档）。
+    #[serde(default)]
+    pub signature: Option<flowix_relay::envelope::WireSignature>,
 }
 
 impl RedactionOutboxRecord {
@@ -150,6 +153,7 @@ impl RedactionOutboxRecord {
                 confirmed_at: created_secs,
                 receipt_id: self.receipt_id.clone(),
             },
+            signature: self.signature.clone(),
         }
     }
 }
@@ -204,6 +208,7 @@ pub fn draft_from_preview(
         to_agent: default_to_agent(),
         in_reply_to: None,
         reply_hops_remaining: None,
+        signature: None,
     }
 }
 

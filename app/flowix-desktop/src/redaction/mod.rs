@@ -23,6 +23,8 @@ use flowix_redaction::{
 use crate::config::access::{AgentAccessEntry, AgentAccessKind};
 use crate::nurture::should_accept_event_in_notebook;
 
+pub mod account;
+pub mod directory;
 pub mod inbound;
 pub mod outbox;
 pub mod transport;
@@ -455,12 +457,30 @@ pub fn submit_confirmation(
     } else {
         OutboxStatus::Cancelled
     };
+    if approved {
+        attach_signature_if_available(notebook_root, receipt_id);
+    }
     let record = settle(notebook_root, receipt_id, status)?;
     let mut waiters = confirm_waiters().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(tx) = waiters.remove(receipt_id) {
         let _ = tx.try_send(approved);
     }
     Ok(record)
+}
+
+/// FD-11 v2：确认通过时若本机有中继账号，对信封签名并把签名块写进留档
+/// （byte-equal 纪律：出口字节 = 留档 envelope() 重序列化，签名随档固化）。
+/// 无账号或签名失败不阻塞确认——匿名档投递仍可用。
+fn attach_signature_if_available(notebook_root: &std::path::Path, receipt_id: &str) {
+    let Some(account) = account::read_account() else { return };
+    let Some(mut record) = outbox::read_record(notebook_root, receipt_id) else { return };
+    if record.signature.is_some() {
+        return;
+    }
+    if let Ok(signature) = account.sign_envelope(&record.envelope()) {
+        record.signature = Some(signature);
+        let _ = outbox::write_record(notebook_root, &record);
+    }
 }
 
 /// 确认门挂起等待（agent 自动发起路径；用户主动路径直接走

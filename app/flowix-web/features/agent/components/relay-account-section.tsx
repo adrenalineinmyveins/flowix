@@ -1,0 +1,379 @@
+'use client';
+
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { BadgeCheck, Globe, Loader2, LogOut, Search, Upload } from 'lucide-react';
+
+import { redaction } from '@platform/tauri/client';
+import type { DirectoryPreviewResult, RelayAccountInfo, RelayUsage } from '@/lib/types/redaction';
+import { Button } from '@shared/ui/button';
+import { Input } from '@shared/ui/input';
+import { useI18n } from '@/lib/i18n';
+
+type DirectoryCard = import('@/lib/types/redaction').DirectoryCard;
+
+const VISIBILITY_OPTIONS = ['unlisted', 'public', 'private'] as const;
+const LEVEL_OPTIONS = ['R1', 'R2', 'R3'] as const;
+
+/** 中继账号 + 目录：注册/用量、目录搜索、发布我的 agent 卡（L1 过闸 + 确认门）。 */
+export function RelayAccountSection({ notebookPath }: { notebookPath: string }) {
+  const { t } = useI18n();
+  const [account, setAccount] = useState<RelayAccountInfo | null>(null);
+  const [usage, setUsage] = useState<RelayUsage | null>(null);
+  const [username, setUsername] = useState('');
+  const [relayUrl, setRelayUrl] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [publishOpen, setPublishOpen] = useState(false);
+  const disposedRef = useRef(false);
+
+  const reload = useCallback(async () => {
+    try {
+      const status = await redaction.accountStatus();
+      if (disposedRef.current) return;
+      setAccount(status);
+      setRelayUrl((current) => current || status?.relayUrl || '');
+      setUsage(status ? await redaction.relayUsage().catch(() => null) : null);
+    } catch (cause) {
+      if (!disposedRef.current) setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }, []);
+
+  useEffect(() => {
+    disposedRef.current = false;
+    void reload();
+    return () => {
+      disposedRef.current = true;
+    };
+  }, [reload]);
+
+  const register = useCallback(async () => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const info = await redaction.accountRegister(username.trim(), relayUrl.trim());
+      if (disposedRef.current) return;
+      setAccount(info);
+      setNotice(t('agent.relay.registered', { username: info.username }));
+      setUsage(await redaction.relayUsage().catch(() => null));
+    } catch (cause) {
+      if (!disposedRef.current) setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, username, relayUrl, t]);
+
+  const forget = useCallback(async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await redaction.accountForget();
+      if (disposedRef.current) return;
+      setAccount(null);
+      setUsage(null);
+    } catch (cause) {
+      if (!disposedRef.current) setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(false);
+    }
+  }, [busy]);
+
+  return (
+    <section className="rounded-lg border border-[var(--border)] bg-[var(--card)] p-4">
+      <header className="mb-3 flex items-center gap-2">
+        <Globe className="size-4 text-[var(--muted-foreground)]" />
+        <h2 className="text-sm font-medium">{t('agent.relay.title')}</h2>
+      </header>
+
+      {error && <p className="mb-2 text-xs text-[var(--destructive)]">{error}</p>}
+      {notice && <p className="mb-2 text-xs text-[var(--muted-foreground)]">{notice}</p>}
+
+      {account ? (
+        <div className="space-y-2 text-xs text-[var(--muted-foreground)]">
+          <p className="flex items-center gap-1 text-[var(--foreground)]">
+            <BadgeCheck className="size-3.5 text-[var(--primary)]" />
+            {account.username}
+            <span className="text-[var(--muted-foreground)]">@{account.relayUrl}</span>
+          </p>
+          {usage && (
+            <p>
+              {t('agent.relay.usage', {
+                deliver: `${usage.deliverUsed}/${usage.deliverLimit}`,
+                poll: `${usage.pollUsed}/${usage.pollLimit}`,
+              })}
+            </p>
+          )}
+          <div className="flex gap-2 pt-1">
+            <Button size="sm" variant="outline" onClick={() => setPublishOpen(true)}>
+              <Upload className="mr-1 size-3.5" />
+              {t('agent.relay.publish')}
+            </Button>
+            <Button size="sm" variant="ghost" onClick={forget} disabled={busy}>
+              <LogOut className="mr-1 size-3.5" />
+              {t('agent.relay.forget')}
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <div className="space-y-2">
+          <Input
+            placeholder={t('agent.relay.usernamePlaceholder')}
+            value={username}
+            onChange={(event) => setUsername(event.target.value)}
+            className="h-8 text-xs"
+          />
+          <Input
+            placeholder={t('agent.relay.relayPlaceholder')}
+            value={relayUrl}
+            onChange={(event) => setRelayUrl(event.target.value)}
+            className="h-8 text-xs"
+          />
+          <Button size="sm" onClick={register} disabled={busy || !username.trim() || !relayUrl.trim()}>
+            {busy ? <Loader2 className="mr-1 size-3.5 animate-spin" /> : null}
+            {t('agent.relay.register')}
+          </Button>
+        </div>
+      )}
+
+      {account && <DirectorySearchBox relayUrl={account.relayUrl} />}
+
+      {publishOpen && (
+        <PublishCardDialog
+          notebookPath={notebookPath}
+          username={account?.username ?? ''}
+          onClose={() => setPublishOpen(false)}
+        />
+      )}
+    </section>
+  );
+}
+
+function DirectorySearchBox({ relayUrl }: { relayUrl: string }) {
+  const { t } = useI18n();
+  const [query, setQuery] = useState('');
+  const [cards, setCards] = useState<DirectoryCard[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState<string | null>(null);
+
+  const search = useCallback(async () => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      setCards(await redaction.directorySearch(query.trim(), undefined, relayUrl));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, query, relayUrl]);
+
+  const copyAddress = useCallback(async (address: string) => {
+    try {
+      await navigator.clipboard.writeText(`${address}@${relayUrl}`);
+      setCopied(address);
+      setTimeout(() => setCopied(null), 1500);
+    } catch {
+      setCopied(null);
+    }
+  }, [relayUrl]);
+
+  return (
+    <div className="mt-4 border-t border-[var(--border)] pt-3">
+      <div className="flex gap-2">
+        <Input
+          placeholder={t('agent.relay.searchPlaceholder')}
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          onKeyDown={(event) => event.key === 'Enter' && void search()}
+          className="h-8 text-xs"
+        />
+        <Button size="sm" variant="outline" onClick={search} disabled={busy}>
+          {busy ? <Loader2 className="size-3.5 animate-spin" /> : <Search className="size-3.5" />}
+        </Button>
+      </div>
+      {error && <p className="mt-2 text-xs text-[var(--destructive)]">{error}</p>}
+      {cards && cards.length === 0 && (
+        <p className="mt-2 text-xs text-[var(--muted-foreground)]">{t('agent.relay.empty')}</p>
+      )}
+      {cards && cards.length > 0 && (
+        <ul className="mt-2 space-y-1">
+          {cards.map((card) => (
+            <li
+              key={card.address}
+              className="flex items-center justify-between gap-2 rounded-md border border-[var(--border)] px-2 py-1.5 text-xs"
+            >
+              <div className="min-w-0">
+                <p className="truncate font-medium text-[var(--foreground)]">{card.displayName}</p>
+                <p className="truncate text-[var(--muted-foreground)]">
+                  {card.address}
+                  {card.card?.minRedactionLevel ? ` · ${String(card.card.minRedactionLevel)}` : ''}
+                </p>
+              </div>
+              <Button size="sm" variant="ghost" onClick={() => void copyAddress(card.address)}>
+                {copied === card.address ? t('agent.relay.copied') : t('agent.relay.copyAddress')}
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function PublishCardDialog({
+  notebookPath,
+  username,
+  onClose,
+}: {
+  notebookPath: string;
+  username: string;
+  onClose: () => void;
+}) {
+  const { t } = useI18n();
+  const [slug, setSlug] = useState('');
+  const [displayName, setDisplayName] = useState('');
+  const [tags, setTags] = useState('');
+  const [visibility, setVisibility] = useState<(typeof VISIBILITY_OPTIONS)[number]>('unlisted');
+  const [minLevel, setMinLevel] = useState<(typeof LEVEL_OPTIONS)[number]>('R1');
+  const [preview, setPreview] = useState<DirectoryPreviewResult | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const startPreview = useCallback(async () => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const specialtyTags = tags.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean);
+      setPreview(await redaction.directoryPreview(
+        notebookPath, slug.trim(), displayName.trim(), specialtyTags, visibility, minLevel,
+      ));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, notebookPath, slug, displayName, tags, visibility, minLevel]);
+
+  const confirmAndPublish = useCallback(async () => {
+    if (!preview || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await redaction.directoryConfirm(notebookPath, preview.draft.id, true);
+      await redaction.directoryPublish(notebookPath, preview.draft.id);
+      setNotice(t('agent.relay.published', { address: `${username}/${slug.trim()}` }));
+      setPreview(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(false);
+    }
+  }, [preview, busy, notebookPath, username, slug, t]);
+
+  const cancelDraft = useCallback(async () => {
+    if (!preview) return;
+    await redaction.directoryConfirm(notebookPath, preview.draft.id, false).catch(() => undefined);
+    setPreview(null);
+  }, [preview, notebookPath]);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+      <div className="w-full max-w-[480px] rounded-lg border border-[var(--border)] bg-[var(--card)] p-4 shadow-lg">
+        <h3 className="mb-3 text-sm font-semibold">{t('agent.relay.publishTitle')}</h3>
+        {error && <p className="mb-2 text-xs text-[var(--destructive)]">{error}</p>}
+        {notice && (
+          <p className="mb-2 text-xs text-[var(--primary)]">{notice}</p>
+        )}
+
+        {preview ? (
+          <div className="space-y-3 text-xs">
+            <div className="rounded-md border border-[var(--border)] p-3">
+              <p className="mb-1 font-medium">{t('agent.relay.previewHeading')}</p>
+              <p className="text-[var(--muted-foreground)]">
+                {t('agent.relay.previewBefore')}: {preview.original}
+              </p>
+              <p className="text-[var(--foreground)]">
+                {t('agent.relay.previewAfter')}: {preview.draft.displayName} |{' '}
+                {preview.draft.specialtyTags.join(', ')}
+              </p>
+            </div>
+            <p className="text-[var(--muted-foreground)]">{t('agent.relay.confirmHint')}</p>
+            <div className="flex justify-end gap-2">
+              <Button size="sm" variant="ghost" onClick={() => void cancelDraft()}>
+                {t('common.cancel')}
+              </Button>
+              <Button size="sm" onClick={() => void confirmAndPublish()} disabled={busy}>
+                {busy ? <Loader2 className="mr-1 size-3.5 animate-spin" /> : null}
+                {t('agent.relay.confirmPublish')}
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            <p className="text-xs text-[var(--muted-foreground)]">
+              {t('agent.relay.namespaceHint', { username })}
+            </p>
+            <Input
+              placeholder={t('agent.relay.slugPlaceholder')}
+              value={slug}
+              onChange={(event) => setSlug(event.target.value)}
+              className="h-8 text-xs"
+            />
+            <Input
+              placeholder={t('agent.relay.namePlaceholder')}
+              value={displayName}
+              onChange={(event) => setDisplayName(event.target.value)}
+              className="h-8 text-xs"
+            />
+            <Input
+              placeholder={t('agent.relay.tagsPlaceholder')}
+              value={tags}
+              onChange={(event) => setTags(event.target.value)}
+              className="h-8 text-xs"
+            />
+            <div className="flex gap-2">
+              <select
+                value={visibility}
+                onChange={(event) => setVisibility(event.target.value as typeof visibility)}
+                className="h-8 flex-1 rounded-md border border-[var(--border)] bg-transparent px-2 text-xs"
+              >
+                {VISIBILITY_OPTIONS.map((option) => (
+                  <option key={option} value={option}>{option}</option>
+                ))}
+              </select>
+              <select
+                value={minLevel}
+                onChange={(event) => setMinLevel(event.target.value as typeof minLevel)}
+                className="h-8 w-24 rounded-md border border-[var(--border)] bg-transparent px-2 text-xs"
+              >
+                {LEVEL_OPTIONS.map((option) => (
+                  <option key={option} value={option}>{option}</option>
+                ))}
+              </select>
+            </div>
+            <div className="flex justify-end gap-2 pt-1">
+              <Button size="sm" variant="ghost" onClick={onClose}>
+                {t('common.close')}
+              </Button>
+              <Button
+                size="sm"
+                onClick={() => void startPreview()}
+                disabled={busy || !slug.trim() || !displayName.trim()}
+              >
+                {busy ? <Loader2 className="mr-1 size-3.5 animate-spin" /> : null}
+                {t('agent.relay.preview')}
+              </Button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

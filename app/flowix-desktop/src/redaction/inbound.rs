@@ -45,6 +45,11 @@ pub struct InboundRecord {
     pub disclosure: flowix_relay::envelope::WireDisclosure,
     pub received_at: i64,
     pub status: InboundStatus,
+    /// FD-11 v2 验签结果（§5：结果入留档）：
+    /// `verified`（信任锚公钥验签通过）/ `invalid`（验签失败）/
+    /// `unsigned`（无签名块）/ `unverified`（from 无目录卡，缺信任锚）。
+    #[serde(default)]
+    pub signature_status: Option<String>,
 }
 
 pub fn inbound_dir(notebook_root: &Path) -> PathBuf {
@@ -81,7 +86,13 @@ pub fn validate_inbound(envelope: &WireEnvelope, local_agent_id: &str) -> Result
 }
 
 /// 校验通过的入站信封 → 留档（Pending）。receiptId 已存在则跳过（去重幂等）。
-pub fn store_inbound(dir: &Path, queue_id: &str, envelope: &WireEnvelope) -> std::io::Result<bool> {
+/// `signature_status`：验签结论随档（见 InboundRecord 注释）。
+pub fn store_inbound(
+    dir: &Path,
+    queue_id: &str,
+    envelope: &WireEnvelope,
+    signature_status: Option<String>,
+) -> std::io::Result<bool> {
     std::fs::create_dir_all(dir)?;
     let path = record_path(dir, &envelope.provenance.receipt_id);
     if path.exists() {
@@ -100,6 +111,7 @@ pub fn store_inbound(dir: &Path, queue_id: &str, envelope: &WireEnvelope) -> std
         disclosure: envelope.disclosure.clone(),
         received_at: now_unix(),
         status: InboundStatus::Pending,
+        signature_status,
     };
     let tmp = dir.join(format!("{}.tmp", Uuid::new_v4().simple()));
     std::fs::write(&tmp, serde_json::to_vec_pretty(&record).expect("inbound serialize"))?;
@@ -132,6 +144,7 @@ pub fn store_rejected(
         disclosure: envelope.disclosure.clone(),
         received_at: now_unix(),
         status: InboundStatus::Rejected,
+        signature_status: None,
     };
     let tmp = dir.join(format!("{}.tmp", Uuid::new_v4().simple()));
     std::fs::write(&tmp, serde_json::to_vec_pretty(&record).expect("inbound serialize"))?;
@@ -209,10 +222,14 @@ pub async fn poll_agent_inbox(
     let dir = inbound_dir(notebook_root);
     let mut summary = PollSummary::default();
     let mut queue_ids = Vec::new();
+    // 信任锚缓存：同一次拉取里同 from 只查一次目录卡。
+    let mut public_keys: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
     for item in &body.envelopes {
         queue_ids.push(item.queue_id.clone());
+        let signature_status = signature_status_of(&client, relay_url, &item.envelope, &mut public_keys).await;
         match validate_inbound(&item.envelope, agent_id) {
-            Ok(()) => match store_inbound(&dir, &item.queue_id, &item.envelope) {
+            Ok(()) => match store_inbound(&dir, &item.queue_id, &item.envelope, signature_status) {
                 Ok(true) => summary.stored += 1,
                 Ok(false) => summary.duplicates += 1,
                 Err(e) => return Err(format!("INBOUND_STORE_FAILED:{e}")),
@@ -243,6 +260,52 @@ struct InboxResponseDto {
     envelopes: Vec<QueueItemDto>,
 }
 
+/// FD-11 §5 收端验签：无签名块 = `unsigned`；有签名但 from 无目录卡 =
+/// `unverified`（缺信任锚，不拒收）；验签通过/失败 = `verified` / `invalid`
+/// （结论入留档，由 UI 呈现；拒收决策留给人审）。
+async fn signature_status_of(
+    client: &reqwest::Client,
+    relay_url: &str,
+    envelope: &WireEnvelope,
+    cache: &mut std::collections::HashMap<String, Option<String>>,
+) -> Option<String> {
+    if envelope.signature.is_none() {
+        return Some("unsigned".to_string());
+    }
+    let from = envelope.from.agent_id.clone();
+    if !cache.contains_key(&from) {
+        let public_key = match from.split_once('/') {
+            // from 即 `user/agent` 两段；裸 id（v1 匿名发起方）无目录可查。
+            Some((user, slug)) => {
+                let card_url = relay_endpoint(relay_url, &format!("/v2/directory/{user}/{slug}"));
+                fetch_card_public_key(client, card_url).await
+            }
+            None => None,
+        };
+        cache.insert(from.clone(), public_key);
+    }
+    match cache.get(&from) {
+        None => None,
+        Some(None) => Some("unverified".to_string()),
+        Some(Some(public_key)) => {
+            let verified = super::account::verify_signature(envelope, public_key);
+            Some(if verified { "verified" } else { "invalid" }.to_string())
+        }
+    }
+}
+
+async fn fetch_card_public_key(client: &reqwest::Client, card_url: String) -> Option<String> {
+    let response = client.get(card_url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = response.json().await.ok()?;
+    body.get("card")?
+        .get("publicKey")?
+        .as_str()
+        .map(str::to_string)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct QueueItemDto {
@@ -258,25 +321,32 @@ struct AckRequestDto {
 }
 
 /// 向中继注册本机 agent 收件通道，返回 deviceToken。
-pub async fn register_device(relay_url: &str, agent_ids: &[String]) -> Result<String, String> {
+/// FD-11 v2：有账号 token 时服务端把裸 slug 归一到 `username/slug` 命名空间。
+pub async fn register_device(
+    relay_url: &str,
+    agent_ids: &[String],
+    account_token: Option<&str>,
+) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| format!("INBOX_CLIENT_INIT_FAILED:{e}"))?;
+        .map_err(|e| format!("INBOX_CLIENT_INIT_FAILED: {e}"))?;
     let url = relay_endpoint(relay_url, "/v1/devices");
-    let response = client
-        .post(url)
-        .json(&serde_json::json!({ "agentIds": agent_ids }))
+    let mut request = client.post(url).json(&serde_json::json!({ "agentIds": agent_ids }));
+    if let Some(token) = account_token {
+        request = request.bearer_auth(token);
+    }
+    let response = request
         .send()
         .await
-        .map_err(|e| format!("DEVICE_REGISTER_FAILED:{e}"))?;
+        .map_err(|e| format!("DEVICE_REGISTER_FAILED: {e}"))?;
     if !response.status().is_success() {
         return Err(format!("DEVICE_REGISTER_REJECTED:{}", response.status().as_u16()));
     }
     let body: DeviceTokenDto = response
         .json()
         .await
-        .map_err(|e| format!("DEVICE_REGISTER_DECODE_FAILED:{e}"))?;
+        .map_err(|e| format!("DEVICE_REGISTER_DECODE_FAILED: {e}"))?;
     Ok(body.device_token)
 }
 
@@ -313,6 +383,7 @@ mod tests {
                 confirmed_at: 1,
                 receipt_id: "rct_in1".into(),
             },
+            signature: None,
         }
     }
 
@@ -328,14 +399,15 @@ mod tests {
     fn stores_pending_and_dedupes() {
         let dir = tempfile::tempdir().unwrap();
         let envelope = sample("agt_b");
-        assert!(store_inbound(dir.path(), "q_1", &envelope).unwrap());
+        assert!(store_inbound(dir.path(), "q_1", &envelope, Some("unsigned".into())).unwrap());
         // 同 receipt 再拉到：去重。
-        assert!(!store_inbound(dir.path(), "q_2", &envelope).unwrap());
+        assert!(!store_inbound(dir.path(), "q_2", &envelope, None).unwrap());
         let records = list_inbound(dir.path());
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].status, InboundStatus::Pending);
         assert_eq!(records[0].from_agent_id, "agt_a");
         assert_eq!(records[0].payload_text, "远端问题");
+        assert_eq!(records[0].signature_status.as_deref(), Some("unsigned"));
     }
 
     #[test]
@@ -354,7 +426,7 @@ mod tests {
     fn status_transitions_only_from_pending() {
         let dir = tempfile::tempdir().unwrap();
         let envelope = sample("agt_b");
-        store_inbound(dir.path(), "q_1", &envelope).unwrap();
+        store_inbound(dir.path(), "q_1", &envelope, None).unwrap();
         set_inbound_status(dir.path(), "rct_in1", InboundStatus::Accepted).unwrap();
         // 已结算的不能再改。
         assert!(set_inbound_status(dir.path(), "rct_in1", InboundStatus::Rejected)

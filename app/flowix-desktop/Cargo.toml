@@ -45,6 +45,9 @@ thiserror = { workspace = true }
 reqwest = { workspace = true, features = ["blocking", "stream"] }
 async-trait = "0.1"
 base64 = "0.22"
+# FD-11 v2：中继账号密钥（Ed25519 签名/挑战登录）。
+ed25519-dalek = "2"
+rand = "0.8"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "ico", "tiff"] }
 nanoid = { workspace = true }
 tempfile = { workspace = true }

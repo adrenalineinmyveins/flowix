@@ -44,7 +44,7 @@ fn party(agent_id: &str, display: &str) -> AgentParty {
 }
 
 async fn spawn_relay() -> String {
-    let router = flowix_relay::build_router(Arc::new(AppState { store: Store::in_memory() }));
+    let router = flowix_relay::build_router(Arc::new(AppState::new(Store::in_memory())));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
@@ -69,8 +69,8 @@ async fn full_roundtrip_consultation_and_reply() {
     let root_b = tempfile::tempdir().unwrap();
 
     // 两台设备各自注册收件通道（不同 token，单设备语义）。
-    let token_a = register_device(&relay, &["agt_a".into()]).await.unwrap();
-    let token_b = register_device(&relay, &["agt_b".into()]).await.unwrap();
+    let token_a = register_device(&relay, &["agt_a".into()], None).await.unwrap();
+    let token_b = register_device(&relay, &["agt_b".into()], None).await.unwrap();
     assert_ne!(token_a, token_b);
 
     // ---- 1. A 发起咨询（sender=agt_a，收件方=agt_b）----
@@ -178,7 +178,7 @@ async fn full_roundtrip_consultation_and_reply() {
 async fn deliver_to_unregistered_recipient_stays_retryable() {
     let relay = spawn_relay().await;
     let root = tempfile::tempdir().unwrap();
-    register_device(&relay, &["agt_a".into()]).await.unwrap();
+    register_device(&relay, &["agt_a".into()], None).await.unwrap();
 
     let record = draft_from_preview(
         "q",

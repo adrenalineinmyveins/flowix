@@ -163,3 +163,63 @@ export interface SendPayload {
   payload: string;
   byteLength: number;
 }
+
+// ----------------------------------------------------------------------
+// FD-11 v2：中继账号、目录、用量
+// ----------------------------------------------------------------------
+
+/** 中继账号（回前端视图，不含私钥）。 */
+export interface RelayAccountInfo {
+  username: string;
+  userId: string;
+  publicKey: string;
+  relayUrl: string;
+}
+
+export type DirectoryCardStatus = "draft" | "confirmed" | "cancelled" | "published";
+
+/** 目录卡发布留档（notebook `.flowix/redaction-directory/`）。 */
+export interface DirectoryCardDraft {
+  id: string;
+  status: DirectoryCardStatus;
+  agentSlug: string;
+  displayName: string;
+  specialtyTags: string[];
+  visibility: "public" | "unlisted" | "private";
+  minRedactionLevel: string;
+  l1Hits?: RuleHit[];
+  createdAt: number;
+  settledAt?: number | null;
+  publishedAt?: number | null;
+}
+
+export interface DirectoryPreviewResult {
+  draft: DirectoryCardDraft;
+  /** L1 脱敏前原文（人审对比）。 */
+  original: string;
+}
+
+/** 中继目录卡（搜索/详情返回）。 */
+export interface DirectoryCard {
+  address: string;
+  username: string;
+  agentSlug: string;
+  displayName: string;
+  visibility: string;
+  card?: {
+    publicKey?: string;
+    specialtyTags?: string[];
+    minRedactionLevel?: string;
+    [key: string]: unknown;
+  };
+  updatedAt: number;
+}
+
+/** 本账号中继用量与配额。 */
+export interface RelayUsage {
+  windowSecs: number;
+  deliverUsed: number;
+  deliverLimit: number;
+  pollUsed: number;
+  pollLimit: number;
+}
