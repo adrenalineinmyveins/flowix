@@ -1,0 +1,26 @@
+[package]
+name = "flowix-cloud"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# Flowix Cloud 自建同步后端（单二进制 + SQLite）。
+# 契约：flowix-sync 客户端（客户端即规范）；坑清单 docs/android-app-execution-plan.md §9。
+# 部署：cargo run -p flowix-cloud --release -- --addr 0.0.0.0:8787 --db /data/flowix-cloud.db
+
+[dependencies]
+axum = "0.7"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+rusqlite = { workspace = true }
+scrypt = { version = "0.11", default-features = false }
+flowix-sync = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+tempfile = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

@@ -8,6 +8,7 @@ members = [
     "flowix-redaction",
     "flowix-relay",
     "flowix-sync",
+    "flowix-cloud",
     "flowix-cli",
     "flowix-installer-helper",
 ]
