@@ -144,6 +144,12 @@ receiptId 去重）。
   全幂等）。途中实证匿名配额执法：同 IP 一小时内第 4 封投递 429，清 `usage_events`
   计量窗口后复验通过
 - SQLite 落库证据：accounts（alice/bob）、directory（public 卡）、WAL 活跃
+- 客户端接入实测（2026-10-21）：CDP 直调 IPC 全链路对真中继验证通过——账号注册（rop，
+  201 路径）+ 重复注册挑战登录幂等（200 挑战换 token，publicKey 不变）+
+  `config.relay_url` 自动对齐账号中继（收发同源）+ usage 读数（投递 0/30、拉取 0/120，
+  Bearer 档）+ 目录搜索与单卡详情（alice/researcher public 卡）。决策：客户端默认
+  `relay_url` 保持空串（空=未配置为 F5 契约，RELAY_NOT_CONFIGURED 显式引导），
+  接入走收件箱面板「中继账号与目录」一次注册即自动对齐，不写死云端地址
 - 遗留（待办）：当前明文 HTTP（对齐 flowix-cloud 8787 先例），与 §6 云端强制 TLS 有差距；
   后续 Cloudflare 加 `relay.*` 子域（橙云代理）补 TLS，unit 切回 `127.0.0.1` + 反代形态
 
