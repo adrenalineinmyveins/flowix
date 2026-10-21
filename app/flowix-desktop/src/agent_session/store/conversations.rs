@@ -120,7 +120,7 @@ impl ThreadManager {
              FROM agent_instances i
              LEFT JOIN threads_index ti ON ti.instance_id = i.id
              LEFT JOIN agent_conversation_instances legacy ON legacy.instance_id = i.id
-             WHERE (?1 IS NULL OR i.notebook_id = ?1)
+             WHERE (?1 IS NULL OR i.notebook_id = ?1 OR i.agent = 'mobile')
                AND (?2 IS NULL OR i.agent = ?2)
                AND (
                    ?3 IS NULL
@@ -160,7 +160,7 @@ impl ThreadManager {
                  FROM agent_instances i
                  LEFT JOIN threads_index ti ON ti.instance_id = i.id
                  LEFT JOIN agent_conversation_instances legacy ON legacy.instance_id = i.id
-                 WHERE (?1 IS NULL OR i.notebook_id = ?1)
+                 WHERE (?1 IS NULL OR i.notebook_id = ?1 OR i.agent = 'mobile')
                    AND NOT (
                        i.agent = 'opencode'
                        AND ti.id GLOB 'ses_*'
@@ -240,7 +240,7 @@ impl ThreadManager {
              FROM agent_instances i
              LEFT JOIN threads_index ti ON ti.instance_id = i.id
              LEFT JOIN agent_conversation_instances legacy ON legacy.instance_id = i.id
-             WHERE (?1 IS NULL OR i.notebook_id = ?1)
+             WHERE (?1 IS NULL OR i.notebook_id = ?1 OR i.agent = 'mobile')
                AND NOT (
                    i.agent = 'opencode'
                    AND ti.id GLOB 'ses_*'

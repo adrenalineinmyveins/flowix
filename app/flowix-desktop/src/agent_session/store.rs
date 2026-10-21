@@ -4,6 +4,7 @@
 //! Domain-specific SQL lives in child modules while every method continues to
 //! operate on this same connection, preserving cross-table transaction semantics.
 
+mod cloud_bridge;
 mod conversations;
 mod external;
 mod legacy_external_sessions;

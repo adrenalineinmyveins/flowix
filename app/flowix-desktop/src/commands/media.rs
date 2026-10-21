@@ -220,3 +220,42 @@ pub async fn delete_media_resource(
         Ok(true)
     }).await?
 }
+
+/// 跨设备回落：按文件名在所有笔记本的 attachments/ 子树找同名媒体文件。
+/// 用于渲染其他设备写入的 asset:// 引用（storageKey 是对方机器的绝对路径，
+/// 本机不存在时按 basename 回落到已同步落盘的本地副本）。
+#[tauri::command]
+pub async fn resolve_attachment_filename(
+    file_name: String,
+    app: AppHandle,
+) -> Result<Option<String>, String> {
+    crate::document_io::run("resolve_attachment_filename", move || {
+        let state = app.state::<AppState>();
+        let name = Path::new(&file_name)
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+            .ok_or("INVALID_FILE_NAME")?;
+        if name.is_empty() || name.starts_with('.') {
+            return Err("INVALID_FILE_NAME".to_string());
+        }
+        let memo_file = read_lock(&state.memo_file, "memo_file");
+        for notebook in memo_file.read_notebook_configs().map_err(|error| error.to_string())? {
+            let root = Path::new(&notebook.path);
+            let mut candidates: Vec<PathBuf> = Vec::new();
+            crate::commands::cloud::local_adapter::scan_cloud_attachments(
+                root,
+                &root.join("attachments"),
+                &mut candidates,
+            )?;
+            for candidate in candidates {
+                if candidate
+                    .file_name()
+                    .is_some_and(|value| value.to_string_lossy() == name)
+                {
+                    return Ok(Some(candidate.display().to_string()));
+                }
+            }
+        }
+        Ok(None)
+    }).await?
+}

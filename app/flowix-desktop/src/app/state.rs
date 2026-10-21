@@ -59,6 +59,8 @@ pub struct AppState {
     pub opencode: Arc<crate::agent_external::opencode::OpenCodeAcpManager>,
     pub pi: Arc<crate::agent_external::pi::PiRpcManager>,
     pub deepseek_harness: Arc<crate::agent_external::deepseek_harness::DeepSeekHarnessManager>,
+    /// 云同步跨端会话 runtime（OpenAI 兼容 SSE 直连，provider 配置平文件）。
+    pub mobile_chat: Arc<crate::agent_external::mobile::MobileChatManager>,
     /// Product-level history policy and fallback orchestration. Runtime
     /// adapters remain responsible for their own protocol and transcript.
     pub agent_history: Arc<crate::agent_history::AgentHistoryService>,

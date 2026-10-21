@@ -118,7 +118,12 @@ impl DeviceRegistry {
 
     /// Whether this client exposes experimental product features.
     /// Missing `experimental` in an existing v2 boot.json deserializes as false.
+    /// 开发旁路：`FLOWIX_EXPERIMENTAL=1` 强制开启（boot.json 会被并存的其他
+    /// dev 实例用各自内存态周期性回写，环境变量是唯一稳定的单实例覆盖）。
     pub fn experimental(&self) -> bool {
+        if let Ok(value) = std::env::var("FLOWIX_EXPERIMENTAL") {
+            return matches!(value.trim(), "1" | "true");
+        }
         self.read().experimental
     }
 

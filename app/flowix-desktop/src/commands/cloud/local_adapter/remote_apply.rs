@@ -74,6 +74,22 @@ pub(super) fn write_cloud_attachments(
     Ok(())
 }
 
+/// 排他锁内决策后延后到锁释放外执行的索引动作。
+///
+/// 两段式：`apply_v2_note_changes` 在 notebook 排他文件锁内只做纯文件系统
+/// 变更与冲突决策；`register_existing_file_for_notebook_id` /
+/// `prune_deleted_memo_for_notebook_id` / `register_preserved_conflict_copy`
+/// 内部会重新获取笔记本共享文件锁，若在排他锁内调用，同进程跨 fd 互等，
+/// 首次 bootstrap 下载即死锁（移动端 cache.rs / sync.rs 已同款修复）。
+enum DeferredIndexAction {
+    /// 落地成功的笔记：注册进索引并发 Updated 事件。
+    RegisterNote { path: PathBuf },
+    /// 冲突判定后保留的本地内容副本：注册（附件或笔记）。
+    RegisterConflictCopy { path: PathBuf, attachment: bool },
+    /// 云端删除已确认：清索引并发 Deleted 事件。
+    PruneDeleted { memo: flowix_core::memo_file::Memo },
+}
+
 fn apply_v2_note_changes(
     state: &AppState,
     app: &AppHandle,
@@ -81,6 +97,87 @@ fn apply_v2_note_changes(
     changes: &[&V2RemoteApply],
 ) -> Result<(), String> {
     let memo_file = read_lock(&state.memo_file, "memo_file");
+    let mut deferred: Vec<DeferredIndexAction> = Vec::new();
+    let result = apply_v2_note_changes_locked(
+        &memo_file,
+        state,
+        app,
+        notebook_id,
+        changes,
+        &mut deferred,
+    );
+    // 排他锁在此（result 内部 guard 已 drop）后执行全部索引动作；无论成败
+    // 都要注册已落地的变更，再向调用方返回原始结果。
+    let base = PathBuf::from(
+        &memo_file
+            .get_notebook_config_by_id(notebook_id)
+            .ok_or_else(|| "NOTEBOOK_NOT_FOUND".to_string())?
+            .path,
+    );
+    for action in deferred {
+        match action {
+            DeferredIndexAction::RegisterNote { path } => {
+                let memo = memo_file
+                    .register_existing_file_for_notebook_id(notebook_id, &path)
+                    .map_err(sync_error)?;
+                memo_events::emit(
+                    app,
+                    MemoEvent::Updated {
+                        id: memo.id.clone(),
+                        path: path.to_string_lossy().into_owned(),
+                        notebook_id: notebook_id.to_string(),
+                        derived_changed: MemoDerivedChanged {
+                            tags: true,
+                            todos: true,
+                            agents: true,
+                        },
+                        memo,
+                        source: MemoChangeSource::CloudSync,
+                    },
+                );
+            }
+            DeferredIndexAction::RegisterConflictCopy { path, attachment } => {
+                register_preserved_conflict_copy(&memo_file, notebook_id, &base, &path, attachment)?;
+            }
+            DeferredIndexAction::PruneDeleted { memo } => {
+                let path = notebook_path_from_relative(&base, &memo.relative_path)
+                    .unwrap_or_else(|_| base.join(&memo.filename));
+                if !memo_file
+                    .prune_deleted_memo_for_notebook_id(notebook_id, &memo.relative_path, &memo.id)
+                    .map_err(|error| error.to_string())?
+                {
+                    return Err(format!(
+                        "CLOUD_DELETE_CONFLICT: path was recreated: {}",
+                        path.display()
+                    ));
+                }
+                let derived_changed = MemoDerivedChanged::from_deleted(&memo);
+                memo_events::emit(
+                    app,
+                    MemoEvent::Deleted {
+                        id: memo.id.clone(),
+                        path: path.to_string_lossy().into_owned(),
+                        relative_path: memo.relative_path.clone(),
+                        notebook_id: notebook_id.to_string(),
+                        derived_changed,
+                        source: MemoChangeSource::CloudSync,
+                    },
+                );
+            }
+        }
+    }
+    result
+}
+
+/// 排他锁阶段：纯文件系统变更 + 冲突决策；索引动作收集进 `deferred`。
+fn apply_v2_note_changes_locked(
+    memo_file: &flowix_core::memo_file::MemoFile,
+    state: &AppState,
+    app: &AppHandle,
+    notebook_id: &str,
+    changes: &[&V2RemoteApply],
+    deferred: &mut Vec<DeferredIndexAction>,
+) -> Result<(), String> {
     let _write_guard = memo_file
         .operation_locks()
         .notebook_change(&[notebook_id], "apply_cloud_note_changes")
@@ -138,13 +235,10 @@ fn apply_v2_note_changes(
                                 | ConflictFileOutcome::Interrupted { preserved } => preserved,
                             };
                             if let Some(preserved) = preserved {
-                                register_preserved_conflict_copy(
-                                    &memo_file,
-                                    notebook_id,
-                                    &base,
-                                    &preserved,
-                                    true,
-                                )?;
+                                deferred.push(DeferredIndexAction::RegisterConflictCopy {
+                                    path: preserved,
+                                    attachment: true,
+                                });
                             }
                             return Err(format!("CLOUD_ATTACHMENT_DELETE_CONFLICT: {filename}"));
                         }
@@ -180,13 +274,10 @@ fn apply_v2_note_changes(
                         | ConflictFileOutcome::Interrupted { preserved } => preserved,
                     };
                     if let Some(preserved) = preserved {
-                        register_preserved_conflict_copy(
-                            &memo_file,
-                            notebook_id,
-                            &base,
-                            &preserved,
-                            true,
-                        )?;
+                        deferred.push(DeferredIndexAction::RegisterConflictCopy {
+                            path: preserved,
+                            attachment: true,
+                        });
                     }
                     return Err(format!("CLOUD_ATTACHMENT_EDIT_CONFLICT: {filename}"));
                 }
@@ -194,28 +285,26 @@ fn apply_v2_note_changes(
             continue;
         }
         if *deleted {
-            if let Some(memo) = deletion::delete_cloud_note_locked(
-                &memo_file,
+            let (outcome, preserved) = deletion::delete_cloud_note_fs(
+                memo_file,
                 &state.cloud_sync,
                 notebook_id,
                 note_id,
                 filename,
                 |path| crate::watcher::runtime::mark_self_write_for(app, path),
-            )? {
-                let path = notebook_path_from_relative(&base, &memo.relative_path)
-                    .unwrap_or_else(|_| base.join(&memo.filename));
-                let derived_changed = MemoDerivedChanged::from_deleted(&memo);
-                memo_events::emit(
-                    app,
-                    MemoEvent::Deleted {
-                        id: memo.id.clone(),
-                        path: path.to_string_lossy().into_owned(),
-                        relative_path: memo.relative_path.clone(),
-                        notebook_id: notebook_id.to_string(),
-                        derived_changed,
-                        source: MemoChangeSource::CloudSync,
-                    },
-                );
+            )?;
+            if let Some(preserved) = preserved {
+                deferred.push(DeferredIndexAction::RegisterConflictCopy {
+                    path: preserved.copy,
+                    attachment: false,
+                });
+                return Err(format!(
+                    "CLOUD_DELETE_CONFLICT: local changes preserved: {}",
+                    preserved.original.display()
+                ));
+            }
+            if let deletion::FsDeleteOutcome::Applied(memo) = outcome {
+                deferred.push(DeferredIndexAction::PruneDeleted { memo });
             }
         } else {
             let bytes = content
@@ -241,9 +330,9 @@ fn apply_v2_note_changes(
             });
             let desired_path = safe_cloud_note_path(&base, filename)?;
             if desired_path.exists() && old_path.as_ref() != Some(&desired_path) {
-                memo_file
-                    .register_existing_file_for_notebook_id(notebook_id, &desired_path)
-                    .map_err(sync_error)?;
+                deferred.push(DeferredIndexAction::RegisterNote {
+                    path: desired_path.clone(),
+                });
                 if std::fs::read(&desired_path).map_err(sync_error)? != *bytes {
                     return Err(format!(
                         "CLOUD_PATH_COLLISION: local file preserved at {filename}"
@@ -270,10 +359,9 @@ fn apply_v2_note_changes(
             if matches!(&old_path, Some(path) if path == &desired_path)
                 && disk_hash.as_deref() == Some(expected_hash)
             {
-                let memo = memo_file
-                    .register_existing_file_for_notebook_id(notebook_id, &desired_path)
-                    .map_err(sync_error)?;
-                let _ = memo;
+                deferred.push(DeferredIndexAction::RegisterNote {
+                    path: desired_path,
+                });
                 continue;
             }
 
@@ -325,48 +413,30 @@ fn apply_v2_note_changes(
                         | ConflictFileOutcome::Interrupted { preserved } => preserved,
                     };
                     if let Some(preserved) = preserved {
-                        register_preserved_conflict_copy(
-                            &memo_file,
-                            notebook_id,
-                            &base,
-                            &preserved,
-                            false,
-                        )?;
+                        deferred.push(DeferredIndexAction::RegisterConflictCopy {
+                            path: preserved,
+                            attachment: false,
+                        });
                     }
                     return Err(format!(
                         "CLOUD_LOCAL_EDIT_CONFLICT: local file preserved at {filename}"
                     ));
                 }
             }
-            let memo = memo_file
-                .register_existing_file_for_notebook_id(notebook_id, &desired_path)
-                .map_err(sync_error)?;
+            deferred.push(DeferredIndexAction::RegisterNote {
+                path: desired_path.clone(),
+            });
             if let Some(path) = old_path.filter(|path| path != &desired_path) {
                 if path.exists() {
                     std::fs::remove_file(&path).map_err(sync_error)?;
                 }
             }
-            memo_events::emit(
-                app,
-                MemoEvent::Updated {
-                    id: memo.id.clone(),
-                    path: desired_path.to_string_lossy().into_owned(),
-                    notebook_id: notebook_id.to_string(),
-                    derived_changed: MemoDerivedChanged {
-                        tags: true,
-                        todos: true,
-                        agents: true,
-                    },
-                    memo,
-                    source: MemoChangeSource::CloudSync,
-                },
-            );
         }
     }
     Ok(())
 }
 
-pub(crate) fn apply_v2_report(
+pub(crate) async fn apply_v2_report(
     state: &AppState,
     app: &AppHandle,
     report: &V2AccountSyncReport,
@@ -374,6 +444,7 @@ pub(crate) fn apply_v2_report(
     let mut note_changes = HashMap::<String, Vec<&V2RemoteApply>>::new();
     let mut notebook_metadata =
         HashMap::<String, (Option<String>, Option<String>, Option<i64>, bool)>::new();
+    let mut thread_changes = Vec::<(&str, bool, Option<&[u8]>)>::new();
     for change in &report.remote {
         match change {
             V2RemoteApply::Notebook {
@@ -395,7 +466,26 @@ pub(crate) fn apply_v2_report(
                     .or_default()
                     .push(change);
             }
+            // A3 桥：远端线程 upsert/删除到 thread.db（消息按 id 幂等），
+            // 有变化时聚合广播 threads-changed 刷新 UI。
+            V2RemoteApply::Thread {
+                thread_id,
+                deleted,
+                content,
+                ..
+            } => {
+                thread_changes.push((thread_id, *deleted, content.as_deref()));
+            }
         }
+    }
+    let mut threads_changed = false;
+    for (thread_id, deleted, content) in thread_changes {
+        if super::thread_bridge::apply_remote_thread(state, thread_id, deleted, content).await? {
+            threads_changed = true;
+        }
+    }
+    if threads_changed {
+        crate::events::emit_to(app, crate::commands::thread::THREADS_CHANGED_EVENT, ());
     }
 
     for (notebook_id, changes) in note_changes {

@@ -5,6 +5,7 @@ pub(crate) mod codex_catalog;
 pub(crate) mod external_config;
 pub(crate) mod flowix_instructions;
 pub(crate) mod image_cache;
+pub(crate) mod mobile_provider;
 pub(crate) mod model_catalog;
 pub(crate) mod notebook_agents;
 pub(crate) mod runtime;

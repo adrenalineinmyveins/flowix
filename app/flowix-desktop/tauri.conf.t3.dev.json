@@ -1,0 +1,83 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Flowix T3",
+  "mainBinaryName": "Flowix T3",
+  "identifier": "com.flowix.app.t3",
+  "plugins": {
+    "deep-link": {
+      "desktop": { "schemes": ["flowix-t3"] }
+    }
+  },
+  "build": {
+    "beforeDevCommand": "npm run dev -- --port 1422",
+    "devUrl": "http://localhost:1422",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../../.build/web-dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Flowix T3",
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": {
+          "x": 15,
+          "y": 25
+        },
+        "width": 1100,
+        "height": 720,
+        "minWidth": 420,
+        "minHeight": 600
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost https://asset.localhost https: http: data: blob:; media-src 'self' asset: http://asset.localhost https://asset.localhost data: blob:; font-src 'self' asset: http://asset.localhost https://asset.localhost data:; connect-src 'self' ipc: http://ipc.localhost https://ipc.localhost http://asset.localhost https://asset.localhost https:; frame-src 'self' http: https:; worker-src 'self' blob:",
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "**"
+        ]
+      }
+    },
+    "withGlobalTauri": false
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
+    "windows": {
+      "nsis": {
+        "installerHooks": "nsis/flowix-cli-path.nsh",
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico"
+      }
+    },
+    "fileAssociations": [
+      {
+        "ext": [
+          "md",
+          "markdown"
+        ],
+        "name": "Markdown Document",
+        "description": "Markdown Document",
+        "mimeType": "text/markdown",
+        "role": "Editor"
+      }
+    ],
+    "macOS": {
+      "bundleName": "Flowix T3",
+      "infoPlist": "Info.plist"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "externalBin": [
+      "binaries/flowix-cli"
+    ]
+  }
+}

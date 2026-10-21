@@ -323,8 +323,14 @@ pub fn validate_distilled(
 
 /// R3 级纯规则兜底：截断 + 首句提取（DISTILL_FAILED 时由调用方选用）。
 /// 首句 = 首个中文/英文句读边界前的片段；整体截断到 R3_FALLBACK_MAX_CHARS。
+/// 载荷由 `assemble_l0_payload` 以 `<user-request>` 标签行开头，提取前先
+/// 剥掉该标签行——否则首句永远是 `"<user-request>"`，兜底稿退化为空壳。
 pub fn r3_fallback(l1_text: &str) -> String {
-    let body = l1_text.trim();
+    let trimmed = l1_text.trim();
+    let body = trimmed
+        .strip_prefix("<user-request>\n")
+        .map(str::trim_start)
+        .unwrap_or(trimmed);
     if body.is_empty() {
         return String::new();
     }
@@ -1219,6 +1225,19 @@ mod tests {
         assert!(fallback.chars().count() <= R3_FALLBACK_MAX_CHARS);
         assert!(!fallback.is_empty());
         assert!(r3_fallback("   ").is_empty());
+    }
+
+    #[test]
+    fn r3_fallback_skips_user_request_tag_line() {
+        // assemble_l0_payload 的载荷以 <user-request> 标签行开头；
+        // 兜底稿必须取问题正文首句，而不是把标签行当首句产出空壳。
+        let payload = "<user-request>\n复购率下滑时如何归因物流环节？\n</user-request>\n\n## 材料\n……";
+        assert_eq!(
+            r3_fallback(payload),
+            "复购率下滑时如何归因物流环节？"
+        );
+        // 无标签行时行为不变。
+        assert_eq!(r3_fallback("复购率下滑。细节。"), "复购率下滑。");
     }
 
     #[test]

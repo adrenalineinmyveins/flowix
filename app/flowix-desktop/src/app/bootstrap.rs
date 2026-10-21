@@ -173,6 +173,10 @@ pub fn run() {
         user_config.clone(),
         user_config.dsh_sessions_dir(),
     ));
+    let mobile_chat_manager = Arc::new(crate::agent_external::mobile::MobileChatManager::new(
+        thread_manager_arc.clone(),
+        user_config_dir.clone(),
+    ));
     let external_runtimes = Arc::new(ExternalRuntimeRegistry::new(
         codex_app_server.clone(),
         claude_cli_manager,
@@ -180,6 +184,7 @@ pub fn run() {
         opencode_acp_manager.clone(),
         pi_rpc_manager.clone(),
         deepseek_harness_manager.clone(),
+        mobile_chat_manager.clone(),
     ));
     let agent_history = Arc::new(crate::agent_history::AgentHistoryService::new(
         thread_manager_arc.clone(),
@@ -315,6 +320,7 @@ pub fn run() {
                 opencode: opencode_acp_manager.clone(),
                 pi: pi_rpc_manager.clone(),
                 deepseek_harness: deepseek_harness_manager.clone(),
+                mobile_chat: mobile_chat_manager.clone(),
                 agent_history: agent_history.clone(),
                 agent_lifecycle: agent_lifecycle.clone(),
                 thread_manager: thread_manager_for_state.clone(),
@@ -600,6 +606,7 @@ pub fn run() {
             commands::media::list_media_resources_page,
             commands::media::update_media_resource,
             commands::media::delete_media_resource,
+            commands::media::resolve_attachment_filename,
             commands::memo::reads::get_used_memo_tag_ids,
             commands::memo::reads::read_document,
             commands::memo::reads::note_path_status,
@@ -726,6 +733,8 @@ pub fn run() {
             commands::agent::image_cache::read_cached_agent_image,
             commands::agent::chat::chat_with_agent_stream,
             commands::agent::chat::steer_agent_stream,
+            commands::agent::mobile_provider::mobile_provider_get,
+            commands::agent::mobile_provider::mobile_provider_set,
             commands::agent::chat::promote_pi_follow_up_to_steer,
             commands::agent::chat::delete_pi_queued_message,
             commands::agent::chat::queue_codex_follow_up,

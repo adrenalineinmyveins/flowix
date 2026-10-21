@@ -11,6 +11,9 @@ use crate::agent_types::default_agent_id;
 
 use crate::app::state::AppState;
 
+/// 云同步 apply 了远端线程（A3 桥）后广播，前端刷新线程列表。
+pub const THREADS_CHANGED_EVENT: &str = "threads-changed";
+
 #[derive(Serialize)]
 pub struct GetThreadResponse {
     pub messages: Vec<ChatMessage>,

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 mod coordinator;
 mod deletion;
-mod local_adapter;
+pub(crate) mod local_adapter;
 mod google_login;
 use google_login::PendingGoogleLogin;
 pub(crate) use google_login::GoogleCallback;

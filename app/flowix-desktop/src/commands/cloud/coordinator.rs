@@ -282,6 +282,14 @@ async fn sync_v2_account_pass(
         "transfer",
         None,
     );
+    // A3 桥（仅账户级 pass）：对账把本地线程变更翻进 dirty 队列，
+    // 再组装 dirty 线程快照供引擎 freeze 上传。
+    let threads = if notebook_scope.is_none() {
+        local_adapter::thread_bridge::reconcile_thread_dirty_state(state).await?;
+        local_adapter::thread_bridge::v2_thread_snapshot(state).await?
+    } else {
+        Vec::new()
+    };
     let mut conflict_attempts = 0;
     let report_result = loop {
         let result = match tokio::time::timeout(
@@ -290,6 +298,7 @@ async fn sync_v2_account_pass(
                 notebook_scope,
                 notebooks,
                 notes,
+                threads.clone(),
                 generation,
             ),
         )
@@ -337,11 +346,14 @@ async fn sync_v2_account_pass(
     );
     state
         .cloud_sync
-        .complete_v2_sync_with_apply(&report, notebook_scope, || {
-            apply_v2_report(state, app, &report).map_err(SyncError::InvalidState)
+        .complete_v2_sync_with_apply_async(&report, notebook_scope, || async {
+            apply_v2_report(state, app, &report).await.map_err(SyncError::InvalidState)
         })
+        .await
         .map_err(sync_error)?;
-    if full_local_snapshot { record_full_local_snapshot(notebook_scope); }
+    if full_local_snapshot {
+        record_full_local_snapshot(notebook_scope);
+    }
     Ok(report)
 }
 
@@ -595,9 +607,9 @@ async fn run_sync_activity(
                                 .to_string()
                         })?
                         .map_err(cloud_error)?;
-                        state.cloud_sync.complete_v2_sync_with_apply(&next, target.notebook_scope(), || {
-                            apply_v2_report(state.inner(), app, &next).map_err(SyncError::InvalidState)
-                        }).map_err(sync_error)?;
+                        state.cloud_sync.complete_v2_sync_with_apply_async(&next, target.notebook_scope(), || async {
+                            apply_v2_report(state.inner(), app, &next).await.map_err(SyncError::InvalidState)
+                        }).await.map_err(sync_error)?;
                         Ok::<_, String>(next)
                     }.await
                 };

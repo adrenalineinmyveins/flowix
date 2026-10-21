@@ -5,6 +5,7 @@ mod conflict_files;
 mod conflict_resolution;
 mod local_snapshot;
 mod remote_apply;
+pub(super) mod thread_bridge;
 
 use conflict_files::{
     choose_markdown_conflict_content, recover_and_register_conflict_stage,
@@ -25,7 +26,7 @@ pub(super) use conflict_files::{
 pub(super) use conflict_resolution::{
     resolve_v2_delete_conflict, resolve_v2_file_put_conflict, resolve_v2_move_conflict,
 };
-pub(super) use local_snapshot::{
+pub(crate) use local_snapshot::{
     record_full_local_snapshot, scan_cloud_attachments, should_run_full_local_snapshot,
     v2_account_snapshot,
 };

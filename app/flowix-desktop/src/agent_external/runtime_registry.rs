@@ -18,6 +18,7 @@ use super::claude::{ClaudeCliManager, AGENT_TYPE as CLAUDE_AGENT_TYPE};
 use super::codex::{CodexAppServerManager, AGENT_TYPE as CODEX_AGENT_TYPE};
 use super::deepseek_harness::{DeepSeekHarnessManager, AGENT_TYPE as DSH_AGENT_TYPE};
 use super::hermes::HermesAcpManager;
+use super::mobile::{MobileChatManager, AGENT_TYPE as MOBILE_AGENT_TYPE};
 use super::opencode::{OpenCodeAcpManager, AGENT_TYPE as OPENCODE_AGENT_TYPE};
 use super::pi::{PiRpcManager, AGENT_TYPE as PI_AGENT_TYPE};
 use crate::agent_wire::{AgentUserMessage, RunInfo};
@@ -33,16 +34,19 @@ pub enum ExternalRuntimeKind {
     OpenCode,
     Pi,
     DeepSeekHarness,
+    /// 云同步跨端会话（OpenAI 兼容 SSE 直连，消息落 thread_messages）。
+    Mobile,
 }
 
 impl ExternalRuntimeKind {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Codex,
         Self::Claude,
         Self::Hermes,
         Self::OpenCode,
         Self::Pi,
         Self::DeepSeekHarness,
+        Self::Mobile,
     ];
 
     pub const fn key(self) -> &'static str {
@@ -53,6 +57,7 @@ impl ExternalRuntimeKind {
             Self::OpenCode => OPENCODE_AGENT_TYPE,
             Self::Pi => PI_AGENT_TYPE,
             Self::DeepSeekHarness => DSH_AGENT_TYPE,
+            Self::Mobile => MOBILE_AGENT_TYPE,
         }
     }
 
@@ -64,6 +69,7 @@ impl ExternalRuntimeKind {
             "opencode" => Ok(Self::OpenCode),
             "pi" => Ok(Self::Pi),
             "deepseek-harness" | "deepseek_harness" | "dsh" => Ok(Self::DeepSeekHarness),
+            "mobile" => Ok(Self::Mobile),
             other => Err(format!("unsupported agent type: {other}")),
         }
     }
@@ -629,6 +635,7 @@ impl ExternalRuntimeRegistry {
         opencode: Arc<OpenCodeAcpManager>,
         pi: Arc<PiRpcManager>,
         deepseek_harness: Arc<DeepSeekHarnessManager>,
+        mobile: Arc<MobileChatManager>,
     ) -> Self {
         let codex_for_registry = codex.clone();
         let deepseek_harness_for_registry = deepseek_harness.clone();
@@ -640,6 +647,7 @@ impl ExternalRuntimeRegistry {
             Box::new(opencode),
             Box::new(pi),
             Box::new(deepseek_harness),
+            Box::new(mobile),
         ])
         .expect("built-in external runtimes must have unique kinds")
         .with_codex(codex_for_registry)
@@ -1149,10 +1157,11 @@ mod tests {
             Arc::new(OpenCodeAcpManager::new(threads.clone())),
             Arc::new(PiRpcManager::new(threads.clone())),
             Arc::new(DeepSeekHarnessManager::new(
-                threads,
+                threads.clone(),
                 user_config,
                 dsh_sessions,
             )),
+            Arc::new(MobileChatManager::new(threads, temp.path().to_path_buf())),
         );
 
         let keys = registry
@@ -1167,7 +1176,8 @@ mod tests {
                 "hermes",
                 "opencode",
                 "pi",
-                "deepseek-harness"
+                "deepseek-harness",
+                "mobile"
             ]
         );
         for kind in ExternalRuntimeKind::ALL {

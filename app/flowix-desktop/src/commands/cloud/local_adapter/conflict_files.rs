@@ -56,7 +56,10 @@ pub(crate) fn record_rejected_cloud_version(
         )
         .map_err(sync_error)?;
     if created.is_none() {
-        let hash = flowix_sync::v2_content_hash(bytes);
+        // dedup 分支（同内容版本已存在且已是 CloudConflict 来源，重试同一冲突时必走）。
+        // 比对必须用清单同款 hex 哈希；此前误用 v2_content_hash（base64url），
+        // 格式永不相等 → 每次重试都误报 CLOUD_CONFLICT_VERSION_UNAVAILABLE（风暴根因）。
+        let hash = flowix_core::memo_file::path_version_content_hash(bytes);
         if !memo_file
             .list_path_versions(notebook_id, &relative)
             .iter()
@@ -341,6 +344,48 @@ pub(crate) fn register_preserved_conflict_copy(
             .register_existing_file_for_notebook_id(notebook_id, path)
             .map(|_| ())
             .map_err(sync_error)
+    }
+}
+
+#[cfg(test)]
+mod record_rejected_tests {
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, flowix_core::memo_file::MemoFile, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("notebook");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Note.md"), "local edit").unwrap();
+        let store = flowix_core::memo_file::MemoFile::new(temp.path().join("config"));
+        store
+            .write_notebook_configs(&[flowix_core::memo_file::NotebookConfig {
+                id: "nb".into(),
+                name: "NB".into(),
+                icon: None,
+                path: root.to_string_lossy().to_string(),
+                is_default: true,
+                sort: 0,
+                created_at: 1,
+                updated_at: 1,
+            }])
+            .unwrap();
+        (temp, store, root)
+    }
+
+    /// 回归：同一冲突内容重试（create 走 dedup 返回 None）不得误报
+    /// CLOUD_CONFLICT_VERSION_UNAVAILABLE（历史上 hex/base64url 哈希格式混用导致风暴）。
+    #[test]
+    fn repeated_rejected_version_recording_is_idempotent() {
+        let (_temp, store, root) = fixture();
+        let path = root.join("Note.md");
+        let bytes = b"cloud head v2";
+        record_rejected_cloud_version(&store, "nb", &root, &path, bytes).unwrap();
+        record_rejected_cloud_version(&store, "nb", &root, &path, bytes).unwrap();
+        let hash = flowix_core::memo_file::path_version_content_hash(bytes);
+        assert!(store
+            .list_path_versions("nb", "Note.md")
+            .iter()
+            .any(|version| version.content_hash == hash));
     }
 }
 

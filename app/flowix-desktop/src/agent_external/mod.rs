@@ -15,6 +15,7 @@ pub mod codex;
 pub mod deepseek_harness;
 pub mod hermes;
 pub mod lifecycle;
+pub mod mobile;
 pub mod node;
 pub mod opencode;
 pub mod pi;
