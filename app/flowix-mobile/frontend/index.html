@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content"
+    />
+    <title>Flowix</title>
+    <script>
+      // 首帧防闪白：与 theme.ts 同 key，在 React 挂载前写 data-theme。
+      (function () {
+        try {
+          var stored = localStorage.getItem('flowix-theme');
+          var resolved =
+            stored === 'light' || stored === 'dark' || stored === 'rock' || stored === 'ember'
+              ? stored
+              : window.matchMedia('(prefers-color-scheme: dark)').matches
+                ? 'dark'
+                : 'light';
+          document.documentElement.dataset.theme = resolved;
+          document.documentElement.style.colorScheme = resolved === 'dark' ? 'dark' : 'light';
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

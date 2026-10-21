@@ -1,0 +1,365 @@
+/* 基础 reset + 通用组件（按钮/输入/卡片/sheet/toast/空态）。 */
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: Inter, system-ui, -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  font-size: var(--m-body);
+  line-height: 1.5;
+  overscroll-behavior: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+  min-height: 44px;
+}
+
+input {
+  font: inherit;
+  color: var(--foreground);
+}
+
+/* ── 屏幕骨架 ─────────────────────────────────────────── */
+
+.screen {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: var(--background);
+  padding-top: env(safe-area-inset-top);
+}
+
+.screen-scroll {
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* 顶栏 */
+.m-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: var(--m-bar-h);
+  padding: 0 8px;
+  flex-shrink: 0;
+}
+
+.m-bar-title {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--m-bar-title);
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: left;
+}
+
+.m-bar-title.small {
+  font-size: var(--m-meta);
+  font-weight: 400;
+  color: var(--muted-foreground);
+}
+
+/* 图标按钮（44px 命中区，24px 视觉） */
+.m-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border-radius: var(--m-radius-ctl);
+  color: var(--foreground);
+  transition: background 150ms var(--m-ease);
+}
+
+.m-icon-btn:active {
+  background: var(--accent);
+  transform: scale(0.96);
+}
+
+.m-icon-btn svg {
+  width: 22px;
+  height: 22px;
+}
+
+.m-icon-btn.spin svg {
+  animation: m-rotate 1s linear infinite;
+  color: var(--brand);
+}
+
+@keyframes m-rotate {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ── 通用控件 ─────────────────────────────────────────── */
+
+/* 主按钮 */
+.m-btn-primary {
+  height: var(--m-input-h);
+  border-radius: var(--m-radius-ctl);
+  background: var(--primary);
+  color: var(--primary-foreground);
+  font-size: 15px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  transition: transform 150ms var(--m-ease), opacity 150ms;
+}
+
+.m-btn-primary:active {
+  transform: translateY(1px);
+}
+
+.m-btn-primary:disabled {
+  opacity: 0.5;
+}
+
+/* 次按钮（ghost） */
+.m-btn-ghost {
+  height: 40px;
+  padding: 0 16px;
+  border-radius: var(--m-radius-ctl);
+  background: var(--card);
+  border: 1px solid var(--border);
+  color: var(--foreground);
+  font-size: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.m-btn-ghost:active {
+  background: var(--accent);
+}
+
+/* danger 按钮（10% 透明底 + 字色，桌面同款非实底红） */
+.m-btn-danger {
+  height: 44px;
+  border-radius: var(--m-radius-ctl);
+  background: color-mix(in oklch, var(--destructive) 10%, transparent);
+  color: var(--destructive);
+  font-size: 15px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+/* 输入框 */
+.m-input {
+  width: 100%;
+  height: var(--m-input-h);
+  padding: 0 14px;
+  border-radius: var(--m-radius-ctl);
+  background: var(--card);
+  border: 1px solid var(--border);
+  outline: none;
+  transition: border-color 150ms;
+}
+
+.m-input:focus {
+  border-color: var(--primary);
+}
+
+.m-input::placeholder {
+  color: var(--muted-foreground);
+}
+
+/* 卡片容器（设置分组） */
+.m-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--m-radius-card);
+  padding: 4px 16px;
+  margin: 0 var(--m-pad) 12px;
+}
+
+.m-card-title {
+  font-size: var(--m-meta);
+  font-weight: 600;
+  color: var(--muted-foreground);
+  padding: 12px 0 4px;
+}
+
+.m-card-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 0;
+  font-size: 14px;
+  border-bottom: 1px solid var(--divider);
+}
+
+.m-card-row:last-child {
+  border-bottom: none;
+}
+
+.m-card-row .value {
+  color: var(--muted-foreground);
+  text-align: right;
+  word-break: break-all;
+}
+
+/* 底部 sheet 遮罩 + 容器 */
+.m-sheet-mask {
+  position: fixed;
+  inset: 0;
+  background: rgb(0 0 0 / 40%);
+  z-index: 40;
+  animation: m-fade 180ms var(--m-ease);
+}
+
+.m-sheet {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 41;
+  background: var(--popover);
+  border-radius: var(--m-radius-sheet) var(--m-radius-sheet) 0 0;
+  box-shadow: var(--m-shadow);
+  padding: 8px 8px calc(12px + env(safe-area-inset-bottom));
+  animation: m-sheet-up var(--m-dur) var(--m-ease);
+}
+
+.m-sheet-handle {
+  width: 36px;
+  height: 4px;
+  border-radius: 9999px;
+  background: var(--divider);
+  margin: 4px auto 8px;
+}
+
+.m-sheet-title {
+  font-size: var(--m-meta);
+  font-weight: 600;
+  color: var(--muted-foreground);
+  padding: 4px 12px 8px;
+}
+
+.m-sheet-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 48px;
+  padding: 0 12px;
+  border-radius: var(--m-radius-ctl);
+  font-size: 15px;
+  position: relative;
+  transition: background 150ms var(--m-ease);
+}
+
+.m-sheet-item:active {
+  background: var(--accent);
+}
+
+/* 选中态：左侧 4px 品牌竖条（桌面视觉签名） */
+.m-sheet-item.active::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 25%;
+  bottom: 25%;
+  width: 4px;
+  border-radius: 2px;
+  background: var(--brand);
+  animation: m-fade 150ms var(--m-ease);
+}
+
+.m-sheet-item .nb-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 9999px;
+  background: var(--success);
+  flex-shrink: 0;
+}
+
+@keyframes m-sheet-up {
+  from {
+    transform: translateY(100%);
+  }
+}
+
+@keyframes m-fade {
+  from {
+    opacity: 0;
+  }
+}
+
+/* Toast */
+.m-toast {
+  position: fixed;
+  left: 50%;
+  bottom: calc(88px + env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  z-index: 50;
+  max-width: 86%;
+  padding: 10px 16px;
+  border-radius: 8px;
+  background: var(--inverse-background, var(--foreground));
+  color: var(--inverse-foreground, var(--background));
+  font-size: 13px;
+  box-shadow: var(--m-shadow);
+  animation: m-fade 180ms var(--m-ease);
+}
+
+/* 空态 */
+.m-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 64px 24px;
+  color: var(--muted-foreground);
+  font-size: 14px;
+  text-align: center;
+}
+
+.m-empty svg {
+  width: 40px;
+  height: 40px;
+  opacity: 0.6;
+}
+
+/* 屏幕转场（栈推进/回退） */
+.m-push-enter {
+  animation: m-push var(--m-dur) var(--m-ease);
+}
+
+.m-fade-enter {
+  animation: m-fade var(--m-dur) var(--m-ease);
+}
+
+@keyframes m-push {
+  from {
+    transform: translateX(24px);
+    opacity: 0.4;
+  }
+}

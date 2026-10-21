@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "M0.3 spike 默认能力",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

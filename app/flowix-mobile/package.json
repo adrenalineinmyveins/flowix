@@ -1,0 +1,8 @@
+{
+  "name": "flowix-mobile",
+  "private": true,
+  "scripts": {
+    "tauri": "tauri",
+    "build:mobile": "npm run build:mobile --prefix ../.."
+  }
+}

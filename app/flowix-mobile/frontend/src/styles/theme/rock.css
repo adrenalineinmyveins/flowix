@@ -1,0 +1,83 @@
+[data-theme="rock"] {
+	/* Rock uses near-white warm stone surfaces, shallow neutral layers, and one chromatic
+	 * heat-source accent for links, selection, and semantic emphasis.
+	 */
+	--neutral-hue: 92;
+	--brand-hue: 22;
+	--brand-chroma: 0.120;
+
+	/* Main rock anchor: #55524d in OKLCH, kept low-chroma and text-safe. */
+	--primary: oklch(0.440 0.009 var(--neutral-hue));
+	--primary-foreground: oklch(0.970 0.007 var(--neutral-hue));
+	--brand: oklch(0.550 var(--brand-chroma) var(--brand-hue));
+	--text-hint: #0F8C25;
+
+	/* Lightness structure on rock's olive-gray axis. */
+	--background: oklch(0.988 0.006 var(--neutral-hue));
+	--frame-bg: #F4F3F1;
+	--foreground: oklch(0.300 0.009 var(--neutral-hue));
+	--card: #ffffff;
+	--list-bg: #f9f8f7;
+
+	--popover: oklch(1 0 0);
+	--popover-foreground: var(--foreground);
+	/* 输入面独立于 document-bg；浅色模式保持纯白。 */
+	--input-bg: oklch(1 0 0);
+
+	--secondary: oklch(0.980 0.005 var(--neutral-hue));
+	--secondary-foreground: oklch(0.360 0.010 var(--neutral-hue));
+	--muted: oklch(0.948 0.006 var(--neutral-hue));
+	--hover-bg: var(--muted);
+	--muted-foreground: oklch(0.620 0.009 var(--neutral-hue));
+	--accent: oklch(0.95 0.006 var(--neutral-hue));
+
+	--border: oklch(0.946 0.006 var(--neutral-hue));
+	--border-popup: oklch(0.880 0.006 var(--neutral-hue));
+	--input: var(--border);
+	/* 分割线: 与 light 同档 (L=0.932, 比 --border 深 0.014)
+	 * ── 跨主题切换时分割线权重一致, 在暖橄榄灰中性轴上 ΔL vs bg
+	 * ≈ 0.056. */
+	--divider: oklch(0.932 0.006 var(--neutral-hue));
+	--ring: var(--primary);
+
+	--agent-bg: oklch(0.982 0.005 var(--neutral-hue));
+	--agent-status-surface: oklch(0.965 0.004 var(--neutral-hue));
+	--agent-foreground: color-mix(in oklch, var(--foreground) 66%, transparent);
+
+	--bg-titlebar: oklch(0.984 0.005 var(--neutral-hue));
+
+	--document-bg: oklch(1 0 0);
+	--document-foreground: oklch(0.300 0.009 var(--neutral-hue));
+	--document-link: oklch(0.480 0.140 var(--brand-hue));
+	--document-highlight-bg: oklch(0.940 0.060 84);
+	--document-tag-bg: oklch(0.900 0 0);
+	--document-tag-foreground: var(--foreground);
+	/* Keep memo colors muted while using rock-specific warm hues. */
+	--memo-color-red:    oklch(64% 0.140 22);
+	--memo-color-orange: oklch(70% 0.130 48);
+	--memo-color-yellow: oklch(78% 0.115 86);
+	--memo-color-green:  oklch(66% 0.125 145);
+	--memo-color-cyan:   oklch(66% 0.090 215);
+	--memo-color-blue:   oklch(60% 0.150 257);
+	--memo-color-gray:   oklch(62% 0.008 var(--neutral-hue));
+
+	--editor-block-bg: oklch(0.982 0.005 var(--neutral-hue));
+
+	--floating-bg: oklch(0.320 0.012 var(--neutral-hue));
+	--floating-foreground: oklch(0.950 0 0);
+
+	--inverse-background: oklch(0.300 0.009 var(--neutral-hue));
+	--inverse-foreground: oklch(0.985 0.006 var(--neutral-hue));
+
+	--success: oklch(0.740 0.115 145);
+	--destructive: oklch(0.620 0.165 22);
+	--warning: oklch(0.800 0.105 75);
+	/* 信息提示: blue 跟 warm rock 中性灰拉得开, 不与 brand 抢；亮度下调以
+	 * 保证白字达到普通文字 AA 对比度。 */
+	--info: oklch(0.52 0.165 235);
+	--info-foreground: oklch(1 0 0);
+
+	color-scheme: light;
+
+	--shiki-theme: github-light;
+}

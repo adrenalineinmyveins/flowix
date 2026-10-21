@@ -1,0 +1,36 @@
+/* 移动端补充 token（与桌面 styles/index.css 同源语义，触控/字号补偿）。
+ * 颜色 token 由 styles/theme/*.css 提供（桌面端拷贝，单一真源）。 */
+
+:root {
+  /* 字号层级（移动端 +1~2px 补偿视距） */
+  --m-title-lg: 22px;      /* 登录 logo / 设置分组头 */
+  --m-bar-title: 17px;     /* 顶栏标题 */
+  --m-card-title: 15px;    /* 笔记卡片标题 */
+  --m-body: 16px;          /* 编辑器正文 */
+  --m-preview: 13px;       /* 卡片摘要 */
+  --m-meta: 12px;          /* 时间戳/元信息 */
+  --m-hint: 11px;          /* 版本号/状态条 */
+  --m-code: 13px;
+
+  /* 控件尺寸（触控 44px 命中区） */
+  --m-bar-h: 52px;
+  --m-input-h: 48px;
+  --m-fab: 56px;
+  --m-toolbar-h: 48px;
+
+  /* 圆角 */
+  --m-radius-card: 12px;
+  --m-radius-ctl: 10px;
+  --m-radius-sheet: 16px;
+  --m-radius-chip: 6px;
+
+  /* 浮层阴影（桌面同款唯一阴影） */
+  --m-shadow: 0 4px 24px -3px rgb(0 0 0 / 24%);
+
+  /* 动效（expo-out 同桌面） */
+  --m-ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --m-dur: 240ms;
+
+  /* 间距 */
+  --m-pad: 16px;
+}

@@ -1,0 +1,385 @@
+/* 编辑器：纸面排版 + 底部格式工具栏（键盘上方悬浮）。 */
+
+.editor-screen {
+  position: relative;
+}
+
+.save-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  padding: 0 12px;
+  font-size: var(--m-meta);
+  color: var(--muted-foreground);
+  flex-shrink: 0;
+}
+
+.save-state .state.dirty {
+  color: var(--brand);
+}
+
+.save-state .word-count {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.8;
+}
+
+.editor-body {
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: var(--document-bg);
+}
+
+.prose-mobile {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 16px 20px calc(24px + var(--m-toolbar-h) + env(safe-area-inset-bottom));
+}
+
+.prose-mobile .tiptap {
+  outline: none;
+  font-size: var(--app-font-size, var(--m-body));
+  line-height: 1.8;
+  min-height: 50vh;
+  word-break: break-word;
+}
+
+.prose-mobile .tiptap h1 {
+  font-size: 24px;
+  line-height: 1.3;
+  margin: 0.8em 0 0.4em;
+  font-weight: 700;
+}
+
+.prose-mobile .tiptap h2 {
+  font-size: 20px;
+  line-height: 1.3;
+  margin: 0.8em 0 0.4em;
+  font-weight: 700;
+}
+
+.prose-mobile .tiptap h3 {
+  font-size: 17px;
+  line-height: 1.3;
+  margin: 0.7em 0 0.35em;
+  font-weight: 600;
+}
+
+.prose-mobile .tiptap p {
+  margin: 0.4em 0;
+}
+
+.prose-mobile .tiptap blockquote {
+  border-left: 3px solid var(--brand);
+  padding-left: 12px;
+  margin: 0.6em 0;
+  color: var(--muted-foreground);
+}
+
+.prose-mobile .tiptap pre {
+  background: var(--editor-block-bg, var(--muted));
+  border-radius: 8px;
+  padding: 12px;
+  overflow-x: auto;
+  font-size: var(--m-code);
+  line-height: 1.7;
+  margin: 0.6em 0;
+}
+
+.prose-mobile .tiptap code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: var(--m-code);
+}
+
+.prose-mobile .tiptap :not(pre) > code {
+  background: var(--editor-block-bg, var(--muted));
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+
+.prose-mobile .tiptap ul,
+.prose-mobile .tiptap ol {
+  padding-left: 1.4em;
+  margin: 0.4em 0;
+}
+
+.prose-mobile .tiptap hr {
+  border: none;
+  border-top: 1px solid var(--divider);
+  margin: 1.2em 0;
+}
+
+.prose-mobile .tiptap img {
+  max-width: 100%;
+  border-radius: 8px;
+}
+
+.prose-mobile .tiptap a {
+  color: var(--brand);
+}
+
+/* 任务列表（checkbox + 勾选划线） */
+.prose-mobile .tiptap ul[data-type='taskList'] {
+  list-style: none;
+  padding-left: 0.2em;
+}
+
+.prose-mobile .tiptap ul[data-type='taskList'] li {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.prose-mobile .tiptap ul[data-type='taskList'] li > label {
+  margin-top: 0.35em;
+  flex-shrink: 0;
+}
+
+.prose-mobile .tiptap ul[data-type='taskList'] li > div {
+  flex: 1;
+}
+
+.prose-mobile .tiptap ul[data-type='taskList'] input[type='checkbox'] {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--brand);
+}
+
+.prose-mobile .tiptap ul[data-type='taskList'] li[data-checked='true'] > div {
+  color: var(--muted-foreground);
+  text-decoration: line-through;
+}
+
+/* 空文档占位（桌面同文案） */
+.prose-mobile .tiptap p.is-editor-empty:first-child::before {
+  content: attr(data-placeholder);
+  color: var(--muted-foreground);
+  opacity: 0.6;
+  float: left;
+  height: 0;
+  pointer-events: none;
+}
+
+/* 图片附件（storageKey 经 attachment_read 转 dataURL 渲染） */
+.file-input-hidden {
+  position: fixed;
+  left: -9999px;
+  top: 0;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.mobile-image-attachment {
+  margin: 12px 0;
+  min-height: 80px;
+}
+
+.mobile-image-attachment img {
+  display: block;
+  max-width: 100%;
+  border-radius: var(--m-radius-md, 10px);
+  background: var(--muted);
+}
+
+.mobile-image-attachment[data-loading='true']::after {
+  content: '图片加载中…';
+  display: block;
+  padding: 20px 0;
+  font-size: var(--m-hint);
+  color: var(--muted-foreground);
+  text-align: center;
+}
+
+.mobile-image-attachment[data-error='true']::after {
+  content: '图片不可用';
+  display: block;
+  padding: 20px 0;
+  font-size: var(--m-hint);
+  color: var(--muted-foreground);
+  text-align: center;
+  border: 1px dashed var(--border);
+  border-radius: var(--m-radius-md, 10px);
+}
+
+.ProseMirror-selectednode > .mobile-image-attachment,
+.mobile-image-attachment[data-selected='true'] {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+  border-radius: var(--m-radius-md, 10px);
+}
+
+/* 高亮（桌面 ==text== 语法互通；flowix 彩色注释在移动端降级为默认黄） */
+.prose-mobile .tiptap mark {
+  background: color-mix(in oklch, var(--brand) 28%, transparent);
+  color: inherit;
+  border-radius: 3px;
+  padding: 0 2px;
+}
+
+/* 表格（GFM 互通，窄屏横向滚动） */
+.prose-mobile .tiptap .tableWrapper {
+  overflow-x: auto;
+  margin: 12px 0;
+  -webkit-overflow-scrolling: touch;
+}
+
+.prose-mobile .tiptap table {
+  border-collapse: collapse;
+  width: 100%;
+  min-width: 280px;
+  font-size: 0.94em;
+}
+
+.prose-mobile .tiptap th,
+.prose-mobile .tiptap td {
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+  vertical-align: top;
+  min-width: 60px;
+}
+
+.prose-mobile .tiptap th {
+  background: var(--muted);
+  font-weight: 600;
+  text-align: left;
+}
+
+.prose-mobile .tiptap .selectedCell::after,
+.prose-mobile .tiptap .column-resize-handle {
+  display: none;
+}
+
+/* ── 历史版本 sheet ───────────────────────────────────── */
+
+.history-sheet {
+  max-height: 72vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.history-list {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-bottom: 4px;
+}
+
+.history-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+}
+
+.history-item .history-time {
+  font-size: 15px;
+  color: var(--foreground);
+}
+
+.history-item .history-meta {
+  font-size: var(--m-meta);
+  color: var(--muted-foreground);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.history-preview {
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  margin: 0 8px;
+  padding: 12px;
+  min-height: 120px;
+  max-height: 44vh;
+  border-radius: var(--m-radius-md, 10px);
+  background: var(--muted);
+  font-size: 14px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--foreground);
+}
+
+.history-actions {
+  display: flex;
+  gap: 10px;
+  padding: 12px 8px 4px;
+}
+
+.history-actions .m-btn-primary,
+.history-actions .m-btn-ghost {
+  flex: 1;
+}
+
+/* ── 底部格式工具栏 ───────────────────────────────────── */
+
+.format-toolbar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: calc(var(--m-toolbar-h) + env(safe-area-inset-bottom));
+  padding: 0 4px env(safe-area-inset-bottom);
+  background: var(--card);
+  border-top: 1px solid var(--divider);
+  overflow-x: auto;
+  scrollbar-width: none;
+  transition: transform var(--m-dur) var(--m-ease), opacity 150ms;
+}
+
+.format-toolbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* 键盘弹出：由 JS 写入 --kb-offset，工具栏悬浮键盘上方 */
+.format-toolbar.keyboard-up {
+  transform: translateY(calc(-1 * var(--kb-offset, 0px)));
+  border-top: none;
+  box-shadow: var(--m-shadow);
+}
+
+.tool-btn {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 42px;
+  height: 44px;
+  border-radius: 8px;
+  color: var(--foreground);
+  transition: background 150ms, color 150ms;
+}
+
+.tool-btn:active {
+  background: var(--accent);
+}
+
+.tool-btn.active {
+  color: var(--brand);
+  background: color-mix(in oklch, var(--brand) 12%, transparent);
+}
+
+.tool-btn svg {
+  width: 20px;
+  height: 20px;
+}
+
+.tool-sep {
+  flex-shrink: 0;
+  width: 1px;
+  height: 22px;
+  margin: 0 4px;
+  background: var(--divider);
+}
+
+.tool-heading {
+  font-size: 13px;
+  font-weight: 700;
+  min-width: 42px;
+}
