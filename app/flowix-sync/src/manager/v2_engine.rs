@@ -360,6 +360,18 @@ impl SyncManager {
             .collect())
     }
 
+    /// 待上传的 thread id（云实体 id，`th_` 前缀）。A3 桥接用它组装
+    /// `V2LocalThread` 快照注入 sync pass。
+    pub fn v2_dirty_thread_ids(&self) -> Result<HashSet<String>, SyncError> {
+        Ok(self
+            .store
+            .v2_dirty_entities()?
+            .into_iter()
+            .filter(|dirty| dirty.entity_type == V2EntityType::Thread)
+            .map(|dirty| dirty.entity_id)
+            .collect())
+    }
+
     pub fn v2_retry_delay(&self, now: i64) -> Result<Option<i64>, SyncError> {
         Ok(self
             .store
@@ -495,6 +507,50 @@ impl SyncManager {
             .any(|dirty| dirty.entity_type == V2EntityType::Note && dirty.entity_id == note_id))
     }
 
+    /// thread 本地变更入队（方案 A2/A3/A4 桥接调用点）。thread 是全局实体，
+    /// 不隶属 notebook，也不要求任何笔记本启用——只要已登录云账户即入队。
+    /// fingerprint 用 payload 内容哈希（v2_content_hash），桥接层防抖后快照
+    /// 未变则不产生新 generation。
+    pub fn record_v2_thread_change(
+        &self,
+        thread_id: &str,
+        operation: LocalChangeKind,
+        fingerprint: &str,
+    ) -> Result<bool, SyncError> {
+        if self.store.v2_account()?.is_none() {
+            return Ok(false);
+        }
+        let (_dirty, changed) = self.store.mark_v2_dirty_with_change(
+            V2EntityType::Thread,
+            thread_id,
+            None,
+            match operation {
+                LocalChangeKind::Put => V2OperationKind::Put,
+                LocalChangeKind::Delete => V2OperationKind::Delete,
+            },
+            fingerprint,
+            Utc::now().timestamp_millis(),
+        )?;
+        Ok(changed)
+    }
+
+    pub fn v2_thread_state(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<crate::v2::V2ThreadState>, SyncError> {
+        self.store.v2_thread_state(thread_id)
+    }
+
+    /// 是否已登录云账户（本地 sync.db 有 v2 账户记录）。桥接层对账的
+    /// 前置判据——未登录时不扫不推水位，避免登录后漏扫。
+    pub fn has_v2_account(&self) -> Result<bool, SyncError> {
+        Ok(self.store.v2_account()?.is_some())
+    }
+
+    pub fn v2_all_thread_states(&self) -> Result<Vec<crate::v2::V2ThreadState>, SyncError> {
+        self.store.v2_all_thread_states()
+    }
+
     /// Recover a missing local Markdown file from Flowix Cloud on the next
     /// account sync. This discards only the stale local operation for the
     /// missing file and requests a full bootstrap of its notebook; it never
@@ -576,8 +632,9 @@ impl SyncManager {
         &self,
         notebooks: Vec<V2LocalNotebook>,
         notes: Vec<V2LocalNote>,
+        threads: Vec<crate::v2::V2LocalThread>,
     ) -> Result<V2AccountSyncReport, SyncError> {
-        self.sync_v2_snapshot_at_generation(None, notebooks, notes, self.auth_generation())
+        self.sync_v2_snapshot_at_generation(None, notebooks, notes, threads, self.auth_generation())
             .await
     }
 
@@ -585,7 +642,8 @@ impl SyncManager {
     ///
     /// The cloud changes endpoint is account-wide, so this uses a cursor per
     /// notebook and advances it over the complete account stream while only
-    /// materializing changes belonging to this notebook.
+    /// materializing changes belonging to this notebook. Thread entities are
+    /// global and only sync via [`SyncManager::sync_v2_account`].
     pub async fn sync_v2_notebook(
         &self,
         notebook_id: &str,
@@ -596,6 +654,7 @@ impl SyncManager {
             Some(notebook_id),
             notebooks,
             notes,
+            Vec::new(),
             self.auth_generation(),
         )
         .await
@@ -606,6 +665,7 @@ impl SyncManager {
         notebook_scope: Option<&str>,
         notebooks: Vec<V2LocalNotebook>,
         notes: Vec<V2LocalNote>,
+        threads: Vec<crate::v2::V2LocalThread>,
         generation: u64,
     ) -> Result<V2AccountSyncReport, SyncError> {
         let _guard = self.account_sync_lock.lock().await;
@@ -614,12 +674,26 @@ impl SyncManager {
             .ok_or(SyncError::NotAuthenticated)?;
         let first_token = self.access_token(generation).await?;
         let first = self
-            .sync_v2_account_once(&first_token, &notebooks, &notes, notebook_scope, generation)
+            .sync_v2_account_once(
+                &first_token,
+                &notebooks,
+                &notes,
+                &threads,
+                notebook_scope,
+                generation,
+            )
             .await;
         let result = if first.as_ref().is_err_and(SyncError::is_unauthorized) {
             let refreshed = self.force_refresh_access_token(generation).await?;
-            self.sync_v2_account_once(&refreshed, &notebooks, &notes, notebook_scope, generation)
-                .await
+            self.sync_v2_account_once(
+                &refreshed,
+                &notebooks,
+                &notes,
+                &threads,
+                notebook_scope,
+                generation,
+            )
+            .await
         } else {
             first
         };
@@ -648,6 +722,37 @@ impl SyncManager {
         let _generation = self
             .require_auth_generation(report.auth_generation.ok_or(SyncError::NotAuthenticated)?)?;
         apply()?;
+        self.commit_v2_sync_report_inner(report, notebook_id)
+    }
+
+    /// 两段式（异步 apply 版）：桥接层 apply 可能含异步落库（如桌面
+    /// ThreadManager upsert）。apply 失败则不 commit cursor/state。
+    pub async fn complete_v2_sync_with_apply_async<F, Fut>(
+        &self,
+        report: &V2AccountSyncReport,
+        notebook_id: Option<&str>,
+        apply: F,
+    ) -> Result<(), SyncError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), SyncError>>,
+    {
+        // 校验 generation 后立即释放 guard：apply().await 跨持有点会让
+        // 调用方 future 退化成 !Send。
+        drop(
+            self.require_auth_generation(
+                report.auth_generation.ok_or(SyncError::NotAuthenticated)?,
+            )?,
+        );
+        apply().await?;
+        self.commit_v2_sync_report_inner(report, notebook_id)
+    }
+
+    fn commit_v2_sync_report_inner(
+        &self,
+        report: &V2AccountSyncReport,
+        notebook_id: Option<&str>,
+    ) -> Result<(), SyncError> {
         match notebook_id {
             Some(notebook_id) => self.store.commit_v2_notebook_sync_report(
                 notebook_id,
@@ -656,11 +761,12 @@ impl SyncManager {
                 &report.bootstrapped_notebooks,
                 Utc::now().timestamp_millis(),
             ),
-            None => self.store.commit_v2_sync_report(
+            None => self.store.commit_v2_sync_report_with_threads(
                 &report.remote,
                 report.cursor,
                 &report.bootstrapped_notebooks,
                 Utc::now().timestamp_millis(),
+                report.threads_bootstrapped,
             ),
         }
     }
@@ -731,6 +837,7 @@ impl SyncManager {
                 Vec::new()
             },
             bootstrap_next_page_token: page.next_page_token,
+            threads_bootstrapped: complete,
         })
     }
 }

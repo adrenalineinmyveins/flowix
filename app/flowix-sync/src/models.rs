@@ -26,7 +26,7 @@ pub struct CloudNotebook {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct CloudSession {
+pub struct CloudSession {
     pub access_token: String,
     pub access_token_expires_at: i64,
     pub refresh_token: String,
@@ -35,7 +35,7 @@ pub(crate) struct CloudSession {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct AuthData {
+pub struct AuthData {
     pub user: CloudUser,
     pub session: CloudSession,
 }
@@ -60,30 +60,30 @@ pub struct AppleAuthorization {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct DataEnvelope<T> {
+pub struct DataEnvelope<T> {
     pub data: T,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct RefreshData {
+pub struct RefreshData {
     pub session: CloudSession,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct MeData {
+pub struct MeData {
     pub user: CloudUser,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ApiErrorEnvelope {
+pub struct ApiErrorEnvelope {
     pub error: ApiErrorBody,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ApiErrorBody {
+pub struct ApiErrorBody {
     pub code: String,
     pub message: String,
     pub details: Option<serde_json::Value>,

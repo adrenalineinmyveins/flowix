@@ -1,7 +1,8 @@
 use super::*;
 use crate::v2::{
     V2CloudAccount, V2DirtyEntity, V2EntityType, V2FreezeOperation, V2InflightOperation,
-    V2NoteState, V2NotebookState, V2OperationKind, V2RemoteApply, V2SyncedNotebook, PROTOCOL_EPOCH,
+    V2NoteState, V2NotebookState, V2OperationKind, V2RemoteApply, V2SyncedNotebook, V2ThreadState,
+    PROTOCOL_EPOCH,
 };
 use std::collections::HashMap;
 
@@ -63,8 +64,17 @@ impl SyncStore {
                 last_seq INTEGER NOT NULL CHECK(last_seq >= 0),
                 updated_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS v2_thread_states (
+                thread_id TEXT PRIMARY KEY,
+                revision TEXT NOT NULL,
+                content_hash TEXT,
+                title TEXT NOT NULL DEFAULT '',
+                deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN (0, 1)),
+                last_seq INTEGER NOT NULL CHECK(last_seq >= 0),
+                updated_at INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS v2_dirty_entities (
-                entity_type TEXT NOT NULL CHECK(entity_type IN ('notebook', 'note')),
+                entity_type TEXT NOT NULL CHECK(entity_type IN ('notebook', 'note', 'thread')),
                 entity_id TEXT NOT NULL,
                 notebook_id TEXT,
                 generation INTEGER NOT NULL CHECK(generation > 0),
@@ -75,7 +85,7 @@ impl SyncStore {
             );
             CREATE TABLE IF NOT EXISTS v2_inflight_operations (
                 operation_id TEXT PRIMARY KEY,
-                entity_type TEXT NOT NULL CHECK(entity_type IN ('notebook', 'note')),
+                entity_type TEXT NOT NULL CHECK(entity_type IN ('notebook', 'note', 'thread')),
                 entity_id TEXT NOT NULL,
                 generation INTEGER NOT NULL CHECK(generation > 0),
                 operation_kind TEXT NOT NULL CHECK(operation_kind IN ('put', 'delete')),
@@ -131,6 +141,86 @@ impl SyncStore {
                 [],
             )?;
         }
+        // thread bootstrap 标志（方案 A2）：首次接入需全量 bootstrap 拉云端
+        // threads（changes 游标已在 head，历史 thread 变更流拉不到）。
+        let has_thread_bootstrap = connection
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('v2_sync_state') WHERE name = 'threads_bootstrap_required'",
+                [],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !has_thread_bootstrap {
+            connection.execute(
+                "ALTER TABLE v2_sync_state ADD COLUMN threads_bootstrap_required INTEGER NOT NULL DEFAULT 1",
+                [],
+            )?;
+        }
+        Self::migrate_v2_thread_entity_check(connection)?;
+        Ok(())
+    }
+
+    /// C1 迁移：`v2_dirty_entities` / `v2_inflight_operations` 的
+    /// `CHECK(entity_type IN ('notebook','note'))` 硬编码排除 thread。
+    /// SQLite CHECK 不可 ALTER → 事务内重建两表搬运数据。
+    /// `v2_retry_state` 对 inflight 有 FK，须在事务外关闭外键再重建。
+    /// 幂等：新 schema 的 sqlite_master DDL 已含 'thread' 则跳过。
+    fn migrate_v2_thread_entity_check(connection: &Connection) -> Result<(), SyncError> {
+        let dirty_sql: String = connection.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'v2_dirty_entities'",
+            [],
+            |row| row.get(0),
+        )?;
+        if dirty_sql.contains("'thread'") {
+            return Ok(());
+        }
+        connection.execute_batch("PRAGMA foreign_keys = OFF")?;
+        let result = connection.execute_batch(
+            r#"
+            BEGIN;
+            CREATE TABLE v2_dirty_entities_migrated (
+                entity_type TEXT NOT NULL CHECK(entity_type IN ('notebook', 'note', 'thread')),
+                entity_id TEXT NOT NULL,
+                notebook_id TEXT,
+                generation INTEGER NOT NULL CHECK(generation > 0),
+                operation_kind TEXT NOT NULL CHECK(operation_kind IN ('put', 'delete')),
+                fingerprint TEXT NOT NULL,
+                detected_at INTEGER NOT NULL,
+                PRIMARY KEY(entity_type, entity_id)
+            );
+            INSERT INTO v2_dirty_entities_migrated
+                (entity_type, entity_id, notebook_id, generation, operation_kind, fingerprint, detected_at)
+            SELECT entity_type, entity_id, notebook_id, generation, operation_kind, fingerprint, detected_at
+              FROM v2_dirty_entities;
+            DROP TABLE v2_dirty_entities;
+            ALTER TABLE v2_dirty_entities_migrated RENAME TO v2_dirty_entities;
+
+            CREATE TABLE v2_inflight_operations_migrated (
+                operation_id TEXT PRIMARY KEY,
+                entity_type TEXT NOT NULL CHECK(entity_type IN ('notebook', 'note', 'thread')),
+                entity_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK(generation > 0),
+                operation_kind TEXT NOT NULL CHECK(operation_kind IN ('put', 'delete')),
+                base_revision TEXT,
+                payload_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(entity_type, entity_id, generation)
+            );
+            INSERT INTO v2_inflight_operations_migrated
+                (operation_id, entity_type, entity_id, generation, operation_kind, base_revision, payload_json, created_at)
+            SELECT operation_id, entity_type, entity_id, generation, operation_kind, base_revision, payload_json, created_at
+              FROM v2_inflight_operations;
+            DROP TABLE v2_inflight_operations;
+            ALTER TABLE v2_inflight_operations_migrated RENAME TO v2_inflight_operations;
+            COMMIT;
+            "#,
+        );
+        connection.execute_batch("PRAGMA foreign_keys = ON")?;
+        result.map_err(|error| {
+            let _ = connection.execute_batch("ROLLBACK");
+            SyncError::InvalidState(format!("migrate v2 thread entity check: {error}"))
+        })?;
         Ok(())
     }
 
@@ -163,10 +253,11 @@ impl SyncStore {
                 DELETE FROM v2_dirty_entities;
                 DELETE FROM v2_note_states;
                 DELETE FROM v2_notebook_states;
+                DELETE FROM v2_thread_states;
                 DELETE FROM v2_notebook_sync_state;
                 DELETE FROM v2_synced_notebooks;
-                UPDATE v2_sync_state SET cursor = 0, last_success_at = NULL, updated_at = 0
-                 WHERE singleton = 1;
+                UPDATE v2_sync_state SET cursor = 0, last_success_at = NULL, updated_at = 0,
+                 threads_bootstrap_required = 1 WHERE singleton = 1;
                 "#,
             )?;
         }
@@ -200,11 +291,12 @@ impl SyncStore {
             DELETE FROM v2_dirty_entities;
             DELETE FROM v2_note_states;
             DELETE FROM v2_notebook_states;
+            DELETE FROM v2_thread_states;
             DELETE FROM v2_notebook_sync_state;
             DELETE FROM v2_synced_notebooks;
             DELETE FROM v2_cloud_account;
-            UPDATE v2_sync_state SET cursor = 0, last_success_at = NULL, updated_at = 0
-             WHERE singleton = 1;
+            UPDATE v2_sync_state SET cursor = 0, last_success_at = NULL, updated_at = 0,
+             threads_bootstrap_required = 1 WHERE singleton = 1;
             "#,
         )?;
         transaction.commit()?;
@@ -839,6 +931,33 @@ impl SyncStore {
                     "move requires its own two-head acknowledgement".into(),
                 ));
             }
+            crate::v2::V2PushOperation::ThreadPut { thread, .. } => {
+                Self::write_v2_thread_state_if_newer(
+                    &transaction,
+                    &V2ThreadState {
+                        thread_id: thread.id.clone(),
+                        revision: data.revision.clone(),
+                        content_hash: Some(thread.content_hash.clone()),
+                        title: thread.title.clone(),
+                        deleted: data.deleted,
+                        last_seq: data.sync_seq,
+                    },
+                )?;
+            }
+            crate::v2::V2PushOperation::ThreadDelete { thread_id, .. } => {
+                let current = Self::read_v2_thread_state(&transaction, thread_id)?;
+                Self::write_v2_thread_state_if_newer(
+                    &transaction,
+                    &V2ThreadState {
+                        thread_id: thread_id.clone(),
+                        revision: data.revision.clone(),
+                        content_hash: None,
+                        title: current.as_ref().map_or_default(|value| value.title.clone()),
+                        deleted: data.deleted,
+                        last_seq: data.sync_seq,
+                    },
+                )?;
+            }
         }
         transaction.execute(
             "DELETE FROM v2_inflight_operations WHERE operation_id = ?1",
@@ -1046,7 +1165,7 @@ impl SyncStore {
         bootstrapped_notebooks: &[String],
         applied_at: i64,
     ) -> Result<(), SyncError> {
-        self.commit_v2_sync_report_scoped(remote, cursor, bootstrapped_notebooks, applied_at, None)
+        self.commit_v2_sync_report_scoped(remote, cursor, bootstrapped_notebooks, applied_at, None, false)
     }
 
     pub fn commit_v2_notebook_sync_report(
@@ -1063,6 +1182,25 @@ impl SyncStore {
             bootstrapped_notebooks,
             applied_at,
             Some(notebook_id),
+            false,
+        )
+    }
+
+    pub fn commit_v2_sync_report_with_threads(
+        &self,
+        remote: &[V2RemoteApply],
+        cursor: i64,
+        bootstrapped_notebooks: &[String],
+        applied_at: i64,
+        threads_bootstrapped: bool,
+    ) -> Result<(), SyncError> {
+        self.commit_v2_sync_report_scoped(
+            remote,
+            cursor,
+            bootstrapped_notebooks,
+            applied_at,
+            None,
+            threads_bootstrapped,
         )
     }
 
@@ -1073,6 +1211,7 @@ impl SyncStore {
         bootstrapped_notebooks: &[String],
         applied_at: i64,
         notebook_scope: Option<&str>,
+        threads_bootstrapped: bool,
     ) -> Result<(), SyncError> {
         let mut connection = self.open()?;
         let transaction = connection.transaction()?;
@@ -1161,12 +1300,40 @@ impl SyncStore {
                         },
                     },
                 )?,
+                V2RemoteApply::Thread {
+                    thread_id,
+                    title,
+                    content_hash,
+                    revision,
+                    sync_seq,
+                    deleted,
+                    ..
+                } => {
+                    Self::write_v2_thread_state_if_newer(
+                        &transaction,
+                        &V2ThreadState {
+                            thread_id: thread_id.clone(),
+                            revision: revision.clone(),
+                            content_hash: content_hash.clone(),
+                            title: title.clone(),
+                            deleted: *deleted,
+                            last_seq: *sync_seq,
+                        },
+                    )?;
+                }
             }
         }
         for notebook_id in bootstrapped_notebooks {
             transaction.execute(
                 "UPDATE v2_synced_notebooks SET bootstrap_required = 0, updated_at = ?2 WHERE notebook_id = ?1",
                 params![notebook_id, applied_at],
+            )?;
+        }
+        // thread bootstrap 完成（A2 两段式：apply 成功后才清除标志）
+        if threads_bootstrapped {
+            transaction.execute(
+                "UPDATE v2_sync_state SET threads_bootstrap_required = 0, updated_at = ?1 WHERE singleton = 1",
+                params![applied_at],
             )?;
         }
         if let Some(notebook_id) = notebook_scope {
@@ -1315,6 +1482,170 @@ impl SyncStore {
         if current.is_none_or(|value| value.last_seq <= state.last_seq) {
             Self::write_v2_notebook_state(connection, state)?;
         }
+        Ok(())
+    }
+
+    // ── thread 状态（照 note/notebook 模式）───────────────────
+
+    fn write_v2_thread_state(
+        connection: &Connection,
+        state: &V2ThreadState,
+    ) -> Result<(), SyncError> {
+        connection.execute(
+            r#"INSERT INTO v2_thread_states
+                 (thread_id, revision, content_hash, title, deleted, last_seq, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+               ON CONFLICT(thread_id) DO UPDATE SET revision = excluded.revision,
+                 content_hash = excluded.content_hash, title = excluded.title,
+                 deleted = excluded.deleted, last_seq = excluded.last_seq,
+                 updated_at = excluded.updated_at"#,
+            params![
+                state.thread_id,
+                state.revision,
+                state.content_hash,
+                state.title,
+                state.deleted,
+                state.last_seq,
+                chrono::Utc::now().timestamp_millis()
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn write_v2_thread_state_if_newer(
+        connection: &Connection,
+        state: &V2ThreadState,
+    ) -> Result<(), SyncError> {
+        let current = Self::read_v2_thread_state(connection, &state.thread_id)?;
+        if current.is_none_or(|value| value.last_seq <= state.last_seq) {
+            Self::write_v2_thread_state(connection, state)?;
+        }
+        Ok(())
+    }
+
+    fn read_v2_thread_state(
+        connection: &Connection,
+        thread_id: &str,
+    ) -> Result<Option<V2ThreadState>, SyncError> {
+        connection
+            .query_row(
+                r#"SELECT thread_id, revision, content_hash, title, deleted, last_seq
+                 FROM v2_thread_states WHERE thread_id = ?1"#,
+                [thread_id],
+                |row| {
+                    Ok(V2ThreadState {
+                        thread_id: row.get(0)?,
+                        revision: row.get(1)?,
+                        content_hash: row.get(2)?,
+                        title: row.get(3)?,
+                        deleted: row.get::<_, i64>(4)? != 0,
+                        last_seq: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(SyncError::from)
+    }
+
+    pub fn save_v2_thread_state(&self, state: &V2ThreadState) -> Result<(), SyncError> {
+        Self::write_v2_thread_state(&self.open()?, state)
+    }
+
+    pub fn v2_thread_state(&self, thread_id: &str) -> Result<Option<V2ThreadState>, SyncError> {
+        Self::read_v2_thread_state(&self.open()?, thread_id)
+    }
+
+    pub fn v2_all_thread_states(&self) -> Result<Vec<V2ThreadState>, SyncError> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare("SELECT thread_id FROM v2_thread_states")?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.iter()
+            .map(|id| Self::read_v2_thread_state(&connection, id).map(Option::unwrap))
+            .collect()
+    }
+
+    pub fn v2_threads_bootstrap_required(&self) -> Result<bool, SyncError> {
+        Ok(self.open()?.query_row(
+            "SELECT threads_bootstrap_required FROM v2_sync_state WHERE singleton = 1",
+            [],
+            |row| row.get::<_, i64>(0).map(|value| value != 0),
+        )?)
+    }
+
+    pub fn complete_v2_threads_bootstrap(&self) -> Result<(), SyncError> {
+        self.open()?.execute(
+            "UPDATE v2_sync_state SET threads_bootstrap_required = 0, updated_at = ?1 WHERE singleton = 1",
+            params![chrono::Utc::now().timestamp_millis()],
+        )?;
+        Ok(())
+    }
+
+    // ── thread 409 冲突消解（push.rs 两段式配套）─────────────
+
+    /// 正常 409：丢弃旧 inflight，**保留 dirty**——桥接层 upsert 远端内容
+    /// 后 re-dirty，下轮以远端头为 base 推合并后的全量。
+    pub fn defer_thread_conflict_to_resync(
+        &self,
+        item: &V2InflightOperation,
+    ) -> Result<(), SyncError> {
+        let mut connection = self.open()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM v2_inflight_operations WHERE operation_id = ?1",
+            [&item.operation_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// 远端已删 + 本地 delete：目的已达，按远端头结算并清空队列。
+    pub fn settle_v2_thread_delete_as_remote_head(
+        &self,
+        item: &V2InflightOperation,
+        revision: &str,
+        sync_seq: i64,
+    ) -> Result<(), SyncError> {
+        let mut connection = self.open()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM v2_inflight_operations WHERE operation_id = ?1",
+            [&item.operation_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM v2_dirty_entities WHERE entity_type = 'thread' AND entity_id = ?1",
+            [&item.entity_id],
+        )?;
+        Self::write_v2_thread_state(
+            &transaction,
+            &V2ThreadState {
+                thread_id: item.entity_id.clone(),
+                revision: revision.to_string(),
+                content_hash: None,
+                title: String::new(),
+                deleted: true,
+                last_seq: sync_seq,
+            },
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// 远端已删 + 本地 put：编辑胜过删除。丢弃旧操作、清空本地基线，
+    /// 保留 dirty 让下轮以 null base 复活线程。
+    pub fn reset_v2_thread_for_recreate(&self, item: &V2InflightOperation) -> Result<(), SyncError> {
+        let mut connection = self.open()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM v2_inflight_operations WHERE operation_id = ?1",
+            [&item.operation_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM v2_thread_states WHERE thread_id = ?1",
+            [&item.entity_id],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 

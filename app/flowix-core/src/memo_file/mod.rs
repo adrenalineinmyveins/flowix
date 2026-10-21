@@ -90,8 +90,8 @@ pub use types::{
     ReconcileReport, TodoItem,
 };
 pub use versions::{
-    MemoVersionSource, PathArchiveSummary, PathVersionMeta, MEMO_AUTO_VERSION_INTERVAL_MS,
-    MEMO_VERSION_LIMIT,
+    path_version_content_hash, MemoVersionSource, PathArchiveSummary, PathVersionMeta,
+    MEMO_AUTO_VERSION_INTERVAL_MS, MEMO_VERSION_LIMIT,
 };
 
 /// Compatibility storage façade over notebook registry, Note catalog, media,

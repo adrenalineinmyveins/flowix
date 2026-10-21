@@ -10,6 +10,13 @@ use super::{IsMd, MemoFile};
 pub const MEMO_AUTO_VERSION_INTERVAL_MS: i64 = 60 * 60 * 1000;
 pub const MEMO_VERSION_LIMIT: usize = 20;
 
+/// 路径版本清单使用的正文哈希（SHA-256 小写 hex）。
+/// 与 flowix-sync 的 `v2_content_hash`（base64url）**不是**同一格式，
+/// 跨模块比对版本时必须用这个，否则永远匹配不上。
+pub fn path_version_content_hash(content: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(content))
+}
+
 fn is_safe_version_id(value: &str) -> bool {
     (3..=128).contains(&value.len())
         && value.starts_with("v_")
@@ -206,7 +213,7 @@ impl MemoFile {
         let version_path = archive.join(format!("{version_id}.{extension}"));
         if fs::symlink_metadata(&version_path).ok()?.file_type().is_symlink() { return None; }
         let bytes = fs::read(version_path).ok()?;
-        (format!("{:x}", Sha256::digest(&bytes)) == version.content_hash).then_some(bytes)
+        (path_version_content_hash(&bytes) == version.content_hash).then_some(bytes)
     }
 
     pub fn create_path_version(
@@ -250,7 +257,7 @@ impl MemoFile {
                 }
             }
         }
-        let content_hash = format!("{:x}", Sha256::digest(content));
+        let content_hash = path_version_content_hash(content);
         if let Some(existing) = manifest.versions.iter_mut()
             .find(|version| version.content_hash == content_hash)
         {

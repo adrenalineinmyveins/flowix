@@ -6,6 +6,7 @@ impl SyncManager {
         access_token: &str,
         notebooks: &[V2LocalNotebook],
         notes: &[V2LocalNote],
+        threads: &[crate::v2::V2LocalThread],
         notebook_scope: Option<&str>,
         generation: u64,
     ) -> Result<(), SyncError> {
@@ -15,12 +16,20 @@ impl SyncManager {
             .collect();
         let notes_by_id: HashMap<&str, &V2LocalNote> =
             notes.iter().map(|item| (item.id.as_str(), item)).collect();
+        let threads_by_id: HashMap<&str, &crate::v2::V2LocalThread> = threads
+            .iter()
+            .map(|item| (item.id.as_str(), item))
+            .collect();
         for dirty in self.store.v2_dirty_entities()? {
             drop(self.require_auth_generation(generation)?);
             if let Some(scope) = notebook_scope {
                 let belongs_to_scope = match dirty.entity_type {
                     V2EntityType::Notebook => dirty.entity_id == scope,
                     V2EntityType::Note => dirty.notebook_id.as_deref() == Some(scope),
+                    // thread 是全局实体：单笔记本 scope 同步既不推也不拉
+                    // thread，统一走账户级同步，避免 notebook cursor 消费
+                    // thread change 的语义纠缠。
+                    V2EntityType::Thread => false,
                 };
                 if !belongs_to_scope {
                     continue;
@@ -42,6 +51,10 @@ impl SyncManager {
                 V2EntityType::Note => self
                     .store
                     .v2_note_state(&dirty.entity_id)?
+                    .map(|state| state.revision),
+                V2EntityType::Thread => self
+                    .store
+                    .v2_thread_state(&dirty.entity_id)?
                     .map(|state| state.revision),
             };
             let operation = match (dirty.entity_type, dirty.operation_kind) {
@@ -160,6 +173,58 @@ impl SyncManager {
                     base_revision: base_revision.clone(),
                     note_id: dirty.entity_id.clone(),
                 },
+                (V2EntityType::Thread, V2OperationKind::Put) => {
+                    let Some(thread) = threads_by_id.get(dirty.entity_id.as_str()) else {
+                        // 桥接层未注入该线程快照（A3/A4 接入前或线程已本地
+                        // 消失）：保持 dirty 等待快照，不产出操作。
+                        continue;
+                    };
+                    let payload_json = serde_json::to_vec(&thread.payload).map_err(|error| {
+                        SyncError::InvalidState(format!("serialize thread payload: {error}"))
+                    })?;
+                    let content_hash = crate::v2::v2_content_hash(&payload_json);
+                    let size_bytes = i64::try_from(payload_json.len()).map_err(|_| {
+                        SyncError::InvalidState("thread payload length exceeds i64".into())
+                    })?;
+                    drop(self.require_auth_generation(generation)?);
+                    let reservation = self
+                        .client
+                        .v2_reserve_blob(
+                            access_token,
+                            &content_hash,
+                            size_bytes,
+                            "thread",
+                            "application/json; charset=utf-8",
+                        )
+                        .await?;
+                    drop(self.require_auth_generation(generation)?);
+                    self.client
+                        .v2_upload_blob(
+                            access_token,
+                            &reservation.upload,
+                            "application/json; charset=utf-8",
+                            payload_json,
+                        )
+                        .await?;
+                    V2PushOperation::ThreadPut {
+                        operation_id: operation_id.clone(),
+                        base_revision: base_revision.clone(),
+                        thread: crate::v2::V2ThreadPut {
+                            id: thread.id.clone(),
+                            agent_id: thread.payload.agent_id.clone(),
+                            title: thread.payload.title.clone(),
+                            content_hash,
+                            size_bytes,
+                        },
+                    }
+                }
+                (V2EntityType::Thread, V2OperationKind::Delete) => {
+                    V2PushOperation::ThreadDelete {
+                        operation_id: operation_id.clone(),
+                        base_revision: base_revision.clone(),
+                        thread_id: dirty.entity_id.clone(),
+                    }
+                }
             };
             let payload = serde_json::to_string(&operation).map_err(|error| {
                 SyncError::InvalidState(format!("serialize v2 operation: {error}"))

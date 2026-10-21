@@ -457,3 +457,316 @@ fn clearing_account_removes_user_scoped_sync_state() {
     assert_eq!(store.v2_cursor().unwrap(), 0);
     assert!(store.v2_notebooks(false).unwrap().is_empty());
 }
+
+// ── 方案 A2：thread 实体的迁移与引擎管线 store 层测试 ──────────
+
+/// R2 迁移回归：旧 CHECK(entity_type IN ('notebook','note')) 库升级后，
+/// 两表数据（含 inflight）完整保留且接受 'thread'。
+#[test]
+fn thread_migration_rebuilds_check_constraints_preserving_inflight_data() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("sync.db");
+    {
+        // 手造旧 schema 库（A2 之前的 DDL）
+        let legacy = rusqlite::Connection::open(&db_path).unwrap();
+        legacy
+            .execute_batch(
+                r#"
+                CREATE TABLE v2_dirty_entities (
+                    entity_type TEXT NOT NULL CHECK(entity_type IN ('notebook', 'note')),
+                    entity_id TEXT NOT NULL,
+                    notebook_id TEXT,
+                    generation INTEGER NOT NULL CHECK(generation > 0),
+                    operation_kind TEXT NOT NULL CHECK(operation_kind IN ('put', 'delete')),
+                    fingerprint TEXT NOT NULL,
+                    detected_at INTEGER NOT NULL,
+                    PRIMARY KEY(entity_type, entity_id)
+                );
+                CREATE TABLE v2_inflight_operations (
+                    operation_id TEXT PRIMARY KEY,
+                    entity_type TEXT NOT NULL CHECK(entity_type IN ('notebook', 'note')),
+                    entity_id TEXT NOT NULL,
+                    generation INTEGER NOT NULL CHECK(generation > 0),
+                    operation_kind TEXT NOT NULL CHECK(operation_kind IN ('put', 'delete')),
+                    base_revision TEXT,
+                    payload_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    UNIQUE(entity_type, entity_id, generation)
+                );
+                CREATE TABLE v2_retry_state (
+                    operation_id TEXT PRIMARY KEY REFERENCES v2_inflight_operations(operation_id) ON DELETE CASCADE,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_retry_at INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    updated_at INTEGER NOT NULL
+                );
+                INSERT INTO v2_dirty_entities VALUES ('note', 'note_inflight', 'nb_1', 3, 'put', 'fp', 100);
+                INSERT INTO v2_inflight_operations VALUES ('op_legacy', 'note', 'note_inflight', 3, 'put', 'rev_a', '{}', 100);
+                INSERT INTO v2_retry_state (operation_id, attempts, next_retry_at, updated_at) VALUES ('op_legacy', 2, 50, 100);
+                "#,
+            )
+            .unwrap();
+    }
+    // open 触发 initialize_v2_schema → CHECK 重建迁移
+    let store = SyncStore::new(&db_path).unwrap();
+
+    // 旧数据保留
+    let inflight = store.v2_inflight_due(i64::MAX).unwrap();
+    assert_eq!(inflight.len(), 1);
+    assert_eq!(inflight[0].operation_id, "op_legacy");
+    assert_eq!(inflight[0].attempts, 2);
+    let dirty = store.v2_dirty_entities().unwrap();
+    assert_eq!(dirty.len(), 1);
+    assert_eq!(dirty[0].entity_id, "note_inflight");
+
+    // thread 实体可写入（迁移后 CHECK 接受）
+    store
+        .mark_v2_dirty_with_change(
+            V2EntityType::Thread,
+            "th_migrated",
+            None,
+            V2OperationKind::Put,
+            "fp-thread",
+            200,
+        )
+        .unwrap();
+    assert!(store
+        .v2_dirty_entities()
+        .unwrap()
+        .iter()
+        .any(|item| item.entity_type == V2EntityType::Thread && item.entity_id == "th_migrated"));
+
+    // 二次 open 幂等（不再触发迁移）
+    let store_again = SyncStore::new(&db_path).unwrap();
+    assert_eq!(store_again.v2_dirty_entities().unwrap().len(), 2);
+}
+
+#[test]
+fn thread_put_acknowledgement_and_commit_update_thread_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = SyncStore::new(temp.path().join("sync.db")).unwrap();
+    let operation_id = crate::v2::new_v2_operation_id();
+    store
+        .mark_v2_dirty_with_change(
+            V2EntityType::Thread,
+            "th_ack",
+            None,
+            V2OperationKind::Put,
+            "fp",
+            100,
+        )
+        .unwrap();
+    let dirty = store
+        .v2_dirty_entities()
+        .unwrap()
+        .into_iter()
+        .find(|item| item.entity_id == "th_ack")
+        .unwrap();
+    let payload = serde_json::to_string(&V2PushOperation::ThreadPut {
+        operation_id: operation_id.clone(),
+        base_revision: None,
+        thread: crate::v2::V2ThreadPut {
+            id: "th_ack".into(),
+            agent_id: "agent_loop".into(),
+            title: "会话".into(),
+            content_hash: "hash_1".into(),
+            size_bytes: 10,
+        },
+    })
+    .unwrap();
+    store
+        .freeze_v2_operation(V2FreezeOperation {
+            operation_id: &operation_id,
+            entity_type: V2EntityType::Thread,
+            entity_id: "th_ack",
+            generation: dirty.generation,
+            operation_kind: V2OperationKind::Put,
+            base_revision: None,
+            payload_json: &payload,
+        })
+        .unwrap();
+
+    let operation: V2PushOperation = serde_json::from_str(&payload).unwrap();
+    match &operation {
+        V2PushOperation::ThreadPut { thread, .. } => {
+            store
+                .acknowledge_v2_operation(
+                    &operation_id,
+                    V2EntityType::Thread,
+                    "th_ack",
+                    dirty.generation,
+                    &operation,
+                    &V2OperationData {
+                        entity_type: "thread".into(),
+                        entity_id: thread.id.clone(),
+                        revision: "rev_t1".into(),
+                        sync_seq: 7,
+                        deleted: false,
+                        resolution: "created".into(),
+                        base_revision: None,
+                        replaced_revision: None,
+                        content_hash: Some(thread.content_hash.clone()),
+                        source_revision: None,
+                        source_sync_seq: None,
+                    },
+                )
+                .unwrap();
+        }
+        other => panic!("unexpected operation: {other:?}"),
+    }
+    let state = store.v2_thread_state("th_ack").unwrap().unwrap();
+    assert_eq!(state.revision, "rev_t1");
+    assert_eq!(state.content_hash.as_deref(), Some("hash_1"));
+    assert_eq!(state.title, "会话");
+    assert!(!state.deleted);
+    assert_eq!(state.last_seq, 7);
+    // ack 清空队列
+    assert!(store
+        .v2_dirty_entities()
+        .unwrap()
+        .iter()
+        .all(|item| item.entity_id != "th_ack"));
+    assert!(store.v2_inflight_due(i64::MAX).unwrap().is_empty());
+}
+
+#[test]
+fn thread_remote_apply_commit_updates_state_and_bootstrap_flag() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = SyncStore::new(temp.path().join("sync.db")).unwrap();
+    assert!(store.v2_threads_bootstrap_required().unwrap(), "初始需要 bootstrap");
+
+    let remote = vec![V2RemoteApply::Thread {
+        thread_id: "th_pull".into(),
+        agent_id: "agent_loop".into(),
+        title: "拉取的会话".into(),
+        content_hash: Some("hash_p".into()),
+        content: Some(br#"{"version":1}"#.to_vec()),
+        revision: "rev_p1".into(),
+        sync_seq: 5,
+        deleted: false,
+    }];
+    store
+        .commit_v2_sync_report_with_threads(&remote, 5, &[], 100, true)
+        .unwrap();
+    let state = store.v2_thread_state("th_pull").unwrap().unwrap();
+    assert_eq!(state.revision, "rev_p1");
+    assert!(!store.v2_threads_bootstrap_required().unwrap(), "bootstrap 后清标志");
+}
+
+#[test]
+fn thread_conflict_resolution_paths_manage_dirty_and_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = SyncStore::new(temp.path().join("sync.db")).unwrap();
+    // 造一个 inflight thread put
+    let operation_id = crate::v2::new_v2_operation_id();
+    store
+        .mark_v2_dirty_with_change(
+            V2EntityType::Thread,
+            "th_c",
+            None,
+            V2OperationKind::Put,
+            "fp",
+            100,
+        )
+        .unwrap();
+    let dirty = store
+        .v2_dirty_entities()
+        .unwrap()
+        .into_iter()
+        .find(|item| item.entity_id == "th_c")
+        .unwrap();
+    let payload = serde_json::to_string(&V2PushOperation::ThreadPut {
+        operation_id: operation_id.clone(),
+        base_revision: Some("rev_old".into()),
+        thread: crate::v2::V2ThreadPut {
+            id: "th_c".into(),
+            agent_id: "a".into(),
+            title: "t".into(),
+            content_hash: "h".into(),
+            size_bytes: 1,
+        },
+    })
+    .unwrap();
+    store
+        .freeze_v2_operation(V2FreezeOperation {
+            operation_id: &operation_id,
+            entity_type: V2EntityType::Thread,
+            entity_id: "th_c",
+            generation: dirty.generation,
+            operation_kind: V2OperationKind::Put,
+            base_revision: Some("rev_old"),
+            payload_json: &payload,
+        })
+        .unwrap();
+    let item = store.v2_inflight_due(i64::MAX).unwrap().remove(0);
+
+    // 正常 409：丢 inflight、保留 dirty
+    store.defer_thread_conflict_to_resync(&item).unwrap();
+    assert!(store.v2_inflight_due(i64::MAX).unwrap().is_empty());
+    assert!(store
+        .v2_dirty_entities()
+        .unwrap()
+        .iter()
+        .any(|d| d.entity_id == "th_c"));
+
+    // 远端已删 + 本地 delete：按远端头结算
+    store
+        .mark_v2_dirty_with_change(
+            V2EntityType::Thread,
+            "th_d",
+            None,
+            V2OperationKind::Delete,
+            "fp",
+            100,
+        )
+        .unwrap();
+    let op_d = crate::v2::new_v2_operation_id();
+    let payload_d = serde_json::to_string(&V2PushOperation::ThreadDelete {
+        operation_id: op_d.clone(),
+        base_revision: Some("rev_x".into()),
+        thread_id: "th_d".into(),
+    })
+    .unwrap();
+    store
+        .freeze_v2_operation(V2FreezeOperation {
+            operation_id: &op_d,
+            entity_type: V2EntityType::Thread,
+            entity_id: "th_d",
+            generation: 1,
+            operation_kind: V2OperationKind::Delete,
+            base_revision: Some("rev_x"),
+            payload_json: &payload_d,
+        })
+        .unwrap();
+    let item_d = store.v2_inflight_due(i64::MAX).unwrap().remove(0);
+    store
+        .settle_v2_thread_delete_as_remote_head(&item_d, "rev_deleted_remote", 9)
+        .unwrap();
+    let state = store.v2_thread_state("th_d").unwrap().unwrap();
+    assert!(state.deleted);
+    assert_eq!(state.revision, "rev_deleted_remote");
+    assert!(store
+        .v2_dirty_entities()
+        .unwrap()
+        .iter()
+        .all(|d| d.entity_id != "th_d"));
+
+    // 远端已删 + 本地 put：清基线走复活
+    store
+        .save_v2_thread_state(&crate::v2::V2ThreadState {
+            thread_id: "th_c".into(),
+            revision: "rev_old".into(),
+            content_hash: Some("h".into()),
+            title: "t".into(),
+            deleted: false,
+            last_seq: 1,
+        })
+        .unwrap();
+    store.reset_v2_thread_for_recreate(&item).unwrap();
+    assert!(store.v2_thread_state("th_c").unwrap().is_none(), "基线已清空");
+    assert!(store
+        .v2_dirty_entities()
+        .unwrap()
+        .iter()
+        .any(|d| d.entity_id == "th_c"), "dirty 保留供复活重推");
+}

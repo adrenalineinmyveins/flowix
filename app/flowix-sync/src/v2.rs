@@ -117,6 +117,108 @@ pub struct V2LocalNote {
     pub attachments: Vec<V2LocalAttachment>,
 }
 
+// ── thread 实体（方案 A：整 Thread 单 JSON blob）──────────────
+
+/// thread blob 内容（版本化 JSON）。桌面 thread.db 与移动端精简存储
+/// 的投影；工具块为只读快照，跨端不可重放执行。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct V2ThreadPayload {
+    pub version: i64,
+    pub thread_id: String,
+    pub agent_id: String,
+    pub title: String,
+    pub created_at: i64,
+    #[serde(default)]
+    pub messages: Vec<V2ThreadMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct V2ThreadMessage {
+    /// 全局唯一（双端 uuid v7 生成），消息级合并的恒等键。
+    pub id: String,
+    pub role: String,
+    pub content: String,
+    #[serde(default)]
+    pub reasoning: Option<String>,
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    #[serde(default)]
+    pub tool_input: Option<String>,
+    #[serde(default)]
+    pub tool_data: Option<String>,
+    pub created_at: i64,
+    /// 溯源（"desktop:pi" / "mobile" 等），纯展示用途。
+    #[serde(default)]
+    pub origin: Option<String>,
+}
+
+/// 消息级合并：双方消息按 id 求并集（同 id 保留 local——同源生成概率≈0），
+/// `(createdAt, id)` 稳定排序（跨端无全局序，弃用桌面 sequence）；
+/// title 取最后消息更新的一方；thread 元数据（agentId/createdAt）以 local 为准。
+/// 纯函数，供引擎 409 重推与桥接层 upsert 共用。
+pub fn v2_merge_thread_payloads(
+    local: &V2ThreadPayload,
+    remote: &V2ThreadPayload,
+) -> Result<V2ThreadPayload, String> {
+    if local.thread_id != remote.thread_id {
+        return Err(format!(
+            "cannot merge threads with different ids: {} vs {}",
+            local.thread_id, remote.thread_id
+        ));
+    }
+    let mut merged: std::collections::BTreeMap<&str, &V2ThreadMessage> = BTreeMap::new();
+    let mut local_last = 0_i64;
+    for message in &local.messages {
+        local_last = local_last.max(message.created_at);
+        merged.insert(message.id.as_str(), message);
+    }
+    let mut remote_last = 0_i64;
+    for message in &remote.messages {
+        remote_last = remote_last.max(message.created_at);
+        merged.entry(message.id.as_str()).or_insert(message);
+    }
+    let mut messages: Vec<V2ThreadMessage> = merged
+        .into_values()
+        .map(|message| (*message).clone())
+        .collect();
+    messages.sort_by(|left, right| (left.created_at, &left.id).cmp(&(right.created_at, &right.id)));
+    // title 冲突取"内容更新"的一方：以双方最后一条消息的时间为判据，
+    // 相等（含双方都无消息）时保留 local。
+    let title = if remote_last > local_last {
+        remote.title.clone()
+    } else {
+        local.title.clone()
+    };
+    Ok(V2ThreadPayload {
+        version: local.version.max(remote.version),
+        thread_id: local.thread_id.clone(),
+        agent_id: local.agent_id.clone(),
+        title,
+        created_at: local.created_at,
+        messages,
+    })
+}
+
+/// 引擎 freeze 输入：本地线程快照（payload 序列化后为 blob 内容）。
+#[derive(Debug, Clone)]
+pub struct V2LocalThread {
+    pub id: String,
+    pub payload: V2ThreadPayload,
+}
+
+/// thread 云端基线（照 V2NoteState，不含 notebook 归属）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V2ThreadState {
+    pub thread_id: String,
+    pub revision: String,
+    pub content_hash: Option<String>,
+    pub title: String,
+    pub deleted: bool,
+    pub last_seq: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
 pub struct V2Attachment {
@@ -327,6 +429,18 @@ pub enum V2RemoteApply {
         deleted: bool,
         attachments: Vec<V2RemoteAttachment>,
     },
+    /// 远端（或 409 合并产物）线程到达本端。content 为 payload JSON 字节，
+    /// 由桌面/移动桥 upsert 到本地线程存储（消息按 id 幂等）。
+    Thread {
+        thread_id: String,
+        agent_id: String,
+        title: String,
+        content_hash: Option<String>,
+        content: Option<Vec<u8>>,
+        revision: String,
+        sync_seq: i64,
+        deleted: bool,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -340,6 +454,9 @@ pub struct V2AccountSyncReport {
     pub remote: Vec<V2RemoteApply>,
     pub bootstrapped_notebooks: Vec<String>,
     pub bootstrap_next_page_token: Option<String>,
+    /// 本轮 bootstrap 已含全部 threads（A2）；commit 时清除
+    /// threads_bootstrap_required 标志。apply 失败则下轮重新 bootstrap。
+    pub threads_bootstrapped: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -347,6 +464,9 @@ pub struct V2AccountSyncReport {
 pub enum V2EntityType {
     Notebook,
     Note,
+    /// AI 对话线程（整线程消息 JSON 为一个内容寻址 blob）。
+    /// A1 起服务端支持；客户端引擎接入在 A2。
+    Thread,
 }
 
 impl V2EntityType {
@@ -354,6 +474,7 @@ impl V2EntityType {
         match self {
             Self::Notebook => "notebook",
             Self::Note => "note",
+            Self::Thread => "thread",
         }
     }
 
@@ -361,6 +482,7 @@ impl V2EntityType {
         match value {
             "notebook" => Some(Self::Notebook),
             "note" => Some(Self::Note),
+            "thread" => Some(Self::Thread),
             _ => None,
         }
     }
@@ -454,6 +576,8 @@ pub struct V2Change {
     #[serde(default)]
     pub filename: Option<String>,
     #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
     pub content_hash: Option<String>,
     #[serde(default)]
     pub size_bytes: Option<i64>,
@@ -480,9 +604,29 @@ pub struct V2Bootstrap {
     pub server_time: i64,
     pub notebooks: Vec<V2BootstrapNotebook>,
     pub notes: Vec<V2BootstrapNote>,
+    /// AI 对话线程（A1 服务端起输出；`#[serde(default)]` 保证新客户端
+    /// 可读旧服务端、旧客户端反序列化自然忽略）。
+    #[serde(default)]
+    pub threads: Vec<V2BootstrapThread>,
     pub usage: V2Usage,
     #[serde(default)]
     pub next_page_token: Option<String>,
+}
+
+/// bootstrap 输出的线程快照行（消息体按 content_hash 走 blob 下载）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct V2BootstrapThread {
+    pub id: String,
+    pub agent_id: String,
+    pub title: String,
+    pub revision: String,
+    pub content_hash: Option<String>,
+    pub size_bytes: i64,
+    pub deleted: bool,
+    pub sync_seq: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -672,6 +816,29 @@ pub enum V2PushOperation {
         to_note_id: String,
         to_path: String,
     },
+    #[serde(rename = "thread.put")]
+    ThreadPut {
+        operation_id: String,
+        base_revision: Option<String>,
+        thread: V2ThreadPut,
+    },
+    #[serde(rename = "thread.delete")]
+    ThreadDelete {
+        operation_id: String,
+        base_revision: Option<String>,
+        thread_id: String,
+    },
+}
+
+/// thread.put 的线程元数据（消息体走内容寻址 blob，与 note 同款）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct V2ThreadPut {
+    pub id: String,
+    pub agent_id: String,
+    pub title: String,
+    pub content_hash: String,
+    pub size_bytes: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -747,9 +914,169 @@ pub struct V2PushResult {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_v2_attachments, new_v2_operation_id, v2_content_hash, v2_local_content_diverged,
-        v2_path_note_id, V2NotePut, V2PushOperation,
+        collect_v2_attachments, new_v2_operation_id, v2_content_hash,
+        v2_local_content_diverged, v2_merge_thread_payloads, v2_path_note_id, V2NotePut,
+        V2PushOperation, V2ThreadMessage, V2ThreadPayload,
     };
+
+    fn thread_message(id: &str, role: &str, created_at: i64) -> V2ThreadMessage {
+        V2ThreadMessage {
+            id: id.into(),
+            role: role.into(),
+            content: format!("content-{id}"),
+            reasoning: None,
+            tool_name: None,
+            tool_input: None,
+            tool_data: None,
+            created_at,
+            origin: None,
+        }
+    }
+
+    fn thread_payload(id: &str, title: &str, messages: Vec<V2ThreadMessage>) -> V2ThreadPayload {
+        V2ThreadPayload {
+            version: 1,
+            thread_id: id.into(),
+            agent_id: "builtin.chat".into(),
+            title: title.into(),
+            created_at: 1,
+            messages,
+        }
+    }
+
+    #[test]
+    fn thread_merge_takes_message_id_union_sorted_by_created_at() {
+        // 双端交错并发：A 持 msg_1/msg_2，B 持 msg_1（同源）/msg_3（并发新增）
+        let local = thread_payload(
+            "th_x",
+            "本地标题",
+            vec![
+                thread_message("msg_1", "user", 100),
+                thread_message("msg_2", "assistant", 200),
+            ],
+        );
+        let remote = thread_payload(
+            "th_x",
+            "远端标题",
+            vec![
+                thread_message("msg_1", "user", 100),
+                thread_message("msg_3", "assistant", 150),
+            ],
+        );
+        let merged = v2_merge_thread_payloads(&local, &remote).unwrap();
+        let ids: Vec<&str> = merged.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["msg_1", "msg_3", "msg_2"], "并集 + (createdAt,id) 序");
+        // remote 最后消息（150）早于 local（200）→ title 取 local
+        assert_eq!(merged.title, "本地标题");
+        assert_eq!(merged.agent_id, "builtin.chat");
+    }
+
+    #[test]
+    fn thread_merge_prefers_remote_title_when_remote_is_newer() {
+        let local = thread_payload(
+            "th_x",
+            "旧标题",
+            vec![thread_message("msg_1", "user", 100)],
+        );
+        let remote = thread_payload(
+            "th_x",
+            "新标题",
+            vec![
+                thread_message("msg_1", "user", 100),
+                thread_message("msg_9", "assistant", 900),
+            ],
+        );
+        let merged = v2_merge_thread_payloads(&local, &remote).unwrap();
+        assert_eq!(merged.title, "新标题");
+        assert_eq!(merged.messages.len(), 2);
+    }
+
+    #[test]
+    fn thread_merge_breaks_created_at_ties_by_message_id() {
+        // 同刻双发（R3）：createdAt 相等时按 id 稳定排序
+        let local = thread_payload(
+            "th_x",
+            "l",
+            vec![thread_message("msg_b", "user", 500)],
+        );
+        let remote = thread_payload(
+            "th_x",
+            "r",
+            vec![thread_message("msg_a", "assistant", 500)],
+        );
+        let merged = v2_merge_thread_payloads(&local, &remote).unwrap();
+        let ids: Vec<&str> = merged.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["msg_a", "msg_b"]);
+    }
+
+    #[test]
+    fn thread_merge_rejects_cross_thread_merge() {
+        let left = thread_payload("th_1", "a", Vec::new());
+        let right = thread_payload("th_2", "b", Vec::new());
+        assert!(v2_merge_thread_payloads(&left, &right).is_err());
+    }
+
+    #[test]
+    fn thread_merge_scales_to_a_thousand_interleaved_messages() {
+        let mut local_messages = Vec::new();
+        let mut remote_messages = Vec::new();
+        for index in 0..1000 {
+            if index % 2 == 0 {
+                local_messages.push(thread_message(&format!("msg_l_{index}"), "user", index));
+            } else {
+                remote_messages.push(thread_message(&format!("msg_r_{index}"), "user", index));
+            }
+        }
+        let local = thread_payload("th_big", "big", local_messages);
+        let remote = thread_payload("th_big", "big", remote_messages);
+        let merged = v2_merge_thread_payloads(&local, &remote).unwrap();
+        assert_eq!(merged.messages.len(), 1000, "交错千条零丢失");
+        assert!(merged.messages.windows(2).all(|pair| {
+            (pair[0].created_at, &pair[0].id) <= (pair[1].created_at, &pair[1].id)
+        }));
+    }
+
+    #[test]
+    fn thread_payload_roundtrips_camel_case_json() {
+        let payload = thread_payload(
+            "th_wire",
+            "Wire",
+            vec![V2ThreadMessage {
+                id: "msg_w".into(),
+                role: "tool".into(),
+                content: "done".into(),
+                reasoning: Some("thinking".into()),
+                tool_name: Some("search".into()),
+                tool_input: Some("{}".into()),
+                tool_data: Some("<result>".into()),
+                created_at: 42,
+                origin: Some("desktop:pi".into()),
+            }],
+        );
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["threadId"], "th_wire");
+        assert_eq!(json["messages"][0]["toolName"], "search");
+        assert_eq!(json["messages"][0]["createdAt"], 42);
+        let parsed: V2ThreadPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, payload);
+    }
+
+    #[test]
+    fn thread_payload_tolerates_missing_optional_fields() {
+        // 旧端/未来端消息缺 optional 字段（serde default）不炸反序列化
+        let json = serde_json::json!({
+            "version": 1,
+            "threadId": "th_min",
+            "agentId": "agent_loop",
+            "title": "t",
+            "createdAt": 1,
+            "messages": [{ "id": "m1", "role": "user", "content": "hi", "createdAt": 2 }]
+        });
+        let parsed: V2ThreadPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.messages.len(), 1);
+        assert!(parsed.messages[0].origin.is_none());
+        assert!(parsed.messages[0].tool_name.is_none());
+    }
 
     #[test]
     fn cloud_note_id_tracks_notebook_relative_path_without_memo_id() {
