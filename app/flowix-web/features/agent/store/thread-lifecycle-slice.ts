@@ -14,6 +14,7 @@ import {
   normalizeThreadTitle,
 } from "@features/agent/store/thread-titles";
 import { isKnownProductThreadId, resolveProductThreadId } from "@features/agent/store/external-session";
+import { ensureThreadsChangedSubscription } from "@features/agent/store/threads-cloud-sync";
 import { useDocumentStore } from "@features/document/store/document-store";
 import { useWorkspaceRestoreStore } from "@features/workspace/store/workspace-restore-store";
 import { closeAgentTarget } from "@features/workspace/use-cases/workspace-navigation";
@@ -251,6 +252,14 @@ export function createThreadLifecycleSlice(
     loadAgentThread: (typeKey, threadId) => loadThread(get, typeKey, threadId),
     loadLocalAgentThreadList: async (typeKey) => {
       const type = getAgentType(typeKey);
+      // 云端线程到达（A3 桥）时刷新产品线程列表；订阅幂等，由列表加载路径挂载。
+      ensureThreadsChangedSubscription(() => {
+        const store = get();
+        void store.loadThreadList().catch(() => undefined);
+        for (const key of ["pi", "opencode", "gemini", "openclaw"] as const) {
+          void store.loadLocalAgentThreadList(key).catch(() => undefined);
+        }
+      });
       if (["deepseek-harness", "codex", "claude", "hermes"].includes(type.key)) return;
       await loadThreadList(get, type.key, type.name);
     },

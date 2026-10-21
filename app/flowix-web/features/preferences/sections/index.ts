@@ -13,6 +13,7 @@ export { AgentSection } from '@features/preferences/sections/agent';
 export { AgentsSection } from '@features/preferences/sections/agents';
 export { DshSettingsSection } from '@features/preferences/sections/dsh';
 export { PiSettingsSection } from '@features/preferences/sections/pi';
+export { MobileChatSettingsSection } from '@features/preferences/sections/mobile-chat';
 export { ShortcutsSection } from '@features/preferences/sections/shortcuts';
 export { CliSection } from '@features/preferences/sections/cli';
 export { McpSection } from '@features/preferences/sections/mcp';

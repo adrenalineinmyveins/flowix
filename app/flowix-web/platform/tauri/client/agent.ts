@@ -234,6 +234,8 @@ export interface AgentRuntimeStatus {
   opencode: AgentRuntimeAvailability;
   pi: AgentRuntimeAvailability;
   'deepseek-harness': AgentRuntimeAvailability;
+  // 云同步移动端会话无本地 runtime，恒为不可用。
+  mobile: AgentRuntimeAvailability;
 }
 
 export interface CodexRateLimitWindow {
@@ -288,8 +290,11 @@ export interface AgentExternalEntry {
 }
 
 export const agent = {
-  runtimeStatus: () =>
-    invoke<AgentRuntimeStatus>('agent_runtime_status'),
+  runtimeStatus: async () => {
+    // Rust 端无 mobile runtime 概念；恒补 false（云同步会话不可本地运行）。
+    const status = await invoke<Omit<AgentRuntimeStatus, 'mobile'>>('agent_runtime_status');
+    return { ...status, mobile: { available: false } };
+  },
   openCodexCliInstallTerminal: () =>
     invoke<void>('open_codex_cli_install_terminal'),
   openCodexConfig: () =>
@@ -312,6 +317,12 @@ export const agent = {
     invoke<string | null>('read_cached_agent_image', { path }),
   chatStream: (threadId: string, message: AgentUserMessage) =>
     invoke<ChatResponse>('chat_with_agent_stream', { threadId, message }),
+  // ── 云同步跨端会话（mobile runtime）provider 配置 ──
+  // 平文件 <config_dir>/mobile-agent-provider.json（API key 不上云）。
+  mobileProviderGet: () =>
+    invoke<{ baseUrl: string; apiKey: string; model: string }>('mobile_provider_get'),
+  mobileProviderSet: (config: { baseUrl: string; apiKey: string; model: string }) =>
+    invoke<{ baseUrl: string; apiKey: string; model: string }>('mobile_provider_set', { config }),
   steerChat: (threadId: string, message: AgentUserMessage, clientUserMessageId: string, deliveryMode: 'steer' | 'follow_up' = 'steer') =>
     invoke<void>('steer_agent_stream', { threadId, message, clientUserMessageId, deliveryMode }),
   promotePiFollowUpToSteer: (threadId: string, clientUserMessageId: string) =>

@@ -19,7 +19,9 @@ export type AgentTypeKey =
   | "openclaw"
   | "opencode"
   | "pi"
-  | "deepseek-harness";
+  | "deepseek-harness"
+  // 云同步下来的移动端会话（只读展示，无本地 runtime）
+  | "mobile";
 
 export interface AgentType {
   key: AgentTypeKey;

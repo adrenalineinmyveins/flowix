@@ -1,4 +1,4 @@
-﻿import type { Node as ProseMirrorNode } from '@tiptap/pm/model';
+import type { Node as ProseMirrorNode } from '@tiptap/pm/model';
 import type { NodeView as ProseMirrorNodeView, EditorView, Decoration } from '@tiptap/pm/view';
 import {
     Node,
@@ -122,6 +122,7 @@ class ImageView implements ProseMirrorNodeView {
     private resizeCaptureTarget: HTMLButtonElement | null = null;
     private lastResizeWidthPercent: number | null = null;
     private isResizing = false;
+    private filenameFallbackTried = false;
 
     constructor(node: ProseMirrorNode, view: EditorView, getPos: () => number, decorations: readonly Decoration[]) {
         this.node = node;
@@ -224,9 +225,28 @@ class ImageView implements ProseMirrorNodeView {
                 this.dom.classList.remove('is-loaded');
                 this.dom.classList.add('is-error');
                 this.setFallbackVisible(true);
+                // 跨设备回落：storageKey 是对方机器的绝对路径，本机 404 时
+                // 按文件名找已同步落盘的本地附件副本（只试一次，防循环）
+                void this.tryFilenameFallback(img);
             }, { once: true });
             img.src = src;
         });
+    }
+
+    private async tryFilenameFallback(img: HTMLImageElement): Promise<void> {
+        if (this.filenameFallbackTried) return;
+        this.filenameFallbackTried = true;
+        const { storageMode, storageKey } = this.node.attrs;
+        if (storageMode !== 'attachment' || typeof storageKey !== 'string' || !storageKey) return;
+        const name = storageKey.replace(/\\/g, '/').split('/').pop() ?? '';
+        if (!name || name.startsWith('.')) return;
+        try {
+            const resolved = await invoke<string | null>('resolve_attachment_filename', { fileName: name });
+            if (!resolved || !img.isConnected) return;
+            this.scheduleImageLoad(img, assetUrl(resolved));
+        } catch (error) {
+            console.warn('[ImageAttachment] filename fallback failed:', error);
+        }
     }
 
     private setFallbackVisible(visible: boolean): void {

@@ -226,6 +226,14 @@ const AGENT_RUNTIME_SPECS: Record<AgentTypeKey, AgentRuntimeSpec> = {
       },
     }),
   },
+  // mobile: 云同步的跨端会话，无本地 runtime，设置区/权限档位全空。
+  mobile: {
+    typeKey: "mobile",
+    emptySettings: [],
+    accessOptions: NO_ACCESS_OPTIONS,
+    workspace: { selectBeforeFirstRun: false, switchWhileRunning: false, switchBetweenRuns: false, switchRequiresRuntimeRestart: false, preservesConversationSession: true },
+    buildRuntimeConfig: () => ({}),
+  },
 };
 
 export function getAgentRuntimeSpec(typeKey: AgentTypeKey): AgentRuntimeSpec {

@@ -39,6 +39,7 @@ export const PREFERENCE_TAB_GROUPS: readonly PreferencesTabGroup[] = [
     tabs: [
       { id: 'pi', labelKey: 'preferences.tabs.pi', icon: <AgentIcon typeKey="pi" alt="" className="w-4 h-4 object-contain" /> },
       { id: 'dsh', labelKey: 'preferences.tabs.dsh', icon: <AgentIcon typeKey="deepseek-harness" alt="" className="w-4 h-4 object-contain" /> },
+      { id: 'mobileChat', labelKey: 'preferences.tabs.mobileChat', icon: <AgentIcon typeKey="mobile" alt="" className="w-4 h-4 object-contain" /> },
       { id: 'aiAgent', labelKey: 'preferences.tabs.aiAgent', icon: <StarFourIcon className="w-4 h-4" weight="regular" /> },
       {
         id: 'mcp',

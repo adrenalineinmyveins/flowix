@@ -7,6 +7,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build && node scripts/check-web-bundle.mjs",
+    "build:mobile": "vite build --config app/flowix-mobile/frontend/vite.config.ts",
     "clean": "rm -rf .build dist app/target app/flowix-desktop/binaries",
     "test": "vitest run",
     "test:rust": "cargo test --manifest-path app/Cargo.toml --workspace --lib",

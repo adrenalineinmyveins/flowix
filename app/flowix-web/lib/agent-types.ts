@@ -15,6 +15,7 @@ import iconOpenClaw from '@/assets/icon-openclaw.svg';
 import iconOpenCode from '@/assets/icon-opencode.svg';
 import iconDeepSeek from '@/assets/icon-deepseek.svg';
 import iconPi from '@/assets/icon-pi.svg';
+import iconMobile from '@/assets/icon-mobile.svg';
 
 // DSH is an optional separately installed runtime. Keep the product default on
 // an external CLI path so users who never install DSH do not create unusable
@@ -29,6 +30,7 @@ export const THEME_ADAPTIVE_AGENT_ICON_KEYS = new Set<AgentTypeKey>([
   'deepseek-harness',
   'opencode',
   'hermes',
+  'mobile',
 ]);
 
 export function isThemeAdaptiveAgentIcon(typeKey: AgentTypeKey): boolean {
@@ -163,6 +165,17 @@ export const AGENT_TYPES: AgentType[] = [
     nameKey: 'agent.types.openclaw.name',
     descKey: 'agent.types.openclaw.desc',
     releaseStatus: 'coming-soon',
+    capabilities: SIMPLE_CLI_CAPABILITIES,
+  },
+  // 云同步下来的移动端会话：跨笔记本全局可见的只读对话（无本地 runtime，
+  // 不出现在新建会话菜单；消息直接读 thread_messages 的产品线程投影）。
+  {
+    key: 'mobile',
+    icon: iconMobile,
+    name: 'Mobile',
+    desc: 'Conversations synced from Flowix mobile',
+    nameKey: 'agent.types.mobile.name',
+    descKey: 'agent.types.mobile.desc',
     capabilities: SIMPLE_CLI_CAPABILITIES,
   },
 ];

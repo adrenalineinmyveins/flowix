@@ -26,7 +26,6 @@ import {
   CloudDownload,
   Loader2,
 } from 'lucide-react';
-import { useExperimentalMode } from '@platform/tauri/use-experimental-mode';
 import { Textarea } from '@shared/ui/textarea';
 import { WindowsTitlebarControls } from '@shared/window-titlebar-controls';
 import { isMac } from '@features/shortcuts';
@@ -182,7 +181,6 @@ export function NotebookDialogs({
   onCancelEdit,
 }: NotebookDialogsProps) {
   const { t } = useI18n();
-  const experimental = useExperimentalMode();
   const {
     templates: notebookTemplates,
     status: notebookTemplateStatus,
@@ -427,15 +425,13 @@ export function NotebookDialogs({
                   {editingNotebook?.path ?? ''}
                 </div>
               </div>
-              {experimental && (
-                <NotebookCloudSyncToggle
-                  checked={editNotebookCloudSync}
-                  available={cloudSyncAvailable}
-                  disabled={editSaving}
-                  onChange={onEditNotebookCloudSyncChange}
-                  onUnavailableClick={onEditNotebookCloudSyncUnavailable}
-                />
-              )}
+              <NotebookCloudSyncToggle
+                checked={editNotebookCloudSync}
+                available={cloudSyncAvailable}
+                disabled={editSaving}
+                onChange={onEditNotebookCloudSyncChange}
+                onUnavailableClick={onEditNotebookCloudSyncUnavailable}
+              />
             </div>
             <div className="min-w-0 flex h-full flex-col md:border-l md:border-[var(--border)] md:pl-6">
               <div className="flex items-center gap-1.5 pb-[0.35rem] pt-[0.35rem] text-sm font-semibold leading-[1.2] text-[var(--foreground)]">

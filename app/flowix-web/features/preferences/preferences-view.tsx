@@ -13,6 +13,7 @@ import {
 	AgentsSection,
 	DshSettingsSection,
 	PiSettingsSection,
+	MobileChatSettingsSection,
 	ShortcutsSection,
 	CliSection,
 	McpSection,
@@ -119,7 +120,7 @@ export function PreferencesView({ initialTab }: PreferencesViewProps) {
 			...group,
 			tabs: experimental
 				? group.tabs
-				: group.tabs.filter((tab) => !['cloudSync', 'connections', 'tools', 'history'].includes(tab.id)),
+				: group.tabs.filter((tab) => !['connections', 'tools', 'history'].includes(tab.id)),
 		})),
 		[experimental],
 	);
@@ -128,14 +129,14 @@ export function PreferencesView({ initialTab }: PreferencesViewProps) {
 	useEffect(() => {
 		if (initialTab) {
 			const normalizedTab = normalizeInitialTab(initialTabName ?? initialTab);
-			if (normalizedTab && (normalizedTab !== 'cloudSync' || experimental)) {
+			if (normalizedTab) {
 				setActiveTab(normalizedTab);
 			}
 		}
-	}, [experimental, initialTab]);
+	}, [initialTab]);
 
 	useEffect(() => {
-		if (!experimental && ['cloudSync', 'connections', 'tools', 'history'].includes(activeTab)) {
+		if (!experimental && ['connections', 'tools', 'history'].includes(activeTab)) {
 			setActiveTab('general');
 		}
 	}, [activeTab, experimental]);
@@ -199,7 +200,8 @@ export function PreferencesView({ initialTab }: PreferencesViewProps) {
 									{activeTab === 'noteSettings' && <NoteSettingsSection />}
 									{activeTab === 'aiAgent' && <AgentsSection />}
 									{activeTab === 'dsh' && <DshSettingsSection autoUpdate={autoUpdateDsh} />}
-									{activeTab === 'pi' && <PiSettingsSection />}
+								{activeTab === 'pi' && <PiSettingsSection />}
+								{activeTab === 'mobileChat' && <MobileChatSettingsSection />}
 									{activeTab === 'shortcuts' && <ShortcutsSection />}
 									{activeTab === 'mcp' && (
 										<div className="space-y-8">
@@ -208,7 +210,7 @@ export function PreferencesView({ initialTab }: PreferencesViewProps) {
 										</div>
 									)}
 									{activeTab === 'connections' && <ConnectionsSection />}
-									{experimental && activeTab === 'cloudSync' && <CloudSyncSection />}
+									{activeTab === 'cloudSync' && <CloudSyncSection />}
 									{activeTab === 'tools' && (
 										<div className="space-y-8">
 											<PlaceholderSection

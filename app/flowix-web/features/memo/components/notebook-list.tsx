@@ -20,7 +20,6 @@ import {
   listenToCloudSyncStatusChanges,
   type CloudSyncStatus,
 } from '@platform/tauri/client';
-import { useExperimentalMode } from '@platform/tauri/use-experimental-mode';
 import { cloudSyncErrorMessage } from '@platform/tauri/errors';
 import { NotebookSelectorPopup } from '@features/shell/components/status-bar/notebook-selector-popup';
 
@@ -63,7 +62,6 @@ export function NotebookList({
   onCreateNotebook,
 }: NotebookListProps) {
   const { t } = useI18n();
-  const experimental = useExperimentalMode();
   const setNotebooks = useNoteStore((s) => s.setNotebooks);
   const notebooksInitialized = useNoteStore((s) => s.notebooksInitialized);
   const [notebookPopupOpen, setNotebookPopupOpen] = useState(false);
@@ -78,11 +76,6 @@ export function NotebookList({
   );
 
   const refreshCloudSyncedNotebookIds = useCallback(() => {
-    if (!experimental) {
-      setCloudSyncAvailable(false);
-      setCloudSyncedNotebookIds(new Set());
-      return;
-    }
     const requestId = ++cloudStateRequestRef.current;
     void Promise.all([cloud.getState(), cloud.listNotebookStates()])
       .then(([cloudState, links]) => {
@@ -97,22 +90,20 @@ export function NotebookList({
         setCloudSyncAvailable(false);
         setCloudSyncedNotebookIds(new Set());
       });
-  }, [experimental]);
+  }, []);
 
   useEffect(() => {
     refreshCloudSyncedNotebookIds();
   }, [notebooks, refreshCloudSyncedNotebookIds]);
 
   useEffect(() => {
-    if (!experimental) return;
     return listenToCloudStateChanges((cloudState) => {
       setCloudSyncAvailable(cloudState.authenticated);
       refreshCloudSyncedNotebookIds();
     });
-  }, [experimental, refreshCloudSyncedNotebookIds]);
+  }, [refreshCloudSyncedNotebookIds]);
 
   useEffect(() => {
-    if (!experimental) return;
     return listenToCloudSyncStatusChanges((status) => {
       setCloudSyncStatuses((previous) => {
         const current = previous.get(status.notebookId);
@@ -124,10 +115,10 @@ export function NotebookList({
         return next;
       });
     });
-  }, [experimental]);
+  }, []);
 
   useEffect(() => {
-    if (!experimental || cloudSyncedNotebookIds.size === 0) return;
+    if (cloudSyncedNotebookIds.size === 0) return;
     const syncAfterConnectivityReturns = () => {
       void cloud.syncNow().catch(() => {
         // The native sync status event owns user-visible error reporting.
@@ -142,7 +133,7 @@ export function NotebookList({
       window.removeEventListener('online', syncAfterConnectivityReturns);
       document.removeEventListener('visibilitychange', syncAfterForeground);
     };
-  }, [cloudSyncedNotebookIds, experimental]);
+  }, [cloudSyncedNotebookIds]);
 
   return (
     <div className="space-y-0.5 pb-1">

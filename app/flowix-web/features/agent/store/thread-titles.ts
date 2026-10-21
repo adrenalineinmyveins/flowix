@@ -25,6 +25,7 @@ const AGENT_SESSION_TITLE_KEYS: Record<AgentTypeKey, I18nKey> = {
   opencode: "agent.opencodeSession.title",
   pi: "agent.piSession.title",
   "deepseek-harness": "agent.deepseekHarnessSession.title",
+  mobile: "agent.mobileSession.title",
 };
 
 const AGENT_THREAD_CARD_TITLE_KEYS: Record<AgentTypeKey, I18nKey> = {

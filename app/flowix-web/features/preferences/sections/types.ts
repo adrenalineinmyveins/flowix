@@ -25,6 +25,7 @@ export type SettingsTab =
   | 'codex'
   | 'aiAgent'
   | 'plugins'
+  | 'mobileChat'
   // 旧 id, 仍在 normalizeInitialTab 里重定向使用。
   | 'agent'
   | 'agents'

@@ -266,7 +266,8 @@ export function AgentConversationList({ isActive = true }: AgentConversationList
     for (const instance of Object.values(instances)) {
       if (filterType && instance.agentType !== filterType) continue;
       const notebookId = instance.source?.notebookId;
-      if (currentNotebookId && notebookId !== currentNotebookId) continue;
+      // mobile 会话是云同步的跨端对话，不属于任何本地笔记本 → 全局可见
+      if (currentNotebookId && instance.agentType !== 'mobile' && notebookId !== currentNotebookId) continue;
       merged = mergeLiveConversation(merged, instance);
     }
     return merged.orderedIdentities
@@ -284,9 +285,11 @@ export function AgentConversationList({ isActive = true }: AgentConversationList
 
   // 按当前笔记本严格圈定对话列表 —— 只有归属当前笔记本的会话可见。
   // 未归属笔记本的历史数据不应出现在任何笔记本列表中；未选中笔记本时退化为全量。
+  // 例外：mobile 会话（云同步跨端对话）无笔记本归属，全局可见。
   const scopedConversations = useMemo(() => {
     if (!currentNotebookId) return conversations;
     return conversations.filter((instance) => {
+      if (instance.agentType === 'mobile') return true;
       const notebookId = instance.source?.notebookId;
       return notebookId === currentNotebookId;
     });
