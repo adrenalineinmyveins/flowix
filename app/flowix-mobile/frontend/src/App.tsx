@@ -101,10 +101,19 @@ export function App() {
     };
     window.addEventListener('popstate', onPopState);
 
+    // 唤起立即补拉：切回前台 0 等待对端新消息（后台 webview 冻结时事件不触发）
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        void api.syncNow().catch(() => {});
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+
     return () => {
       unlisten.then((fn) => fn());
       unlistenCache.then((fn) => fn());
       window.removeEventListener('popstate', onPopState);
+      document.removeEventListener('visibilitychange', onVisibility);
     };
   }, [enterApp]);
 

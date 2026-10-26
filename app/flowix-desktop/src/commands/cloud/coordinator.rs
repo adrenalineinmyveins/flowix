@@ -107,7 +107,8 @@ impl SyncActivity {
 
 const AUTO_SYNC_DEBOUNCE: Duration = Duration::from_millis(1_200);
 const AUTO_SYNC_MAX_WAIT: Duration = Duration::from_secs(5);
-const CLOUD_POLL_INTERVAL: Duration = Duration::from_secs(30);
+/// 桌面电源充足：10s 轮询让跨端消息（含移动端 builtin chat 回路）秒级可见。
+const CLOUD_POLL_INTERVAL: Duration = Duration::from_secs(10);
 const CLOUD_SYNC_PASS_TIMEOUT: Duration = Duration::from_secs(180);
 const MANUAL_SYNC_TIMEOUT: Duration = Duration::from_secs(300);
 
