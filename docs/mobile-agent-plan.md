@@ -257,3 +257,28 @@ CREATE TABLE thread_revisions (...);  -- 照 note_revisions（对话历史免费
 **临时规避（待验证）**：关闭桌面对应外部文档标签（恢复会话不再打开它）后观察 pass 是否恢复；本记录时点桌面 dev 仍处于死锁状态（第二轮复现中）。
 
 **修复（2026-10-26，同日闭环）**：先给 [operation_locks.rs](../app/flowix-core/src/memo_file/operation_locks.rs) 加进程内独占锁持有登记（超时错误点名持有者 + tracing warn）复现取证——持有者为 **`resolve_cloud_file_put_conflict`**（409 消解器）。根因即上文②的自死锁变体：消解器持 notebook **Exclusive** 后调 `register_existing_file_for_notebook_id` → `sync_index_on_write` → `refresh_note_path` 内部 `notebook_read`（**Shared**）→ **同进程同线程新句柄自等自死锁 5s 超时**（fs2 不同句柄不识别同线程）→ 消解失败 → rebase 未执行 → dirty 保留 → 下轮 pass 再撞 409 → 无限循环（每轮消解写盘一次 = 5.7s 周期回写，本地编辑被反复覆盖）。修复（core 层统一，桌面/移动端 all-in）：`notebook_read` 增加同线程重入——本线程已持该笔记本 Exclusive 时直接放行（Exclusive 语义覆盖 Shared，无需真实文件锁），`NotebookChangeGuard` 在 thread-local 登记持有 key、drop 移除。测试：新增 `notebook_read_is_reentrant_while_holding_change_on_same_thread`（修复前该场景 5s 超时），锁模块 8/8 + flowix-core 355/355 零回归。**实机验证**：修复版 dev 重启后 90s 零锁超时 WARN；挂起 3 小时的 5 个 inflight op 与 dirty 全部清零；`last_success_at` 恢复实时推进；云端与本地内容一致收敛；「立即同步」按钮由常亮禁用恢复可点且手动 pass 无错。
+
+## 17. 移动端笔记内嵌 AI 对话卡片（thread card，2026-10-26）
+
+**需求**：桌面端可在笔记中插入 agent 对话卡片（HTML 注释存储，随笔记云同步）；移动端此前遇到该注释会**静默丢弃**（`@tiptap/markdown` 对 html token 走 `generateJSON`，DOM 解析丢注释）。本轮让移动端互认该格式：能显示、能新建、能对话。
+
+**存储格式与桌面完全一致**：`<!-- flowix:agent-thread-card {"version":1,"instanceId":...,"threadId":...,"agentType":...,"collapsed":...} -->`（marker/正则/parse/serialize 均从桌面 [agent-thread-card-markdown.ts](../app/flowix-web/features/agent/thread-card/agent-thread-card-markdown.ts) 移植为 [agent-thread-card-md.ts](../app/flowix-mobile/frontend/src/extensions/agent-thread-card-md.ts) 零依赖纯函数模块）。旧版 `::agent-thread-card{...}` 语法同样认领并升级为新格式。
+
+**实现**（纯前端，零 Rust 改动）：
+- [agent-thread-card.tsx](../app/flowix-mobile/frontend/src/extensions/agent-thread-card.tsx)：`agentThreadCard` Atom 节点 + `markdownTokenizer`（block 级 tokenizer 在 marked html 规则前认领注释）+ `parseMarkdown`/`renderMarkdown`（与桌面、与移动端 MobileImage 用同一套 `@tiptap/markdown` v3.23.4 扩展点）；卡片视图用 ReactNodeViewRenderer。
+- 会话逻辑 `useThreadChat`（与 ChatScreen 同源：`agent-chunk` 流式 + `threads-changed` 刷新 + `api.agentChatSend`）；threadId 初始可为 null，首条消息后回填 node attrs 持久化。竞态兜底：`chat_send` 立即返回但 chunk 并发到达，chunk 早于 IPC 返回时直接采纳 `chunk.thread_id`。
+- **交互分级**：`typeKey === 'mobile'`（移动端自建或云端移动端会话）可完整对话（输入框/停止/流式）；桌面 runtime 类型卡（deepseek-harness 等）只读——消息可显示（线程已云同步时），无输入框。
+- [EditorScreen.tsx](../app/flowix-mobile/frontend/src/EditorScreen.tsx) 工具栏新增「插入 AI 对话」按钮（Bot 图标）；ChatScreen 的 MessageBubble 导出复用。
+
+**往返验证**（[atc-roundtrip.test.mts](../../m1-10/atc-roundtrip.test.mts)，node 24 类型剥离直跑移动端纯函数 + marked v17 同款 tokenizer 注册，11 项断言全过）：桌面注释 parse→render 逐字节一致、二次往返幂等、移动端新建卡身份保留、旧版语法升级、无关注释不误认领、threadId 回填序列化正确。已查明 marked v17 会把注释后的单个换行并入前一 token 的 raw（space 合并），不影响 metadata 解析与序列化。
+
+**待实机验证**：模拟器 APK 安装后（插入卡片→发送→流式回复→threadId 回填→保存→桌面打开该笔记卡片互认）。
+
+**实机验证（2026-10-26，模拟器 x86_64 debug 签名 APK）**：
+- **插卡与对话**：工具栏 Bot 按钮 → 卡片插入 → 发送 → mock 引擎流式回复完整渲染（user + assistant 气泡）。
+- **持久化往返**：返回列表再进笔记，卡片与消息完整恢复（注释 parse→serialize 往返 + threadId 回填后按线程重载）。
+- **上云**：在 Loop 本（云同步本）loop-note-1.md 文末插卡对话后，云端 blob 出现顶格注释 `<!-- flowix:agent-thread-card {"version":1,"instanceId":"58d06974-…","threadId":"th_m_01a177b1fa11…","agentType":"mobile",…} -->`（seq 202/203/205 三连 put），线程 th_m_01a177b1fa11… 同步上云。格式与桌面字节级一致（桌面读侧走同款 marker/解析，为其既有能力）。
+- **修复一处流式 bug**：`stream_end` 后 liveText/liveReasoning 未清空导致落库消息与流式气泡重复显示（卡片 hook 与 ChatScreen 同源同病，两处同步修复）。
+
+**遗留待办（非本功能引入）**：① 移动端**新建笔记首推不生效**——note_create/note_save 记 dirty 后 pass 上传 0（LoopCardTest.md 十余分钟未上云），而编辑已有云笔记（loop-note-1）dirty 推送正常；新 note 无 baseline 时内容对账也跳过，需查 dirty 队列消费路径。② 桌面生产包（旧版）云同步轮询停摆：18:03 后未再拉取云端 put（dev 版未登录云）；重启生产包 + dev 均未恢复，与本轮 thread card 无关，归入 §15/§16 既有挂起问题族。③ 桌面打开移动端卡的视觉确认随 ② 恢复后补做。
+- **修复验证**：新版 APK 重装后续发一轮（before 2 → after 4 条气泡，user/assistant 各一条），重复显示消除；旧对话重开加载亦干净。

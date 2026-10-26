@@ -3,6 +3,7 @@ import { EditorContent, useEditor } from '@tiptap/react';
 import {
   ArrowLeft,
   Bold,
+  Bot,
   Italic,
   Strikethrough,
   Heading1,
@@ -31,6 +32,7 @@ import TableRow from '@tiptap/extension-table-row';
 import TableHeader from '@tiptap/extension-table-header';
 import TableCell from '@tiptap/extension-table-cell';
 import { MobileImage } from './extensions/image';
+import { AgentThreadCardMobile } from './extensions/agent-thread-card';
 import { api, type HistoryEntry } from './api';
 import { OpenNote } from './App';
 
@@ -95,6 +97,8 @@ export function EditorScreen({ note, onBack }: { note: OpenNote; onBack: () => v
       TableCell,
       // 图片附件：asset://localhost 语法与桌面互认，跨设备按文件名回落
       MobileImage.configure({ notebookId: note.notebookId }),
+      // AI 对话卡片：HTML 注释存储与桌面互认；mobile 卡可对话，桌面卡只读
+      AgentThreadCardMobile,
     ],
     content: '',
     editable: false,
@@ -448,6 +452,13 @@ export function EditorScreen({ note, onBack }: { note: OpenNote; onBack: () => v
           aria-label="插入图片"
         >
           <ImagePlus />
+        </button>
+        <button
+          className="tool-btn"
+          onClick={() => editor.chain().focus().insertMobileAgentThreadCard().run()}
+          aria-label="插入 AI 对话"
+        >
+          <Bot />
         </button>
         <div className="tool-sep" />
         <button

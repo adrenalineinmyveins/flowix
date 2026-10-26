@@ -8,7 +8,7 @@ interface Props {
   onThreadCreated: (threadId: string) => void;
 }
 
-function MessageBubble({ message }: { message: ThreadMessage }) {
+export function MessageBubble({ message }: { message: ThreadMessage }) {
   if (message.role === 'user') {
     return <div className="chat-bubble chat-bubble-user">{message.content}</div>;
   }
@@ -82,6 +82,9 @@ export function ChatScreen({ threadId, onBack, onThreadCreated }: Props) {
           break;
         case 'stream_end':
           setStreaming(false);
+          // 清掉 live 增量再 reload：落库消息回来前不与流式气泡重复显示
+          setLiveText('');
+          setLiveReasoning('');
           // 后端已把 assistant 消息落库，重读即最终态
           void reload();
           break;
