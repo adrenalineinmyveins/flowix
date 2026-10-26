@@ -8,6 +8,7 @@ import { useI18n } from '@/lib/i18n';
 import { toast } from '@/lib/toast';
 import { createLogger } from '@/lib/logger';
 import { agent } from '@platform/tauri/client/agent';
+import { subscribe } from '@platform/tauri/event-bus';
 import { useAgentSessionStore } from '@features/agent/store/agent-session-store';
 import { canActOnQueuedMessage } from '@features/agent/store/follow-up-queue-slice';
 import type { AgentConversationInstance } from '@features/agent/store/agent-conversation-types';
@@ -442,6 +443,20 @@ function AgentConversationDetailContent({
     void store.loadMessages(instance.agentType, threadId);
     if (instance.agentType === "codex") void store.hydrateCodexFollowUps(threadId);
     return release;
+  }, [instance, threadId]);
+
+  // 云端线程变更（A3 桥 apply 后端广播 threads-changed）时重拉当前会话
+  // 消息，让另一端的消息在已打开的会话里即时可见。loadMessages 为
+  // stale-while-revalidate，幂等合并不打断本地流式。mobile 类型会话
+  // （云同步的移动端对话）内容只经 threads-changed 到达，是唯一需要
+  // 实时重拉的范围；本地 runtime 类型有自己的流式/事件链，不在此刷新。
+  useEffect(() => {
+    if (!threadId || !instance || instance.agentType !== "mobile") return;
+    return subscribe('threads-changed', () => {
+      void useAgentSessionStore
+        .getState()
+        .loadMessages(instance.agentType, threadId);
+    });
   }, [instance, threadId]);
 
   useEffect(() => {

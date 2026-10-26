@@ -3,7 +3,8 @@
 //! 协议对齐桌面 `agent-chunk`（`#[serde(tag = "kind")]` 内部 tag、字段
 //! snake_case——`app.emit` 不走 IPC camelCase 转换，TS 侧手写镜像类型）。
 //! 长连接客户端不设总超时（默认 30s timeout 会掐断流），靠 chunk 间隔
-//! 与停止标志兜底。回合结束落库 → `record_v2_thread_change` → 防抖同步。
+//! 与停止标志兜底。用户消息与回合收尾各自落库 → `record_v2_thread_change`
+//! → 防抖同步（fingerprint 幂等）。
 
 use super::{AgentState, THREADS_CHANGED_EVENT};
 use flowix_sync::{V2ThreadMessage, V2ThreadPayload};
@@ -98,6 +99,10 @@ pub(crate) async fn chat_send(
     }
     agent.save_thread_payload(&payload)?;
     let _ = app.emit(THREADS_CHANGED_EVENT, ());
+    // 用户消息落库即入队上云：回合失败（请求/流错误）时收尾路径不会
+    // enqueue，否则该消息会滞留本地直到该线程下一个成功回合。
+    // fingerprint 覆盖整个 payload，回合收尾再次 enqueue 是幂等更新。
+    super::enqueue_thread_change_and_sync(&app, &agent, &sync, &payload);
 
     // 2. spawn 流式任务（不阻塞 IPC）
     tauri::async_runtime::spawn(async move {
