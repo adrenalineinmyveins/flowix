@@ -60,6 +60,31 @@ pub async fn agent_thread_delete(
     Ok(removed)
 }
 
+/// 会话元数据更新（重命名/收藏/归档，None 字段不动；P1b）。
+#[tauri::command]
+pub async fn agent_thread_update(
+    app: AppHandle,
+    agent: State<'_, Arc<AgentState>>,
+    sync: State<'_, Arc<flowix_sync::SyncManager>>,
+    thread_id: String,
+    title: Option<String>,
+    starred: Option<bool>,
+    archived: Option<bool>,
+) -> Result<(), String> {
+    agent
+        .update_thread_meta(&thread_id, title.as_deref(), starred, archived)?
+        .ok_or_else(|| format!("AGENT_THREAD_NOT_FOUND: {thread_id}"))?;
+    sync.record_v2_thread_change(
+        &thread_id,
+        flowix_sync::LocalChangeKind::Put,
+        "meta-updated",
+    )
+    .map_err(|e| e.to_string())?;
+    emit_threads_changed(&app);
+    crate::sync::spawn_debounced_sync(app);
+    Ok(())
+}
+
 /// 卡片所在笔记（P1a 上下文注入）。嵌套结构体字段不随命令参数做
 /// camelCase 自动转换，需显式声明（前端传 notebookId/relativePath）。
 #[derive(Debug, Clone, serde::Deserialize)]

@@ -151,10 +151,40 @@ impl AgentState {
                         .max()
                         .unwrap_or(payload.created_at),
                     message_count: payload.messages.len(),
+                    starred: payload.starred,
+                    archived: payload.archived,
                 });
             }
         }
         Ok(summaries)
+    }
+
+    /// 更新会话元数据（重命名/收藏/归档；None 字段不动）。返回更新后的 payload。
+    pub(crate) fn update_thread_meta(
+        &self,
+        thread_id: &str,
+        title: Option<&str>,
+        starred: Option<bool>,
+        archived: Option<bool>,
+    ) -> Result<Option<V2ThreadPayload>, String> {
+        let Some(mut payload) = self.thread_payload(thread_id)? else {
+            return Ok(None);
+        };
+        if let Some(title) = title {
+            let trimmed = title.trim();
+            if trimmed.is_empty() {
+                return Err("AGENT_THREAD_TITLE_EMPTY".into());
+            }
+            payload.title = trimmed.to_string();
+        }
+        if let Some(starred) = starred {
+            payload.starred = starred;
+        }
+        if let Some(archived) = archived {
+            payload.archived = archived;
+        }
+        self.save_thread_payload(&payload)?;
+        Ok(Some(payload))
     }
 
     /// 落库（整包替换）。写入方：回合结束、apply 远端。
@@ -212,6 +242,8 @@ pub struct ThreadSummary {
     pub agent_id: String,
     pub updated_at: i64,
     pub message_count: usize,
+    pub starred: bool,
+    pub archived: bool,
 }
 
 /// ── 云同步桥（A2 API 消费方）───────────────────────────────

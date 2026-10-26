@@ -122,6 +122,8 @@ pub(crate) async fn chat_send(
             title: String::new(),
             created_at: now,
             messages: Vec::new(),
+            starred: false,
+            archived: false,
         });
     // 上下文块只随首条消息注入（对齐桌面 isFirstMessage 语义），
     // 且只进请求不落库——落库 content 恒为用户原文。

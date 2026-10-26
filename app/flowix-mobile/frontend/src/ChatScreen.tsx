@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowUp, Check, ChevronDown, Copy, Square, Terminal } from 'lucide-react';
 import { api, listenEvent, AgentChunk, ThreadMessage } from './api';
 import { renderChatMarkdown, toolCallSummary } from './chat-render';
+import { markThreadRead } from './thread-read';
 
 interface Props {
   threadId: string;
@@ -9,7 +10,7 @@ interface Props {
   onThreadCreated: (threadId: string) => void;
 }
 
-function formatMessageTime(timestamp: number): string {
+export function formatMessageTime(timestamp: number): string {
   const date = new Date(timestamp);
   const now = new Date();
   const sameDay =
@@ -73,6 +74,26 @@ function ToolCallRow({ message }: { message: ThreadMessage }) {
       ) : null}
     </div>
   );
+}
+
+/** 草稿持久化（P1b）：新对话统一存 'new' 键（首条消息后 threadId 才产生）。 */
+function draftKey(threadId: string): string {
+  return `flowix.chat.draft.${threadId || 'new'}`;
+}
+function loadDraft(threadId: string): string {
+  try {
+    return localStorage.getItem(draftKey(threadId)) ?? '';
+  } catch {
+    return '';
+  }
+}
+function saveDraft(threadId: string, value: string): void {
+  try {
+    if (value) localStorage.setItem(draftKey(threadId), value);
+    else localStorage.removeItem(draftKey(threadId));
+  } catch {
+    // 隐私模式/配额满：静默
+  }
 }
 
 /** 单条消息富渲染：markdown（assistant/system）、工具行、复制、时间戳。
@@ -144,19 +165,24 @@ export function MessageBubble({ message }: { message: ThreadMessage }) {
 /** 聊天屏：流式渲染走 `agent-chunk` 事件（不信 IPC await）。 */
 export function ChatScreen({ threadId, onBack, onThreadCreated }: Props) {
   const [messages, setMessages] = useState<ThreadMessage[] | null>(null);
-  const [draft, setDraft] = useState('');
+  const [draft, setDraft] = useState(() => loadDraft(threadId));
   const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState('');
+  const [title, setTitle] = useState('');
   // 流式中的 assistant 增量（独立于已落库消息；stream_end 后由后端落库刷新）
   const [liveText, setLiveText] = useState('');
   const [liveReasoning, setLiveReasoning] = useState('');
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  // 滚动跟随（P1b）：仅当用户在底部附近时自动滚，向上翻阅脱离跟随
+  const pinnedRef = useRef(true);
   const activeThreadRef = useRef(threadId);
   activeThreadRef.current = threadId;
 
   const reload = useCallback(async () => {
     try {
       setMessages(await api.agentThreadMessages(threadId));
+      if (threadId) markThreadRead(threadId);
     } catch (err) {
       setError(String(err));
     }
@@ -166,8 +192,30 @@ export function ChatScreen({ threadId, onBack, onThreadCreated }: Props) {
     setMessages(null);
     setLiveText('');
     setLiveReasoning('');
+    setDraft(loadDraft(threadId));
     void reload();
   }, [reload]);
+
+  // 标题（chat.rs 首条消息自动取名 30 字；threads-changed 跟随远端改名）
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const list = await api.agentThreadList();
+        if (!cancelled) setTitle(list.find((t) => t.threadId === threadId)?.title ?? '');
+      } catch {
+        // 标题拿不到就用默认
+      }
+    };
+    void load();
+    const unlisten = listenEvent('threads-changed', () => void load()).catch(
+      () => Promise.resolve(() => {}),
+    );
+    return () => {
+      cancelled = true;
+      void unlisten.then((fn) => fn());
+    };
+  }, [threadId]);
 
   useEffect(() => {
     const unlisten = listenEvent<AgentChunk>('agent-chunk', (chunk) => {
@@ -214,10 +262,17 @@ export function ChatScreen({ threadId, onBack, onThreadCreated }: Props) {
     };
   }, [reload]);
 
-  // 新内容自动滚底
+  // 新内容自动滚底（仅当用户仍停留在底部附近）
   useEffect(() => {
+    if (!pinnedRef.current) return;
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, liveText, liveReasoning]);
+
+  const onScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+  };
 
   // 键盘跟随（照抄 EditorScreen 的 visualViewport 方案）
   useEffect(() => {
@@ -237,6 +292,7 @@ export function ChatScreen({ threadId, onBack, onThreadCreated }: Props) {
     const content = draft.trim();
     if (!content || streaming) return;
     setDraft('');
+    saveDraft(threadId, '');
     setError('');
     try {
       const resolved = await api.agentChatSend(threadId, content);
@@ -254,6 +310,7 @@ export function ChatScreen({ threadId, onBack, onThreadCreated }: Props) {
     } catch (err) {
       setError(String(err));
       setDraft(content);
+      saveDraft(threadId, content);
     }
   };
 
@@ -263,11 +320,11 @@ export function ChatScreen({ threadId, onBack, onThreadCreated }: Props) {
         <button className="m-icon-btn" onClick={onBack} aria-label="返回">
           <ArrowUp style={{ transform: 'rotate(-90deg)' }} size={20} />
         </button>
-        <div className="m-bar-title chat-title">AI 对话</div>
+        <div className="m-bar-title chat-title">{title || 'AI 对话'}</div>
         <div className="m-bar-spacer" />
       </header>
 
-      <div className="chat-scroll">
+      <div className="chat-scroll" ref={scrollRef} onScroll={onScroll}>
         {messages === null ? (
           <div className="m-empty">加载中…</div>
         ) : (
@@ -308,7 +365,10 @@ export function ChatScreen({ threadId, onBack, onThreadCreated }: Props) {
           placeholder={streaming ? '回复生成中…' : '输入消息'}
           disabled={streaming}
           rows={Math.min(4, Math.max(1, draft.split('\n').length))}
-          onChange={(event) => setDraft(event.target.value)}
+          onChange={(event) => {
+            setDraft(event.target.value);
+            saveDraft(threadId, event.target.value);
+          }}
           onKeyDown={(event) => {
             if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
               event.preventDefault();

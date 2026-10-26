@@ -92,6 +92,8 @@ export interface ThreadSummary {
   agentId: string;
   updatedAt: number;
   messageCount: number;
+  starred: boolean;
+  archived: boolean;
 }
 
 export interface ThreadMessage {
@@ -155,6 +157,10 @@ export const api = {
     invoke<ThreadMessage[]>('agent_thread_messages', { threadId }),
   agentThreadDelete: (threadId: string) =>
     invoke<boolean>('agent_thread_delete', { threadId }),
+  agentThreadUpdate: (
+    threadId: string,
+    patch: { title?: string; starred?: boolean; archived?: boolean },
+  ) => invoke<void>('agent_thread_update', { threadId, ...patch }),
   agentChatSend: (
     threadId: string | null,
     content: string,

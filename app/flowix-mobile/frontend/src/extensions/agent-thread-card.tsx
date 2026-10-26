@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Node, mergeAttributes, type MarkdownToken, type NodeViewProps } from '@tiptap/core';
 import { TextSelection } from '@tiptap/pm/state';
 import { NodeViewWrapper, ReactNodeViewRenderer } from '@tiptap/react';
-import { ArrowUp, ChevronDown, Square, Trash2 } from 'lucide-react';
+import { ArrowUp, ChevronDown, Maximize2, Square, Trash2 } from 'lucide-react';
 import { api, listenEvent, type AgentChunk, type ThreadMessage } from '../api';
 import { MessageBubble } from '../ChatScreen';
 import { renderChatMarkdown } from '../chat-render';
@@ -141,6 +141,8 @@ function useThreadChat(
 interface ThreadCardOptions {
   /** 卡片所在笔记（P1a 上下文注入；由 EditorScreen configure 传入） */
   noteContext?: { notebookId: string; relativePath: string } | null;
+  /** 全屏打开会话（P1b：EditorScreen 传入 App 的 openChat） */
+  onOpenThread?: ((threadId: string) => void) | null;
 }
 
 function AgentThreadCardComponent({ node, editor, getPos, deleteNode }: NodeViewProps) {
@@ -152,12 +154,17 @@ function AgentThreadCardComponent({ node, editor, getPos, deleteNode }: NodeView
   };
   // P1a：所在笔记经扩展 storage 读取（configure → addStorage），
   // 避免包装 NodeView 组件破坏 ReactNodeViewRenderer 的组件身份
-  const noteContext =
-    (editor?.storage?.agentThreadCard as
-      | { noteContext?: { notebookId: string; relativePath: string } | null }
-      | undefined)?.noteContext ?? null;
+  const storage = editor?.storage?.agentThreadCard as
+    | {
+        noteContext?: { notebookId: string; relativePath: string } | null;
+        onOpenThread?: ((threadId: string) => void) | null;
+      }
+    | undefined;
+  const noteContext = storage?.noteContext ?? null;
+  const onOpenThread = storage?.onOpenThread ?? null;
   const interactive = attrs.typeKey === 'mobile' || !attrs.typeKey;
-  const [draft, setDraft] = useState('');
+  // 草稿持久化（P1b）：初始读 attrs.inputDraft（随笔记保存跨端互认）
+  const [draft, setDraft] = useState(() => (node.attrs.inputDraft as string | null) ?? '');
 
   const updateAttrs = useCallback(
     (patch: Record<string, unknown>) => {
@@ -187,8 +194,14 @@ function AgentThreadCardComponent({ node, editor, getPos, deleteNode }: NodeView
 
   const onSend = async () => {
     const ok = await send(draft);
-    if (ok) setDraft('');
+    if (ok) {
+      setDraft('');
+      updateAttrs({ inputDraft: '' });
+    }
   };
+
+  // 草稿写回 attrs（失焦/折叠时）：随笔记自动保存持久化，跨端互认
+  const persistDraft = () => updateAttrs({ inputDraft: draft });
 
   return (
     <NodeViewWrapper as="div" className="agent-thread-card-m" data-collapsed={attrs.collapsed ? 'true' : 'false'}>
@@ -196,13 +209,22 @@ function AgentThreadCardComponent({ node, editor, getPos, deleteNode }: NodeView
         <button
           className="atc-m-toggle"
           aria-label={attrs.collapsed ? '展开' : '折叠'}
-          onClick={() => updateAttrs({ collapsed: !attrs.collapsed })}
+          onClick={() => updateAttrs({ collapsed: !attrs.collapsed, inputDraft: draft })}
         >
           <ChevronDown size={16} className={attrs.collapsed ? 'atc-m-chevron-collapsed' : ''} />
         </button>
         <div className="atc-m-title">
           {attrs.title || (interactive ? 'AI 对话' : '桌面端 AI 会话')}
         </div>
+        {attrs.threadId && onOpenThread ? (
+          <button
+            className="atc-m-icon"
+            aria-label="全屏打开会话"
+            onClick={() => onOpenThread(attrs.threadId as string)}
+          >
+            <Maximize2 size={14} />
+          </button>
+        ) : null}
         <button className="atc-m-icon" aria-label="删除卡片" onClick={() => deleteNode()}>
           <Trash2 size={14} />
         </button>
@@ -251,6 +273,7 @@ function AgentThreadCardComponent({ node, editor, getPos, deleteNode }: NodeView
                 disabled={streaming}
                 rows={Math.min(4, Math.max(1, draft.split('\n').length))}
                 onChange={(event) => setDraft(event.target.value)}
+                onBlur={persistDraft}
                 onKeyDown={(event) => {
                   if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
                     event.preventDefault();
@@ -310,11 +333,14 @@ export const AgentThreadCardMobile = Node.create<ThreadCardOptions>({
   draggable: false,
 
   addOptions() {
-    return { noteContext: null };
+    return { noteContext: null, onOpenThread: null };
   },
 
   addStorage() {
-    return { noteContext: this.options.noteContext ?? null };
+    return {
+      noteContext: this.options.noteContext ?? null,
+      onOpenThread: this.options.onOpenThread ?? null,
+    };
   },
 
   addAttributes() {

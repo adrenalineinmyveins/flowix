@@ -334,3 +334,44 @@ mock 引擎（mock-llm.cjs，PORT=18900）回复 markdown 富内容并回显最�
 ### 交付文件
 
 chat-render.ts（新）/ ChatScreen.tsx / extensions/agent-thread-card.tsx / agent/chat.rs / agent/commands.rs / api.ts / EditorScreen.tsx / styles/screens.css / package.json。
+
+## 20. 移动端对话窗 P1b 会话与交互补齐（2026-10-26，已交付）
+
+评估文档第三步落地：会话列表增强 + 草稿持久化 + 卡片全屏跳转。未含：超长消息折叠、顶部历史分页、连续工具分组、桌面卡特殊消息徽章（按需后续）。
+
+### 会话列表（ChatListScreen 重写）
+
+- **筛选 chips**：全部 / 收藏 / 已归档（归档在「全部」隐藏，只在「已归档」出现）。
+- **日期分组**：今天 / 昨天 / 7 天内 / 更早（threads 按 updatedAt 倒序，组序自然降序）。
+- **未读点**：`thread-read.ts` localStorage map（threadId→已读时间戳），`updatedAt > 已读` 且有消息判未读——纯本地视图不上云；ChatScreen 打开/刷新时 markThreadRead。
+- **长按菜单**（480ms pointer 计时 + 抑制后续 click）：m-sheet 动作面板——重命名（内联输入）/ 收藏⇄ / 归档⇄ / 删除。pointermove 取消（滚动不误触）。
+
+### schema：starred/archived（收藏/归档）
+
+- `V2ThreadPayload` 加 `starred`/`archived`（`#[serde(default)]`，旧端反序列化忽略、重写时丢弃——v1 JSON 版本化向后兼容，无迁移成本）。
+- **merge 语义：取 local**（v2_merge_thread_payloads）——旧端（未升级的桌面）重写 blob 会丢字段，local 优先保证本端标记不被远端旧版本覆盖；桌面投影（cloud_bridge.rs）暂写 false。单测 `thread_merge_keeps_local_starred_archived_flags` 锁定。
+- 新命令 `agent_thread_update(thread_id, title?, starred?, archived?)`：update_thread_meta 落库 → record_v2_thread_change(Put) → threads-changed → 防抖同步。重命名与 merge 的「title 取最后消息更新一方」规则共存：消息静止时重命名生效，远端再来新消息时 title 会被消息方覆盖（已知限制）。
+
+### ChatScreen
+
+- **标题**：agentThreadList 查当前会话 title（chat.rs 首条消息自动取名 30 字），threads-changed 跟随远端改名。
+- **草稿持久化**：localStorage `flowix.chat.draft.<threadId>`（新对话统一 'new' 键），onChange 即存、发送/失败路径清理。
+- **滚动跟随/脱离**：仅当用户在底部 120px 内时自动滚底，向上翻阅脱离跟随（pinnedRef + onScroll）。
+
+### 卡片（agent-thread-card）
+
+- **全屏跳转**：有 threadId 的卡 header 显示 Maximize2 按钮 → `onOpenThread`（扩展 storage，与 noteContext 同机制）→ App 的 openChat 直通 ChatScreen。
+- **草稿持久化**：blur/折叠时写 `attrs.inputDraft`（随笔记自动保存，注释 JSON 与桌面同格式跨端互认）；初始态从 attrs 恢复；发送成功清空。每键不写 attrs（避免笔记 dirty 抖动）。
+
+### 验证（模拟器 CDP 实机，三脚本全绿）
+
+- **列表**（verify-p1b-list.mjs）：chips×3 / 分组（今天+7 天内）/ 未读点→打开后消除 / 长按重命名→列表更新 / 收藏→收藏筛选可见 / 归档→全部隐藏+已归档可见+取消归档还原。
+- **卡片跳转**（verify-p1b-card.mjs）：Maximize2 → ChatScreen 8 气泡 + 标题正确。
+- **卡片草稿**（verify-p1b-draft.mjs）：输入→blur→保存→重开笔记恢复。
+- cargo check（flowix-sync + flowix-mobile）零错误；flowix-sync 70 单测全过。⚠️ flowix-desktop 被 flowix-relay 工作区未完成改动（routes.rs SSE 闭包 E0308，非本任务）卡住无法整编，cloud_bridge.rs 仅 3 处字面量补字段（与 mobile 同构已验证模式）。
+
+**验证脚本坑（CDP）**：① 长按模拟必须补 `pointerup`+`click` 完整序列，否则 suppressClick 标志不消费、吞掉后续点击；② React onBlur 监听原生 `focusout`（blur 不冒泡不委托），`dispatchEvent(FocusEvent('blur'))` 不触发。
+
+### 交付文件
+
+flowix-sync/v2.rs / flowix-desktop cloud_bridge.rs / flowix-mobile agent（mod.rs/commands.rs/chat.rs/lib.rs）/ 前端（thread-read.ts 新、ChatListScreen 重写、ChatScreen、agent-thread-card、EditorScreen、App、api.ts、screens.css）。

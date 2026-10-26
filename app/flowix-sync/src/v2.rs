@@ -131,6 +131,12 @@ pub struct V2ThreadPayload {
     pub created_at: i64,
     #[serde(default)]
     pub messages: Vec<V2ThreadMessage>,
+    /// 用户标记（P1b 会话管理）。serde default 向后兼容：旧端反序列化
+    /// 忽略、重写时丢弃——因此合并规则取 local，本端标记不被远端旧版本覆盖。
+    #[serde(default)]
+    pub starred: bool,
+    #[serde(default)]
+    pub archived: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -198,6 +204,9 @@ pub fn v2_merge_thread_payloads(
         title,
         created_at: local.created_at,
         messages,
+        // 用户标记取 local（见结构体注释：旧端重写会丢字段，local 优先保本端视图）
+        starred: local.starred,
+        archived: local.archived,
     })
 }
 
@@ -941,6 +950,8 @@ mod tests {
             title: title.into(),
             created_at: 1,
             messages,
+            starred: false,
+            archived: false,
         }
     }
 
@@ -989,6 +1000,28 @@ mod tests {
         let merged = v2_merge_thread_payloads(&local, &remote).unwrap();
         assert_eq!(merged.title, "新标题");
         assert_eq!(merged.messages.len(), 2);
+    }
+
+    #[test]
+    fn thread_merge_keeps_local_starred_archived_flags() {
+        // P1b：用户标记取 local——旧端重写会丢字段，local 优先保本端视图
+        let local = {
+            let mut payload = thread_payload("th_x", "本地", vec![thread_message("msg_1", "user", 100)]);
+            payload.starred = true;
+            payload
+        };
+        // 远端（旧版本端重写）无标记
+        let remote = thread_payload(
+            "th_x",
+            "远端标题",
+            vec![
+                thread_message("msg_1", "user", 100),
+                thread_message("msg_9", "assistant", 900),
+            ],
+        );
+        let merged = v2_merge_thread_payloads(&local, &remote).unwrap();
+        assert!(merged.starred, "本端收藏不被远端旧版本覆盖");
+        assert!(!merged.archived);
     }
 
     #[test]

@@ -153,6 +153,8 @@ impl ThreadManager {
                 title: head.title,
                 created_at: head.created_at,
                 messages,
+                starred: false,
+                archived: false,
             }))
         })
         .await
@@ -397,6 +399,8 @@ mod tests {
                     origin: Some("mobile".into()),
                 },
             ],
+            starred: false,
+            archived: false,
         };
 
         let changed = manager
@@ -438,6 +442,8 @@ mod tests {
                 created_at: 50,
                 origin: Some("mobile".into()),
             }],
+            starred: false,
+            archived: false,
         };
         assert!(manager.upsert_thread_from_cloud(&fresh).await.unwrap());
         let projected = manager

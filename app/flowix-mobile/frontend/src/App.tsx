@@ -179,6 +179,7 @@ export function App() {
             back('notes');
             notesRefreshRef.current();
           }}
+          onOpenChat={openChat}
         />
       </div>
     );

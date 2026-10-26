@@ -62,7 +62,15 @@ function formatHistoryTime(timestamp: number): string {
   return sameYear ? `${md} ${hm}` : `${date.getFullYear()}年${md} ${hm}`;
 }
 
-export function EditorScreen({ note, onBack }: { note: OpenNote; onBack: () => void }) {
+export function EditorScreen({
+  note,
+  onBack,
+  onOpenChat,
+}: {
+  note: OpenNote;
+  onBack: () => void;
+  onOpenChat?: (threadId: string) => void;
+}) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [saveState, setSaveState] = useState<SaveState>('saved');
@@ -98,9 +106,11 @@ export function EditorScreen({ note, onBack }: { note: OpenNote; onBack: () => v
       // 图片附件：asset://localhost 语法与桌面互认，跨设备按文件名回落
       MobileImage.configure({ notebookId: note.notebookId }),
       // AI 对话卡片：HTML 注释存储与桌面互认；mobile 卡可对话，桌面卡只读。
-      // P1a：携带所在笔记，卡片首条消息自动注入笔记上下文
+      // P1a：携带所在笔记，卡片首条消息自动注入笔记上下文；
+      // P1b：卡片全屏跳转（App 的 openChat）
       AgentThreadCardMobile.configure({
         noteContext: { notebookId: note.notebookId, relativePath: note.relativePath },
+        onOpenThread: onOpenChat ?? null,
       }),
     ],
     content: '',
