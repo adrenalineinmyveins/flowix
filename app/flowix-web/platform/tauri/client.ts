@@ -12,6 +12,7 @@ export * from './client/properties';
 export * from './client/notes';
 export * from './client/memos';
 export * from './client/redaction';
+export * from './client/consult';
 export * from './client/agent-profile';
 export * from './client/updater';
 export * from './client/recovery';

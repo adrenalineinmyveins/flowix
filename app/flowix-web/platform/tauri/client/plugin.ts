@@ -15,3 +15,18 @@ export function listenToPluginCatalogChanges(
 ): UnlistenFn {
   return subscribe<unknown>('plugin-catalog-changed', handler, options);
 }
+
+/** FD-11 v2 P1-5：confirm 档工具类别首用拦截的审批请求。 */
+export interface PluginToolConfirmEvent {
+  pluginId: string;
+  category: string;
+  tool: string;
+  runId: string;
+}
+
+export function listenToPluginToolConfirms(
+  handler: (event: PluginToolConfirmEvent) => void,
+  options?: SubscribeOptions,
+): UnlistenFn {
+  return subscribe<PluginToolConfirmEvent>('plugin-tool-confirm', handler, options);
+}

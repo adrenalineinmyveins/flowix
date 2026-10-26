@@ -1,6 +1,10 @@
 import { create } from 'zustand';
 import type { PluginArtifact, PluginRunEvent } from '@platform/tauri/client';
-import { listenToPluginRuns } from '@platform/tauri/client/plugin';
+import {
+  listenToPluginRuns,
+  listenToPluginToolConfirms,
+  type PluginToolConfirmEvent,
+} from '@platform/tauri/client/plugin';
 import { canonicalPath } from '@/lib/path';
 
 export type PluginRunStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
@@ -26,6 +30,9 @@ export interface PluginRunContext {
 interface PluginRunStore {
   runs: Record<string, PluginRunRecord>;
   latestRunIdByContext: Record<string, string>;
+  /** FD-11 v2 P1-5：待审批的 confirm 档工具类别请求（FIFO）。 */
+  toolConfirms: PluginToolConfirmEvent[];
+  dismissToolConfirm: (runId: string) => void;
   registerRunContext: (runId: string, pluginId: string, context: PluginRunContext) => void;
   ingestEvent: (event: PluginRunEvent) => void;
   getLatestForPlugin: (pluginId: string, notebookPath: string | null) => PluginRunRecord | null;
@@ -53,6 +60,10 @@ function eventStatus(status: PluginRunEvent['status']): PluginRunStatus {
 export const usePluginRunStore = create<PluginRunStore>((set, get) => ({
   runs: {},
   latestRunIdByContext: {},
+  toolConfirms: [],
+  dismissToolConfirm: (runId) => set((state) => ({
+    toolConfirms: state.toolConfirms.filter((confirm) => confirm.runId !== runId),
+  })),
   registerRunContext: (runId, pluginId, context) => set((state) => {
     const previous = state.runs[runId];
     const notebookPath = canonicalPath(context.notebookPath);
@@ -160,6 +171,15 @@ export function ensurePluginRunStoreSubscription(): Promise<void> {
     usePluginRunStore.getState().ingestEvent(event);
   }, {
     onListenerReady: () => resolveReady?.(),
+  });
+  // P1-5 confirm 档审批事件入队（对话框由 workbench 渲染）。
+  listenToPluginToolConfirms((event) => {
+    usePluginRunStore.setState((state) => ({
+      toolConfirms: [
+        ...state.toolConfirms.filter((confirm) => confirm.runId !== event.runId),
+        event,
+      ],
+    }));
   });
   return runEventReady;
 }

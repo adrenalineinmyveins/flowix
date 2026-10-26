@@ -234,7 +234,7 @@ mod tests {
                 expires_at: 4_102_444_800,
                 allowed_scopes: vec![],
             },
-            payload: WirePayload { kind: "consultation".into(), text: "咨询".into() },
+            payload: WirePayload { kind: "consultation".into(), text: "咨询".into(), cipher_text: None },
             provenance: WireProvenance {
                 pipeline_version: "1".into(),
                 rule_set_version: "rs".into(),

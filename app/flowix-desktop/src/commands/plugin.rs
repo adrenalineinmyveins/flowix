@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use tauri::{AppHandle, Listener, Manager, State};
+use tauri::{AppHandle, Emitter, Listener, Manager, State};
 
 use crate::agent_session::ThreadManager;
 use crate::agent_wire::{AgentRuntimeConfig, AgentUserMessage, RuntimePathConfig};
@@ -199,8 +199,11 @@ pub async fn plugin_run(
     };
     let plugin_id_for_task = plugin_id.clone();
     // P4 toolGrants 运行时执法：声明了授权的插件（manifest v3），越权
-    // 工具调用即终止 run 并留痕（事件层黑名单执行器）。
-    let tool_policy = plugin::ToolPolicy::from_grants(&descriptor.manifest.tool_grants);
+    // 工具调用即终止 run 并留痕；confirm 档首用拦截待用户批准（P1-5）。
+    let tool_policy = plugin::ToolPolicy::from_grants(
+        &descriptor.manifest.tool_grants,
+        &plugin::approved_categories_of(&plugin_id),
+    );
     let (stream_end_tx, stream_end_rx) = tokio::sync::mpsc::unbounded_channel();
     let stream_end_run_id = run_id.clone();
     let enforce_app = app_handle.clone();
@@ -226,15 +229,24 @@ pub async fn plugin_run(
             let _ = stream_end_tx.send(reason);
             return;
         }
-        // P4：tool_call 越权检查（未声明 grants 的插件不执法）。
+        // P4：tool_call 执法（未声明 grants 的插件不执法）。
+        // Deny = 越权终止；Confirm = confirm 档首用拦截（终止 + 审批事件，
+        // 用户批准后重跑放行，见 FD-11 v2 P1-5）。
         if kind == Some("tool_call") {
             let Some(policy) = tool_policy.as_ref() else { return };
             let Some(name) = payload.get("name").and_then(serde_json::Value::as_str) else {
                 return;
             };
-            if !policy.violates(name) {
-                return;
-            }
+            let verdict = policy.verdict(name);
+            let (violation, confirm_category) = match verdict {
+                plugin::ToolVerdict::Allow => return,
+                plugin::ToolVerdict::Deny => {
+                    (format!("TOOL_GRANT_VIOLATION:{name}"), None)
+                }
+                plugin::ToolVerdict::Confirm { category } => {
+                    (format!("TOOL_GRANT_CONFIRM_REQUIRED:{category}:{name}"), Some(category))
+                }
+            };
             let app = enforce_app.clone();
             let runs = enforce_runs.clone();
             let run_id = enforce_run_id.clone();
@@ -243,7 +255,6 @@ pub async fn plugin_run(
             let tool = name.to_string();
             tauri::async_runtime::spawn(async move {
                 let state = app.state::<crate::app::state::AppState>();
-                let violation = format!("TOOL_GRANT_VIOLATION:{tool}");
                 // 与 plugin_run_stop 相同的终止契约：cancel 先摘除协调器
                 // 条目，等待 task 检测到摘除后不再二次发失败事件。
                 let Some(info) = runs.cancel(&run_id).await else {
@@ -259,11 +270,30 @@ pub async fn plugin_run(
                         tracing::warn!(thread_id, "clean up violating plugin thread failed: {error}");
                     }
                 }
-                tracing::warn!(
-                    plugin = %plugin_id,
-                    tool = %tool,
-                    "plugin tool grant violated; run terminated"
-                );
+                if let Some(category) = confirm_category {
+                    tracing::warn!(
+                        plugin = %plugin_id,
+                        tool = %tool,
+                        category = %category,
+                        "plugin tool grant awaits confirmation; run terminated"
+                    );
+                    // 审批事件：前端弹批准对话框，批准后写进程级批准集。
+                    let _ = app.emit(
+                        "plugin-tool-confirm",
+                        serde_json::json!({
+                            "pluginId": plugin_id,
+                            "category": category,
+                            "tool": tool,
+                            "runId": run_id,
+                        }),
+                    );
+                } else {
+                    tracing::warn!(
+                        plugin = %plugin_id,
+                        tool = %tool,
+                        "plugin tool grant violated; run terminated"
+                    );
+                }
                 let _ = plugin::emit_run_failed(
                     &run_id,
                     &plugin_id,
@@ -371,6 +401,20 @@ fn build_knowledge_context(
     }, 100);
     let (context, _injected, _skipped) = plugin::render_knowledge_materials(&materials);
     Ok(context)
+}
+
+#[tauri::command]
+/// FD-11 v2 P1-5：用户批准某插件的 confirm 档工具类别（本会话有效）。
+/// 批准后重跑插件，该类别工具调用放行。
+pub fn plugin_tool_grant_approve(
+    plugin_id: String,
+    category: String,
+) -> Result<(), String> {
+    if category.trim().is_empty() {
+        return Err("CATEGORY_REQUIRED".to_string());
+    }
+    crate::plugin::approve_tool_grant(plugin_id.trim(), category.trim());
+    Ok(())
 }
 
 #[tauri::command]

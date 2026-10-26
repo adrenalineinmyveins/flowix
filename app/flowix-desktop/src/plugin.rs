@@ -494,41 +494,101 @@ pub fn install_from_directory(source_directory: &str) -> Result<PluginDescriptor
 }
 
 // ---------------------------------------------------------------------------
-// P4 toolGrants 运行时执法（桌面事件层黑名单执行器）
+// P4 toolGrants 运行时执法（桌面事件层执行器）
 // ---------------------------------------------------------------------------
 
-/// 由 manifest v3 `toolGrants` 派生的工具类别白名单。
+/// 由 manifest v3 `toolGrants` 派生的工具策略。
 ///
 /// 语义（保守口径）：
 /// - 未声明 grants（v1/v2 插件）→ `from_grants` 返回 None，不执法；
-/// - 声明了 grants → 已识别类别的工具调用若未授权即违规（violation），
+/// - 已识别类别的工具调用若未授权（read/write/confirm 均未声明）→ `Deny`，
 ///   调用方应终止 run 并留痕；
-/// - 未识别类别的工具名（agent 内部机制等）放行，避免误杀。
-///
-/// access 三档（read/write/confirm）在类别级不区分——confirm 档的
-/// 逐命令 allowlist 执法属 DSH approval 集成，后续里程碑接入。
+/// - 未识别类别的工具名（agent 内部机制等）放行，避免误杀；
+/// - `confirm` 档（FD-11 v2 P1-5）：命令先过 `allowlist`（非空逐命令执法，
+///   不在表内 → Deny），表内且用户已批准（进程级批准集）→ Allow，
+///   否则 → `Confirm`，调用方终止 run、发审批事件，用户批准后重跑放行。
+///   依据 REDACTION-PIPELINE §9 未决 1 决策（2026-10-21）：复用 permissions
+///   通路，DSH approval 层不另建 disclosure 类别；闸门落在事件层。
 #[derive(Debug, Clone)]
 pub struct ToolPolicy {
     granted: std::collections::HashSet<String>,
+    confirm: std::collections::HashMap<String, Vec<String>>,
+}
+
+/// 单次工具调用的执法结论。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolVerdict {
+    Allow,
+    Deny,
+    Confirm { category: String },
 }
 
 impl ToolPolicy {
-    pub fn from_grants(grants: &[flowix_plugin_runtime::PluginToolGrant]) -> Option<Self> {
+    /// `approved_categories`：本插件在进程级批准集里已放行的 confirm 档类别。
+    pub fn from_grants(
+        grants: &[flowix_plugin_runtime::PluginToolGrant],
+        approved_categories: &std::collections::HashSet<String>,
+    ) -> Option<Self> {
         if grants.is_empty() {
             return None;
         }
-        Some(Self {
-            granted: grants.iter().map(|grant| grant.tool.clone()).collect(),
-        })
+        let mut granted = std::collections::HashSet::new();
+        let mut confirm = std::collections::HashMap::new();
+        for grant in grants {
+            match grant.access.as_str() {
+                "confirm" => {
+                    confirm.insert(grant.tool.clone(), grant.allowlist.clone());
+                }
+                // read/write 类别级放行（现有口径：类别内不细分读写）。
+                _ => {
+                    granted.insert(grant.tool.clone());
+                }
+            }
+        }
+        granted.extend(approved_categories.iter().cloned());
+        Some(Self { granted, confirm })
     }
 
-    /// 该工具调用是否越权（已识别类别 + 未授权）。
-    pub fn violates(&self, tool_name: &str) -> bool {
-        match classify_tool(tool_name) {
-            Some(category) => !self.granted.contains(category),
-            None => false,
+    /// 该工具调用的执法结论。
+    pub fn verdict(&self, tool_name: &str) -> ToolVerdict {
+        let Some(category) = classify_tool(tool_name) else {
+            return ToolVerdict::Allow;
+        };
+        if self.granted.contains(category) {
+            return ToolVerdict::Allow;
         }
+        if let Some(allowlist) = self.confirm.get(category) {
+            if !allowlist.is_empty() && !allowlist.iter().any(|entry| entry == tool_name) {
+                return ToolVerdict::Deny;
+            }
+            return ToolVerdict::Confirm { category: category.to_string() };
+        }
+        ToolVerdict::Deny
     }
+}
+
+/// confirm 档进程级批准集：(pluginId, category)。批准后本会话内放行；
+/// 重启后首用再确认（保守默认，不做持久授权）。
+fn approved_tool_grants() -> &'static std::sync::Mutex<std::collections::HashSet<(String, String)>> {
+    static APPROVED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(String, String)>>> =
+        std::sync::OnceLock::new();
+    APPROVED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// 用户批准某插件的某工具类别（confirm 档，本会话有效）。
+pub fn approve_tool_grant(plugin_id: &str, category: &str) {
+    let mut approved = approved_tool_grants().lock().unwrap_or_else(|e| e.into_inner());
+    approved.insert((plugin_id.to_string(), category.to_string()));
+}
+
+/// 某插件当前已批准的 confirm 档类别集合。
+pub fn approved_categories_of(plugin_id: &str) -> std::collections::HashSet<String> {
+    let approved = approved_tool_grants().lock().unwrap_or_else(|e| e.into_inner());
+    approved
+        .iter()
+        .filter(|(plugin, _)| plugin == plugin_id)
+        .map(|(_, category)| category.clone())
+        .collect()
 }
 
 /// 把运行时工具名归类到 toolGrants 的四个类别之一；无法识别返回 None。
@@ -1543,43 +1603,81 @@ mod tests {
         }
     }
 
-    /// 黑名单执行器回归：已识别类别未授权 → 违规；授权类别与未识别
-    /// 类别（agent 内部机制）放行。验收口径「未授权工具调用穿透数 0」。
+    /// 执行器回归：已识别类别未授权 → Deny；授权类别与未识别类别放行。
+    /// 验收口径「未授权工具调用穿透数 0」。
     #[test]
     fn tool_policy_blocks_unauthorized_categories() {
-        let policy = super::ToolPolicy::from_grants(&[grant("flowix.memo", "read")])
+        use super::ToolVerdict;
+        let empty = std::collections::HashSet::new();
+        let policy = super::ToolPolicy::from_grants(&[grant("flowix.memo", "read")], &empty)
             .expect("declared grants enforce");
 
-        assert!(policy.violates("shell_exec"));
-        assert!(policy.violates("run_bash_command"));
-        assert!(policy.violates("write_artifact"));
-        assert!(policy.violates("notebook_read_all"));
+        assert_eq!(policy.verdict("shell_exec"), ToolVerdict::Deny);
+        assert_eq!(policy.verdict("run_bash_command"), ToolVerdict::Deny);
+        assert_eq!(policy.verdict("write_artifact"), ToolVerdict::Deny);
+        assert_eq!(policy.verdict("notebook_read_all"), ToolVerdict::Deny);
         // 授权类别放行。
-        assert!(!policy.violates("memo_search"));
-        assert!(!policy.violates("memo_write_note"));
+        assert_eq!(policy.verdict("memo_search"), ToolVerdict::Allow);
+        assert_eq!(policy.verdict("memo_write_note"), ToolVerdict::Allow);
         // 未识别类别放行（避免误杀 agent 内部机制）。
-        assert!(!policy.violates("think"));
-        assert!(!policy.violates("update_plan"));
-        assert!(!policy.violates(""));
+        assert_eq!(policy.verdict("think"), ToolVerdict::Allow);
+        assert_eq!(policy.verdict("update_plan"), ToolVerdict::Allow);
+        assert_eq!(policy.verdict(""), ToolVerdict::Allow);
     }
 
     #[test]
     fn tool_policy_inactive_without_grants() {
         // v1/v2 插件未声明 grants：不执法。
-        assert!(super::ToolPolicy::from_grants(&[]).is_none());
+        let empty = std::collections::HashSet::new();
+        assert!(super::ToolPolicy::from_grants(&[], &empty).is_none());
     }
 
     #[test]
     fn tool_policy_all_categories_pass_when_granted() {
-        let policy = super::ToolPolicy::from_grants(&[
-            grant("flowix.memo", "read"),
-            grant("flowix.notebook", "read"),
-            grant("shell", "confirm"),
-            grant("artifact", "write"),
-        ])
+        use super::ToolVerdict;
+        let empty = std::collections::HashSet::new();
+        let policy = super::ToolPolicy::from_grants(
+            &[
+                grant("flowix.memo", "read"),
+                grant("flowix.notebook", "read"),
+                grant("artifact", "write"),
+            ],
+            &empty,
+        )
         .expect("declared grants enforce");
-        for tool in ["memo_search", "notebook_list", "shell_exec", "save_artifact"] {
-            assert!(!policy.violates(tool), "{tool} should be granted");
+        for tool in ["memo_search", "notebook_list", "save_artifact"] {
+            assert_eq!(policy.verdict(tool), ToolVerdict::Allow, "{tool} should be granted");
         }
+    }
+
+    /// P1-5 confirm 档：未批准 → Confirm；批准后（进程级批准集）→ Allow；
+    /// allowlist 非空且命令不在表内 → Deny（逐命令 allowlist 执法）。
+    #[test]
+    fn tool_policy_confirm_gate_and_allowlist() {
+        use super::ToolVerdict;
+        let empty = std::collections::HashSet::new();
+        let mut shell_confirm = grant("shell", "confirm");
+        shell_confirm.allowlist = vec!["shell_exec".to_string()];
+        let policy = super::ToolPolicy::from_grants(&[shell_confirm], &empty).unwrap();
+        // allowlist 外的命令：直接 Deny。
+        assert_eq!(policy.verdict("run_bash_command"), ToolVerdict::Deny);
+        // allowlist 内但未批准：Confirm。
+        assert_eq!(
+            policy.verdict("shell_exec"),
+            ToolVerdict::Confirm { category: "shell".to_string() },
+        );
+        // 批准后：Allow。
+        let approved: std::collections::HashSet<String> = ["shell".to_string()].into();
+        let policy = super::ToolPolicy::from_grants(&[grant("shell", "confirm")], &approved).unwrap();
+        assert_eq!(policy.verdict("shell_exec"), ToolVerdict::Allow);
+    }
+
+    /// P1-5 批准集：按插件隔离，approve 后本会话可查。
+    #[test]
+    fn tool_grant_approve_scoped_by_plugin() {
+        super::approve_tool_grant("plug_test_a", "shell");
+        assert!(super::approved_categories_of("plug_test_a").contains("shell"));
+        // 其他插件不受影响。
+        assert!(!super::approved_categories_of("plug_test_b").contains("shell"));
     }
 }

@@ -239,6 +239,7 @@ pub async fn redaction_preview(
     recipient_display_name: Option<String>,
     in_reply_to: Option<String>,
     reply_hops_remaining: Option<u32>,
+    blind_relay: Option<bool>,
 ) -> Result<crate::redaction::RedactionPreviewReport, String> {
     if question.trim().is_empty() {
         return Err("QUESTION_REQUIRED".to_string());
@@ -272,7 +273,7 @@ pub async fn redaction_preview(
             .unwrap_or(crate::redaction::outbox::DISCLOSURE_MAX_HOPS.saturating_sub(1));
         (receipt_id, hops)
     });
-    crate::redaction::preview_full(
+    crate::redaction::preview_full_inner(
         &app_handle,
         &cwd,
         &question,
@@ -280,6 +281,7 @@ pub async fn redaction_preview(
         &effective,
         parties,
         reply,
+        blind_relay.unwrap_or(false),
     )
     .await
     .map_err(|error| error.to_ipc_error())
@@ -567,6 +569,145 @@ pub async fn redaction_directory_card(
 pub async fn redaction_relay_usage(
 ) -> Result<crate::redaction::directory::RelayUsage, String> {
     crate::redaction::directory::relay_usage().await
+}
+
+/// FD-11 §5 收端举报一条入站信封（账号 token 鉴权）。
+/// Ok(true) = 已受理；Ok(false) = 此前已举报过（幂等）。
+#[tauri::command]
+pub async fn redaction_report(
+    target_agent: String,
+    receipt_id: String,
+) -> Result<bool, String> {
+    crate::redaction::directory::report_abuse(&target_agent, &receipt_id).await
+}
+
+/// FD-11 P2-6：近 N 天用量报表（1-90 天）。
+#[tauri::command]
+pub async fn redaction_usage_summary(
+    days: i64,
+) -> Result<crate::redaction::directory::UsageSummary, String> {
+    crate::redaction::directory::usage_summary(days.clamp(1, 90)).await
+}
+
+// ----------------------------------------------------------------------
+// FD-11 P2-8：SSE 推送订阅（新信封通知 → 前端自动拉取）
+// ----------------------------------------------------------------------
+
+/// 订阅任务句柄 + 运行标志（进程级单订阅，重复 start = 幂等替换）。
+static PUSH_TASK: std::sync::OnceLock<
+    std::sync::Mutex<Option<(std::sync::Arc<std::sync::atomic::AtomicBool>, tauri::async_runtime::JoinHandle<()>)>>,
+> = std::sync::OnceLock::new();
+
+fn push_task() -> &'static std::sync::Mutex<
+    Option<(std::sync::Arc<std::sync::atomic::AtomicBool>, tauri::async_runtime::JoinHandle<()>)>,
+> {
+    PUSH_TASK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// 订阅中继 SSE：命中本机注册 agent 的新信封事件时 emit `redaction-inbound`。
+/// 断线 5s 退避重连；拉取语义不变（前端收到事件后自行 poll）。
+#[tauri::command]
+pub async fn redaction_push_start(
+    cwd: String,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    notebook_root(&cwd)?;
+    let config = load_config()?;
+    let token = config
+        .device_token
+        .clone()
+        .ok_or_else(|| "DEVICE_NOT_REGISTERED".to_string())?;
+    if config.relay_url.trim().is_empty() {
+        return Err("RELAY_NOT_CONFIGURED".to_string());
+    }
+    let mut guard = push_task().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((running, handle)) = guard.take() {
+        running.store(false, std::sync::atomic::Ordering::SeqCst);
+        handle.abort();
+    }
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let flag = running.clone();
+    let relay_url = config.relay_url.clone();
+    let agents = config.registered_agents.clone();
+    let handle = tauri::async_runtime::spawn(async move {
+        let mut backoff = std::time::Duration::from_secs(5);
+        while flag.load(std::sync::atomic::Ordering::SeqCst) {
+            match subscribe_once(&relay_url, &token, &agents, &app_handle, &flag).await {
+                Ok(()) => return,
+                Err(_) => {
+                    // 断线重连（退避封顶 60s）；错误不打断订阅生命周期。
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
+                }
+            }
+        }
+    });
+    *guard = Some((running, handle));
+    Ok(())
+}
+
+async fn subscribe_once(
+    relay_url: &str,
+    token: &str,
+    agents: &[String],
+    app: &tauri::AppHandle,
+    flag: &std::sync::atomic::AtomicBool,
+) -> Result<(), String> {
+    use futures_util::StreamExt as _;
+    use tauri::Emitter as _;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .map_err(|e| format!("PUSH_CLIENT_INIT_FAILED: {e}"))?;
+    let url = crate::redaction::inbound::relay_endpoint(relay_url, "/v2/events");
+    let response = client
+        .get(url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("PUSH_CONNECT_FAILED: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("PUSH_REJECTED:{}", response.status().as_u16()));
+    }
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+    while let Some(chunk) = stream.next().await {
+        if !flag.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+        let chunk = chunk.map_err(|e| format!("PUSH_STREAM_FAILED: {e}"))?;
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        // SSE 事件以空行分隔；只关心 data: 行。
+        while let Some(pos) = buffer.find("\n\n") {
+            let block: String = buffer.drain(..pos + 2).collect();
+            for line in block.lines() {
+                let Some(data) = line.strip_prefix("data:") else { continue };
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(data.trim()) else {
+                    continue;
+                };
+                let Some(agent_id) = value.get("agentId").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if agents.iter().any(|agent| agent == agent_id) {
+                    let _ = app.emit("redaction-inbound", serde_json::json!({ "agentId": agent_id }));
+                }
+            }
+        }
+    }
+    // 流正常结束（服务端关闭）：按断线重连处理。
+    Err("PUSH_STREAM_ENDED".to_string())
+}
+
+/// 停止 SSE 订阅（收件箱关闭时调用；幂等）。
+#[tauri::command]
+pub fn redaction_push_stop() -> Result<(), String> {
+    let mut guard = push_task().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((running, handle)) = guard.take() {
+        running.store(false, std::sync::atomic::Ordering::SeqCst);
+        handle.abort();
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -106,7 +106,10 @@ function textArea(): HTMLTextAreaElement {
 }
 
 async function selectFirstScope() {
-  const checkbox = host.querySelector<HTMLInputElement>('input[type="checkbox"]');
+  // 排除发起区的盲转开关（data-blind-relay），只取披露范围勾选框。
+  const checkbox = host.querySelector<HTMLInputElement>(
+    'input[type="checkbox"]:not([data-blind-relay])',
+  );
   expect(checkbox).not.toBeNull();
   await act(async () => checkbox!.click());
 }
@@ -168,8 +171,10 @@ describe('redaction send gate', () => {
 
     expect(redactionMock.preview).toHaveBeenCalledWith(CWD, '复购为什么下滑？', ['nb_1'], 'r2', {
       recipient: undefined,
+      sender: undefined,
       inReplyTo: undefined,
       replyHopsRemaining: undefined,
+      blindRelay: false,
     });
     expect(host.textContent).toContain(REPORT.finalText);
     expect(host.textContent).toContain('⟦PHONE-1⟧');

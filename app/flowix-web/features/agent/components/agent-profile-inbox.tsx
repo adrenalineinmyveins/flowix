@@ -1,9 +1,9 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Inbox, Loader2, RefreshCw, Send, ShieldCheck } from 'lucide-react';
+import { Flag, Inbox, Loader2, RefreshCw, Send, ShieldCheck, Sparkles } from 'lucide-react';
 
-import { agentProfile, redaction } from '@platform/tauri/client';
+import { agentProfile, consult, redaction } from '@platform/tauri/client';
 import type { InboundRecord, RedactionConfig } from '@/lib/types/redaction';
 import { useNoteStore } from '@features/memo/store/note-store';
 import { RedactionSendGateDialog } from '@features/agent/components/redaction-send-gate';
@@ -12,6 +12,7 @@ import { Button } from '@shared/ui/button';
 import { OverlayScrollbar } from '@shared/ui/overlay-scrollbar';
 import { ListSurfaceLoadingState } from '@shared/ui/list-surface';
 import { useI18n, type I18nKey } from '@/lib/i18n';
+import { subscribe } from '@platform/tauri/event-bus';
 import { cn } from '@/lib/utils';
 
 const STATUS_LABEL_KEYS: Record<InboundRecord['status'], I18nKey> = {
@@ -135,9 +136,111 @@ export function AgentProfileInbox({ notebookPath }: { notebookPath: string }) {
     }
   }, [notebookPath, reload]);
 
+  /** FD-11 §5 一键举报：向中继人工审核队列投递（账号 token 鉴权，幂等）。 */
+  const report = useCallback(async (record: InboundRecord) => {
+    setError(null);
+    setNotice(null);
+    try {
+      const accepted = await redaction.report(record.fromAgentId, record.receiptId);
+      if (disposedRef.current) return;
+      setNotice(accepted
+        ? t('agent.inbox.reportAccepted', { from: record.fromDisplayName || record.fromAgentId })
+        : t('agent.inbox.reportDuplicate'));
+    } catch (cause) {
+      if (!disposedRef.current) setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }, [t]);
+
+  // ------------------------------------------------------------------
+  // F4 编排自动回答（FD-11 v2 待办 P1-4）：把入站咨询交给本机专家生成草稿。
+  // 纪律：编排自动化，出门人审——结果只填入草稿框，仍走确认门后才出设备。
+  // ------------------------------------------------------------------
+
+  /** receiptId → 自动回答运行态。 */
+  const [autoBusy, setAutoBusy] = useState<Record<string, boolean>>({});
+  const [autoNote, setAutoNote] = useState<Record<string, string | null>>({});
+
+  /**
+   * 触发一次自动回答：命名空间 toAgent 的 slug 段即本机专家
+   * flowix_agent_id（inbox 注册时由裸 slug 补前缀而来）；from 取本机
+   * 另一 agent（单 agent 时自转述）。轮询事件直到 Result / Askback / Failed。
+   */
+  const autoAnswer = useCallback(async (record: InboundRecord) => {
+    if (autoBusy[record.receiptId]) return;
+    setError(null);
+    setAutoBusy((prev) => ({ ...prev, [record.receiptId]: true }));
+    setAutoNote((prev) => ({ ...prev, [record.receiptId]: null }));
+    try {
+      const profiles = await agentProfile.list(notebookPath);
+      const toAgent = record.toAgentId.split('/').pop() ?? record.toAgentId;
+      const fromAgent = profiles.find((profile) => profile.flowix_agent_id !== toAgent)
+        ?.flowix_agent_id ?? toAgent;
+      if (!profiles.some((profile) => profile.flowix_agent_id === toAgent)) {
+        throw new Error(t('agent.inbox.autoAnswerAgentMissing', { agent: toAgent }));
+      }
+      const meta = await consult.initiate(notebookPath, fromAgent, toAgent, record.payloadText);
+      let lastSeq = 0;
+      // 事件轮询（2s；编排一轮通常数十秒）。组件卸载经 disposedRef 退出。
+      for (let tick = 0; tick < 150; tick += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        if (disposedRef.current) return;
+        const events = await consult.events(notebookPath, fromAgent, meta.consultId, lastSeq);
+        let done = false;
+        for (const { seq, event } of events) {
+          lastSeq = Math.max(lastSeq, seq);
+          if (event.kind === 'result') {
+            setAnswerDrafts((prev) => ({ ...prev, [record.receiptId]: event.answer }));
+            setAutoNote((prev) => ({ ...prev, [record.receiptId]: t('agent.inbox.autoAnswerDone') }));
+            done = true;
+          } else if (event.kind === 'askback') {
+            setAutoNote((prev) => ({
+              ...prev,
+              [record.receiptId]: t('agent.inbox.autoAnswerAskback', { question: event.question }),
+            }));
+            done = true;
+          } else if (event.kind === 'failed') {
+            throw new Error(event.reason);
+          }
+        }
+        if (done) return;
+      }
+      throw new Error(t('agent.inbox.autoAnswerTimeout'));
+    } catch (cause) {
+      if (!disposedRef.current) {
+        setAutoNote((prev) => ({
+          ...prev,
+          [record.receiptId]: cause instanceof Error ? cause.message : String(cause),
+        }));
+      }
+    } finally {
+      if (!disposedRef.current) setAutoBusy((prev) => ({ ...prev, [record.receiptId]: false }));
+    }
+  }, [notebookPath, autoBusy, t]);
+
   const setTarget = useNoteStore((state) => state.setAgentProfileViewTarget);
   const selectedNotebookId = useNoteStore((state) => state.selectedNotebookId);
   const registeredCount = config?.registeredAgents?.length ?? 0;
+
+  // FD-11 P2-8：SSE 推送——订阅中继新信封事件，命中即自动拉取（3s 去抖合并）。
+  const pollRef = useRef(poll);
+  pollRef.current = poll;
+  useEffect(() => {
+    if (!notebookPath || !config?.deviceToken) return;
+    void redaction.pushStart(notebookPath).catch(() => undefined);
+    let timer: number | null = null;
+    const unlisten = subscribe<{ agentId: string }>('redaction-inbound', () => {
+      if (timer !== null) return;
+      timer = window.setTimeout(() => {
+        timer = null;
+        void pollRef.current();
+      }, 3000);
+    });
+    return () => {
+      if (timer !== null) window.clearTimeout(timer);
+      unlisten();
+      void redaction.pushStop().catch(() => undefined);
+    };
+  }, [notebookPath, config?.deviceToken, config?.registeredAgents?.length]);
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-[var(--document-bg)]">
@@ -230,10 +333,23 @@ export function AgentProfileInbox({ notebookPath }: { notebookPath: string }) {
                         {t('agent.inbox.hops')} {record.disclosure.hopsRemaining}
                         {expired && ` · ${t('agent.inbox.expired')}`}
                       </span>
+                      <button
+                        type="button"
+                        className="shrink-0 rounded-md p-1 text-[var(--muted-foreground)] transition-colors hover:text-[var(--destructive)]"
+                        title={t('agent.inbox.report')}
+                        onClick={() => void report(record)}
+                      >
+                        <Flag className="h-3.5 w-3.5" />
+                      </button>
                     </div>
                     <p className="whitespace-pre-wrap break-words text-sm leading-6 text-[var(--foreground)]">
                       {record.payloadText}
                     </p>
+                    {record.encrypted && (
+                      <p className="font-mono text-[11px] text-[var(--primary)]">
+                        {t('agent.inbox.encrypted')}
+                      </p>
+                    )}
                     {record.rejectCode && (
                       <p className="font-mono text-[11px] text-[var(--destructive)]">
                         {record.rejectCode}
@@ -260,22 +376,39 @@ export function AgentProfileInbox({ notebookPath }: { notebookPath: string }) {
                     )}
                     {record.status === 'accepted' && record.payloadKind === 'consultation' && (
                       <div className="space-y-2 border-t border-[var(--divider)] pt-3">
-                        <label className="block space-y-1.5">
+                        <div className="flex items-center gap-2">
                           <span className="text-xs font-medium text-[var(--foreground)]">
                             {t('agent.inbox.answerLabel')}
                           </span>
-                          <textarea
-                            className="w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2 text-sm leading-6 text-[var(--foreground)] outline-none transition-colors placeholder:text-[var(--muted-foreground)] focus:border-[var(--primary)]"
-                            value={answerDrafts[record.receiptId] ?? ''}
-                            onChange={(event) =>
-                              setAnswerDrafts((prev) => ({
-                                ...prev,
-                                [record.receiptId]: event.target.value,
-                              }))
-                            }
-                            placeholder={t('agent.inbox.answerPlaceholder')}
-                          />
-                        </label>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            className="ml-auto h-7 gap-1.5 rounded-lg px-2.5 text-xs"
+                            disabled={Boolean(autoBusy[record.receiptId])}
+                            onClick={() => void autoAnswer(record)}
+                          >
+                            {autoBusy[record.receiptId]
+                              ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              : <Sparkles className="h-3.5 w-3.5" />}
+                            {t('agent.inbox.autoAnswer')}
+                          </Button>
+                        </div>
+                        {autoNote[record.receiptId] && (
+                          <p className="text-xs leading-5 text-[var(--muted-foreground)]">
+                            {autoNote[record.receiptId]}
+                          </p>
+                        )}
+                        <textarea
+                          className="w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2 text-sm leading-6 text-[var(--foreground)] outline-none transition-colors placeholder:text-[var(--muted-foreground)] focus:border-[var(--primary)]"
+                          value={answerDrafts[record.receiptId] ?? ''}
+                          onChange={(event) =>
+                            setAnswerDrafts((prev) => ({
+                              ...prev,
+                              [record.receiptId]: event.target.value,
+                            }))
+                          }
+                          placeholder={t('agent.inbox.answerPlaceholder')}
+                        />
                         <div className="flex justify-end">
                           <Button
                             type="button"

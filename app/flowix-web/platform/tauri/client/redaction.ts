@@ -15,6 +15,7 @@ import type {
   RelayAccountInfo,
   RelayUsage,
   RelayDeliverResult,
+  UsageSummary,
   SendPayload,
 } from '@/lib/types/redaction';
 
@@ -45,6 +46,8 @@ export const redaction = {
       inReplyTo?: string;
       /** 回程信封跳数继承（请求信封 hopsRemaining - 1）。 */
       replyHopsRemaining?: number;
+      /** FD-11 P2-9 盲转：payload 加密（收件方须有目录卡公钥）。 */
+      blindRelay?: boolean;
     },
   ) =>
     invoke<RedactionPreviewReport>('redaction_preview', {
@@ -59,6 +62,7 @@ export const redaction = {
       recipientDisplayName: options?.recipient?.displayName,
       inReplyTo: options?.inReplyTo,
       replyHopsRemaining: options?.replyHopsRemaining,
+      blindRelay: options?.blindRelay,
     }),
 
   /** 确认门决定：approved → confirmed；否则 cancelled（超时语义同拒绝）。 */
@@ -134,4 +138,16 @@ export const redaction = {
     invoke<DirectoryCard>('redaction_directory_card', { user, agentSlug, relayUrl }),
 
   relayUsage: () => invoke<RelayUsage>('redaction_relay_usage'),
+
+  /** FD-11 §5 收端举报（返回 true=已受理，false=已举报过）。 */
+  report: (targetAgent: string, receiptId: string) =>
+    invoke<boolean>('redaction_report', { targetAgent, receiptId }),
+
+  /** FD-11 P2-8：SSE 推送订阅（新信封事件 → `redaction-inbound`）。 */
+  pushStart: (cwd: string) => invoke<void>('redaction_push_start', { cwd }),
+  pushStop: () => invoke<void>('redaction_push_stop'),
+
+  /** FD-11 P2-6：近 N 天用量报表 + 套餐配额档。 */
+  usageSummary: (days: number) =>
+    invoke<UsageSummary>('redaction_usage_summary', { days }),
 };

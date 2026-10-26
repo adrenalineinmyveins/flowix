@@ -32,6 +32,7 @@ import {
   PluginArtifactRenderer,
   type PluginArtifactRendererHandle,
 } from './plugin-artifact-renderer';
+import { PluginToolConfirmDialog } from './plugin-tool-confirm-dialog';
 import {
   isEmptyPluginFieldValue,
   pluginFieldLabel,
@@ -171,6 +172,8 @@ export function AgentPluginWorkbench({
 
   return (
     <div ref={canvasRef} className="relative flex h-full min-w-0 flex-col overflow-hidden bg-[var(--document-bg)] [&:fullscreen]:h-screen">
+      {/* FD-11 v2 P1-5：confirm 档工具审批（全局 store 队列，仅此一处渲染）。 */}
+      <PluginToolConfirmDialog />
       <div className="pointer-events-none absolute left-4 top-4 z-20">
         <div className="pointer-events-auto flex items-center gap-2 rounded-xl border border-[var(--divider)] bg-[var(--card)]/90 px-3 py-2 shadow-lg backdrop-blur">
           <button

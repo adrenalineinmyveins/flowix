@@ -8,6 +8,9 @@ const redactionMock = vi.hoisted(() => ({
   inboxRegister: vi.fn(),
   inboxSetStatus: vi.fn(),
   configGet: vi.fn(),
+  pushStart: vi.fn().mockResolvedValue(undefined),
+  pushStop: vi.fn().mockResolvedValue(undefined),
+  report: vi.fn().mockResolvedValue(true),
 }));
 
 const agentProfileMock = vi.hoisted(() => ({

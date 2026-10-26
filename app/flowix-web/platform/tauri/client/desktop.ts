@@ -513,6 +513,9 @@ export const plugins = {
     sourceNote?: string;
   }) => invoke<PluginRunStarted>('plugin_run', params),
   runStop: (runId: string) => invoke<boolean>('plugin_run_stop', { runId }),
+  /** FD-11 v2 P1-5：批准某插件的 confirm 档工具类别（本会话有效）。 */
+  toolGrantApprove: (pluginId: string, category: string) =>
+    invoke<void>('plugin_tool_grant_approve', { pluginId, category }),
   resolveNote: (memoId: string) =>
     invoke<PluginArtifact>('plugin_resolve_note', { memoId }),
 };

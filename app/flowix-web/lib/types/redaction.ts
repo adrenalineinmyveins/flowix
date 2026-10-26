@@ -146,6 +146,10 @@ export interface InboundRecord {
   disclosure: WireDisclosure;
   receivedAt: number;
   status: InboundStatus;
+  /** FD-11 v2 验签结论（verified/invalid/unsigned/unverified）。 */
+  signatureStatus?: string | null;
+  /** FD-11 P2-9 盲转：payload 为密文（payloadText 已解密或为占位提示）。 */
+  encrypted?: boolean;
 }
 
 /** redaction_inbox_poll 汇总。 */
@@ -222,4 +226,22 @@ export interface RelayUsage {
   deliverLimit: number;
   pollUsed: number;
   pollLimit: number;
+}
+
+/** FD-11 P2-6：按天用量行（UTC 日期）。 */
+export interface UsageDay {
+  date: string;
+  deliver: number;
+  poll: number;
+  directory: number;
+}
+
+/** FD-11 P2-6：用量报表 + 当前套餐配额档。 */
+export interface UsageSummary {
+  days: UsageDay[];
+  plan: {
+    deliverPerHour: number;
+    pollPerHour: number;
+    directoryPerDay: number;
+  };
 }

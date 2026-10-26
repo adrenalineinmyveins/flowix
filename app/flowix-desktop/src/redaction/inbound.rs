@@ -50,6 +50,10 @@ pub struct InboundRecord {
     /// `unsigned`（无签名块）/ `unverified`（from 无目录卡，缺信任锚）。
     #[serde(default)]
     pub signature_status: Option<String>,
+    /// FD-11 P2-9 盲转：信封 payload 为密文。解密成功时 `payloadText`
+    /// 已是明文；失败时为占位提示（人审决定拒收与否）。
+    #[serde(default)]
+    pub encrypted: bool,
 }
 
 pub fn inbound_dir(notebook_root: &Path) -> PathBuf {
@@ -87,17 +91,22 @@ pub fn validate_inbound(envelope: &WireEnvelope, local_agent_id: &str) -> Result
 
 /// 校验通过的入站信封 → 留档（Pending）。receiptId 已存在则跳过（去重幂等）。
 /// `signature_status`：验签结论随档（见 InboundRecord 注释）。
+/// `blind`：P2-9 盲转密文时的 `(encrypted, 最终展示文本)`——None = 明文信封。
 pub fn store_inbound(
     dir: &Path,
     queue_id: &str,
     envelope: &WireEnvelope,
     signature_status: Option<String>,
+    blind: Option<(bool, String)>,
 ) -> std::io::Result<bool> {
     std::fs::create_dir_all(dir)?;
     let path = record_path(dir, &envelope.provenance.receipt_id);
     if path.exists() {
         return Ok(false);
     }
+    let (encrypted, payload_text) = blind
+        .map(|(encrypted, text)| (encrypted, text))
+        .unwrap_or_else(|| (false, envelope.payload.text.clone()));
     let record = InboundRecord {
         receipt_id: envelope.provenance.receipt_id.clone(),
         queue_id: queue_id.to_string(),
@@ -105,13 +114,14 @@ pub fn store_inbound(
         from_display_name: envelope.from.display_name.clone(),
         to_agent_id: envelope.to.agent_id.clone(),
         payload_kind: envelope.payload.kind.clone(),
-        payload_text: envelope.payload.text.clone(),
+        payload_text,
         reject_code: None,
         in_reply_to: envelope.in_reply_to.clone(),
         disclosure: envelope.disclosure.clone(),
         received_at: now_unix(),
         status: InboundStatus::Pending,
         signature_status,
+        encrypted,
     };
     let tmp = dir.join(format!("{}.tmp", Uuid::new_v4().simple()));
     std::fs::write(&tmp, serde_json::to_vec_pretty(&record).expect("inbound serialize"))?;
@@ -145,6 +155,7 @@ pub fn store_rejected(
         received_at: now_unix(),
         status: InboundStatus::Rejected,
         signature_status: None,
+        encrypted: envelope.payload.cipher_text.is_some(),
     };
     let tmp = dir.join(format!("{}.tmp", Uuid::new_v4().simple()));
     std::fs::write(&tmp, serde_json::to_vec_pretty(&record).expect("inbound serialize"))?;
@@ -228,8 +239,26 @@ pub async fn poll_agent_inbox(
     for item in &body.envelopes {
         queue_ids.push(item.queue_id.clone());
         let signature_status = signature_status_of(&client, relay_url, &item.envelope, &mut public_keys).await;
+        // P2-9 盲转：密文信封优先用本机账号私钥解密（发起方公钥 =
+        // 签名 keyId，缺签名回退目录卡信任锚）；失败留占位提示人审。
+        let blind = item.envelope.payload.cipher_text.as_ref().map(|cipher| {
+            let sender_key = item
+                .envelope
+                .signature
+                .as_ref()
+                .map(|signature| signature.key_id.clone())
+                .or_else(|| public_keys.get(&item.envelope.from.agent_id).cloned().flatten());
+            let decrypted = super::account::read_account()
+                .and_then(|account| account.signing_key().ok())
+                .zip(sender_key)
+                .and_then(|(secret, public)| super::e2e::open(cipher, &public, &secret).ok());
+            match decrypted {
+                Some(plaintext) => (true, plaintext),
+                None => (true, "[盲转密文：本机无法解密]".to_string()),
+            }
+        });
         match validate_inbound(&item.envelope, agent_id) {
-            Ok(()) => match store_inbound(&dir, &item.queue_id, &item.envelope, signature_status) {
+            Ok(()) => match store_inbound(&dir, &item.queue_id, &item.envelope, signature_status, blind) {
                 Ok(true) => summary.stored += 1,
                 Ok(false) => summary.duplicates += 1,
                 Err(e) => return Err(format!("INBOUND_STORE_FAILED:{e}")),
@@ -374,7 +403,7 @@ mod tests {
                 expires_at: 4_102_444_800,
                 allowed_scopes: vec![],
             },
-            payload: WirePayload { kind: "consultation".into(), text: "远端问题".into() },
+            payload: WirePayload { kind: "consultation".into(), text: "远端问题".into(), cipher_text: None },
             provenance: WireProvenance {
                 pipeline_version: "1".into(),
                 rule_set_version: "rs".into(),
@@ -399,15 +428,36 @@ mod tests {
     fn stores_pending_and_dedupes() {
         let dir = tempfile::tempdir().unwrap();
         let envelope = sample("agt_b");
-        assert!(store_inbound(dir.path(), "q_1", &envelope, Some("unsigned".into())).unwrap());
+        assert!(store_inbound(dir.path(), "q_1", &envelope, Some("unsigned".into()), None).unwrap());
         // 同 receipt 再拉到：去重。
-        assert!(!store_inbound(dir.path(), "q_2", &envelope, None).unwrap());
+        assert!(!store_inbound(dir.path(), "q_2", &envelope, None, None).unwrap());
         let records = list_inbound(dir.path());
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].status, InboundStatus::Pending);
         assert_eq!(records[0].from_agent_id, "agt_a");
         assert_eq!(records[0].payload_text, "远端问题");
         assert_eq!(records[0].signature_status.as_deref(), Some("unsigned"));
+        assert!(!records[0].encrypted);
+    }
+
+    #[test]
+    fn stores_blind_payload_with_decrypted_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut envelope = sample("agt_b");
+        envelope.payload.cipher_text = Some("cipher-bytes".into());
+        envelope.payload.text = String::new();
+        // 解密成功路径：文本替换、encrypted 标记。
+        assert!(store_inbound(
+            dir.path(),
+            "q_1",
+            &envelope,
+            None,
+            Some((true, "解密后的咨询".to_string())),
+        )
+        .unwrap());
+        let records = list_inbound(dir.path());
+        assert_eq!(records[0].payload_text, "解密后的咨询");
+        assert!(records[0].encrypted);
     }
 
     #[test]
@@ -426,7 +476,7 @@ mod tests {
     fn status_transitions_only_from_pending() {
         let dir = tempfile::tempdir().unwrap();
         let envelope = sample("agt_b");
-        store_inbound(dir.path(), "q_1", &envelope, None).unwrap();
+        store_inbound(dir.path(), "q_1", &envelope, None, None).unwrap();
         set_inbound_status(dir.path(), "rct_in1", InboundStatus::Accepted).unwrap();
         // 已结算的不能再改。
         assert!(set_inbound_status(dir.path(), "rct_in1", InboundStatus::Rejected)

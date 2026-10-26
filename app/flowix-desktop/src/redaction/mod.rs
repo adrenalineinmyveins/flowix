@@ -25,6 +25,7 @@ use crate::nurture::should_accept_event_in_notebook;
 
 pub mod account;
 pub mod directory;
+pub mod e2e;
 pub mod inbound;
 pub mod outbox;
 pub mod transport;
@@ -464,6 +465,8 @@ pub fn submit_confirmation(
         OutboxStatus::Cancelled
     };
     if approved {
+        // P2-9 盲转：先加密（密文固化）再签名（签名覆盖密文）。
+        seal_payload_if_blind(notebook_root, receipt_id);
         attach_signature_if_available(notebook_root, receipt_id);
     }
     let record = settle(notebook_root, receipt_id, status)?;
@@ -472,6 +475,34 @@ pub fn submit_confirmation(
         let _ = tx.try_send(approved);
     }
     Ok(record)
+}
+
+/// FD-11 P2-9：盲转留档在确认通过时一次性加密（nonce 随机 → 必须固化，
+/// byte-equal 纪律禁止发送时再加密）。无账号/无收件方公钥/失败不阻塞
+/// 确认——退化为明文投递并留痕日志。
+fn seal_payload_if_blind(notebook_root: &std::path::Path, receipt_id: &str) {
+    let Some(account) = account::read_account() else { return };
+    let Some(mut record) = outbox::read_record(notebook_root, receipt_id) else { return };
+    if !record.blind_relay || record.cipher_text.is_some() {
+        return;
+    }
+    let Some(recipient_public) = record.recipient_public_key.clone() else {
+        tracing::warn!(receipt_id, "blind relay draft missing recipient key; sending plaintext");
+        return;
+    };
+    let Ok(signing_key) = account.signing_key() else {
+        tracing::warn!(receipt_id, "account signing key unreadable; sending plaintext");
+        return;
+    };
+    match e2e::seal(&record.payload, &recipient_public, &signing_key) {
+        Ok(cipher) => {
+            record.cipher_text = Some(cipher);
+            let _ = outbox::write_record(notebook_root, &record);
+        }
+        Err(error) => {
+            tracing::warn!(receipt_id, error, "blind relay encrypt failed; sending plaintext");
+        }
+    }
 }
 
 /// FD-11 v2：确认通过时若本机有中继账号，对信封签名并把签名块写进留档
@@ -562,6 +593,22 @@ pub async fn preview_full(
     target_level: &str,
     parties: Option<(outbox::AgentParty, outbox::AgentParty)>,
     reply: Option<(String, u32)>,
+) -> Result<RedactionPreviewReport, RedactionPipelineError> {
+    preview_full_inner(
+        app, notebook_path, question, scope_entry_ids, target_level, parties, reply, false,
+    )
+        .await
+}
+
+pub async fn preview_full_inner(
+    app: &tauri::AppHandle,
+    notebook_path: &str,
+    question: &str,
+    scope_entry_ids: &[String],
+    target_level: &str,
+    parties: Option<(outbox::AgentParty, outbox::AgentParty)>,
+    reply: Option<(String, u32)>,
+    blind_relay: bool,
 ) -> Result<RedactionPreviewReport, RedactionPipelineError> {
     use tauri::Manager;
 
@@ -698,6 +745,19 @@ pub async fn preview_full(
     if let Some((in_reply_to, hops)) = reply {
         record = record.with_reply(in_reply_to, hops);
     }
+    // FD-11 P2-9 盲转：预取收件方目录卡公钥（信任锚）固化进留档；
+    // 确认通过时据此加密。无卡/网络失败 → 拒开盲转（提示对方先发卡）。
+    if blind_relay {
+        let recipient = record.to_agent.agent_id.clone();
+        let Some((user, slug)) = recipient.split_once('/') else {
+            return Err(RedactionPipelineError::DistillFailed(
+                "BLIND_RELAY_RECIPIENT_INVALID".to_string(),
+            ));
+        };
+        let relay_url = crate::commands::redaction::redaction_config_for_pipeline().relay_url;
+        let public_key = fetch_recipient_public_key(&relay_url, user, slug).await?;
+        record = record.with_blind_relay(public_key);
+    }
     // F5 披露标记：当次授权范围进信封 disclosure.allowedScopes。
     record.allowed_scopes = scopes
         .iter()
@@ -713,6 +773,42 @@ pub async fn preview_full(
 
 trait TapDebug {
     fn tap_debug(self, reason: &str) -> Self;
+}
+
+/// FD-11 P2-9：取收件方目录卡公钥（盲转信任锚）。
+async fn fetch_recipient_public_key(
+    relay_url: &str,
+    user: &str,
+    slug: &str,
+) -> Result<String, RedactionPipelineError> {
+    if relay_url.trim().is_empty() {
+        return Err(RedactionPipelineError::DistillFailed(
+            "BLIND_RELAY_NOT_CONFIGURED".to_string(),
+        ));
+    }
+    let url = inbound::relay_endpoint(relay_url, &format!("/v2/directory/{user}/{slug}"));
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| RedactionPipelineError::DistillFailed(format!("BLIND_RELAY_FETCH_FAILED:{e}")))?
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| RedactionPipelineError::DistillFailed(format!("BLIND_RELAY_FETCH_FAILED:{e}")))?;
+    if !response.status().is_success() {
+        return Err(RedactionPipelineError::DistillFailed(
+            "BLIND_RELAY_NO_TRUST_ANCHOR".to_string(),
+        ));
+    }
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|_| RedactionPipelineError::DistillFailed("BLIND_RELAY_FETCH_INVALID".to_string()))?;
+    body.get("card")
+        .and_then(|card| card.get("publicKey"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| RedactionPipelineError::DistillFailed("BLIND_RELAY_NO_TRUST_ANCHOR".to_string()))
 }
 
 impl TapDebug for DistillOutcome {

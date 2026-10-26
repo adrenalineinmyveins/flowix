@@ -92,6 +92,15 @@ pub struct RedactionOutboxRecord {
     /// FD-11 v2：确认门通过时附上的出站签名（无账号 = None，匿名档）。
     #[serde(default)]
     pub signature: Option<flowix_relay::envelope::WireSignature>,
+    /// FD-11 P2-9 盲转模式：preview 时用户选择 + 预取的收件方 ed25519
+    /// 公钥（目录卡信任锚）。确认通过时据此一次性加密并固化 cipher。
+    #[serde(default)]
+    pub blind_relay: bool,
+    #[serde(default)]
+    pub recipient_public_key: Option<String>,
+    /// 盲转密文（NaCl box，base64；确认时固化，byte-equal 随档）。
+    #[serde(default)]
+    pub cipher_text: Option<String>,
 }
 
 impl RedactionOutboxRecord {
@@ -106,6 +115,13 @@ impl RedactionOutboxRecord {
     pub fn with_reply(mut self, in_reply_to: String, hops_remaining: u32) -> Self {
         self.in_reply_to = Some(in_reply_to);
         self.reply_hops_remaining = Some(hops_remaining);
+        self
+    }
+
+    /// FD-11 P2-9：开启盲转（收件方公钥由 preview 预取固化）。
+    pub fn with_blind_relay(mut self, recipient_public_key: String) -> Self {
+        self.blind_relay = true;
+        self.recipient_public_key = Some(recipient_public_key);
         self
     }
 
@@ -143,7 +159,13 @@ impl RedactionOutboxRecord {
             },
             payload: WirePayload {
                 kind: if is_reply { "reply" } else { "consultation" }.to_string(),
-                text: self.payload.clone(),
+                // P2-9 盲转：密文固化后明文置空（中继只见密文）。
+                text: if self.cipher_text.is_some() {
+                    String::new()
+                } else {
+                    self.payload.clone()
+                },
+                cipher_text: self.cipher_text.clone(),
             },
             provenance: WireProvenance {
                 pipeline_version: "1".to_string(),
@@ -209,6 +231,9 @@ pub fn draft_from_preview(
         in_reply_to: None,
         reply_hops_remaining: None,
         signature: None,
+        blind_relay: false,
+        recipient_public_key: None,
+        cipher_text: None,
     }
 }
 

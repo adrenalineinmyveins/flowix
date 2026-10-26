@@ -4,7 +4,12 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { BadgeCheck, Globe, Loader2, LogOut, Search, Upload } from 'lucide-react';
 
 import { redaction } from '@platform/tauri/client';
-import type { DirectoryPreviewResult, RelayAccountInfo, RelayUsage } from '@/lib/types/redaction';
+import type {
+  DirectoryPreviewResult,
+  RelayAccountInfo,
+  RelayUsage,
+  UsageSummary,
+} from '@/lib/types/redaction';
 import { Button } from '@shared/ui/button';
 import { Input } from '@shared/ui/input';
 import { useI18n } from '@/lib/i18n';
@@ -19,6 +24,9 @@ export function RelayAccountSection({ notebookPath }: { notebookPath: string }) 
   const { t } = useI18n();
   const [account, setAccount] = useState<RelayAccountInfo | null>(null);
   const [usage, setUsage] = useState<RelayUsage | null>(null);
+  /** FD-11 P2-6：近 7 天用量报表（展开态）。 */
+  const [summary, setSummary] = useState<UsageSummary | null>(null);
+  const [summaryOpen, setSummaryOpen] = useState(false);
   const [username, setUsername] = useState('');
   const [relayUrl, setRelayUrl] = useState('');
   const [busy, setBusy] = useState(false);
@@ -73,12 +81,27 @@ export function RelayAccountSection({ notebookPath }: { notebookPath: string }) 
       if (disposedRef.current) return;
       setAccount(null);
       setUsage(null);
+      setSummary(null);
+      setSummaryOpen(false);
     } catch (cause) {
       if (!disposedRef.current) setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       setBusy(false);
     }
   }, [busy]);
+
+  /** P2-6：展开/收起近 7 天报表（懒加载）。 */
+  const toggleSummary = useCallback(async () => {
+    if (!summaryOpen && !summary) {
+      try {
+        setSummary(await redaction.usageSummary(7));
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : String(cause));
+        return;
+      }
+    }
+    setSummaryOpen((open) => !open);
+  }, [summaryOpen, summary]);
 
   return (
     <section className="rounded-lg border border-[var(--border)] bg-[var(--card)] p-4">
@@ -104,6 +127,36 @@ export function RelayAccountSection({ notebookPath }: { notebookPath: string }) 
                 poll: `${usage.pollUsed}/${usage.pollLimit}`,
               })}
             </p>
+          )}
+          <button
+            type="button"
+            className="text-xs text-[var(--primary)] hover:underline"
+            onClick={() => void toggleSummary()}
+          >
+            {summaryOpen ? t('agent.relay.reportHide') : t('agent.relay.reportShow')}
+          </button>
+          {summaryOpen && summary && (
+            <div className="space-y-1 rounded-md border border-[var(--border)] p-2">
+              {summary.days.length === 0 && (
+                <p className="text-xs text-[var(--muted-foreground)]">{t('agent.relay.reportEmpty')}</p>
+              )}
+              {summary.days.map((day) => (
+                <p key={day.date} className="flex justify-between gap-2 font-mono text-[11px]">
+                  <span>{day.date}</span>
+                  <span>
+                    {t('agent.relay.reportDeliver')}: {day.deliver} · {t('agent.relay.reportPoll')}: {day.poll}
+                    {day.directory > 0 && ` · ${t('agent.relay.reportDirectory')}: ${day.directory}`}
+                  </span>
+                </p>
+              ))}
+              <p className="text-[11px] text-[var(--muted-foreground)]">
+                {t('agent.relay.reportPlan', {
+                  deliver: summary.plan.deliverPerHour,
+                  poll: summary.plan.pollPerHour,
+                  directory: summary.plan.directoryPerDay,
+                })}
+              </p>
+            </div>
           )}
           <div className="flex gap-2 pt-1">
             <Button size="sm" variant="outline" onClick={() => setPublishOpen(true)}>

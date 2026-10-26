@@ -325,6 +325,71 @@ pub async fn relay_usage() -> Result<RelayUsage, String> {
     })
 }
 
+/// FD-11 §5 收端举报：POST /v2/reports（账号 token 鉴权）。
+/// 幂等：同一 receipt 重复举报返回 Ok(false)（中继 409）。
+pub async fn report_abuse(target_agent: &str, receipt_id: &str) -> Result<bool, String> {
+    let account = super::account::read_account().ok_or("ACCOUNT_NOT_CONFIGURED")?;
+    let client = http_client().await?;
+    let url = super::inbound::relay_endpoint(&account.relay_url, "/v2/reports");
+    let response = client
+        .post(url)
+        .bearer_auth(&account.device_token)
+        .json(&serde_json::json!({ "targetAgent": target_agent, "receiptId": receipt_id }))
+        .send()
+        .await
+        .map_err(|e| format!("REPORT_REQUEST_FAILED: {e}"))?;
+    match response.status().as_u16() {
+        201 => Ok(true),
+        409 => Ok(false),
+        code => Err(format!("REPORT_REJECTED:{code}")),
+    }
+}
+
+/// FD-11 P2-6 计量报表：近 N 天按天用量 + 当前套餐配额档。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDay {
+    pub date: String,
+    pub deliver: i64,
+    pub poll: i64,
+    pub directory: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageSummary {
+    pub days: Vec<UsageDay>,
+    pub plan: UsagePlan,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsagePlan {
+    pub deliver_per_hour: i64,
+    pub poll_per_hour: i64,
+    pub directory_per_day: i64,
+}
+
+pub async fn usage_summary(days: i64) -> Result<UsageSummary, String> {
+    let account = super::account::read_account().ok_or("ACCOUNT_NOT_CONFIGURED")?;
+    let client = http_client().await?;
+    let url = super::inbound::relay_endpoint(&account.relay_url, "/v2/usage/summary");
+    let response = client
+        .get(url)
+        .query(&[("days", days.to_string())])
+        .bearer_auth(&account.device_token)
+        .send()
+        .await
+        .map_err(|e| format!("SUMMARY_FETCH_FAILED: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("SUMMARY_FETCH_REJECTED:{}", response.status().as_u16()));
+    }
+    response
+        .json()
+        .await
+        .map_err(|e| format!("SUMMARY_DECODE_FAILED: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

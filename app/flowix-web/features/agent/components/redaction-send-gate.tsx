@@ -117,6 +117,10 @@ export function RedactionSendGateDialog({
   const [tagDraft, setTagDraft] = useState('');
   /** F5 收件方：preset 锁定（回程）；否则用户可输 agentId（手动投递留空）。 */
   const [recipientAgentId, setRecipientAgentId] = useState('');
+  /** F5 发起身份（发起侧）：空 = 自动取第一个注册 agent；回程由 presetSender 锁定。 */
+  const [senderAgentId, setSenderAgentId] = useState('');
+  /** FD-11 P2-9 盲转：payload 加密（收件方须有目录卡公钥，命名空间地址）。 */
+  const [blindRelay, setBlindRelay] = useState(false);
 
   const [gate, setGate] = useState<RedactionGateView | null>(null);
   const [gateCreatedAt, setGateCreatedAt] = useState(0);
@@ -219,13 +223,16 @@ export function RedactionSendGateDialog({
         : recipientAgentId.trim()
           ? { agentId: recipientAgentId.trim(), displayName: '' }
           : undefined;
-      // 发起身份：回程用预设专家；发起侧（有网络收件方时）取本机首个注册 agent，
+      // 发起身份：回程用预设专家；发起侧（有网络收件方时）用所选或第一个注册 agent，
       // 无注册则 local（对端无法回程，等价手动投递语义）。
-      const sender = presetSender
-        ? { agentId: presetSender.agentId, displayName: presetSender.displayName ?? '' }
-        : recipient && config?.registeredAgents?.length
-          ? { agentId: config.registeredAgents[0], displayName: '' }
-          : undefined;
+      const senderAgent =
+        presetSender?.agentId || senderAgentId || config?.registeredAgents?.[0];
+      const sender = recipient && (presetSender || senderAgent)
+        ? {
+            agentId: presetSender?.agentId ?? senderAgent ?? '',
+            displayName: presetSender?.displayName ?? '',
+          }
+        : undefined;
       const report = await redaction.preview(
         notebookPath,
         question.trim(),
@@ -237,6 +244,7 @@ export function RedactionSendGateDialog({
           inReplyTo: replyTo?.receiptId,
           replyHopsRemaining:
             replyTo !== undefined ? Math.max(0, replyTo.hopsRemaining - 1) : undefined,
+          blindRelay: blindRelay && recipient !== undefined,
         },
       );
       if (disposedRef.current) return;
@@ -261,6 +269,8 @@ export function RedactionSendGateDialog({
     presetSender,
     presetRecipient,
     recipientAgentId,
+    senderAgentId,
+    blindRelay,
     replyTo,
   ]);
 
@@ -417,18 +427,52 @@ export function RedactionSendGateDialog({
                   </span>
                 </div>
               ) : (
-                <label className="block space-y-1.5">
-                  <span className="text-xs font-medium text-[var(--foreground)]">
-                    收件方 Agent ID（可选，F5 网络咨询必填）
-                  </span>
-                  <input
-                    className={inputClass}
-                    value={presetRecipient ? `${presetRecipient.displayName || ''} ${presetRecipient.agentId}`.trim() : recipientAgentId}
-                    readOnly={Boolean(presetRecipient)}
-                    onChange={(event) => setRecipientAgentId(event.target.value)}
-                    placeholder="agt_…（留空 = 手动投递）"
-                  />
-                </label>
+                <div className="space-y-3">
+                  <label className="block space-y-1.5">
+                    <span className="text-xs font-medium text-[var(--foreground)]">
+                      收件方 Agent ID（可选，F5 网络咨询必填）
+                    </span>
+                    <input
+                      className={inputClass}
+                      value={presetRecipient ? `${presetRecipient.displayName || ''} ${presetRecipient.agentId}`.trim() : recipientAgentId}
+                      readOnly={Boolean(presetRecipient)}
+                      onChange={(event) => setRecipientAgentId(event.target.value)}
+                      placeholder="agt_…（留空 = 手动投递）"
+                    />
+                  </label>
+                  {(config?.registeredAgents?.length ?? 0) > 0 && (() => {
+                    const agents = config?.registeredAgents ?? [];
+                    return (
+                      <label className="block space-y-1.5">
+                        <span className="text-xs font-medium text-[var(--foreground)]">
+                          发起身份（以哪个注册 Agent 的名义发出）
+                        </span>
+                        <select
+                          className={inputClass}
+                          value={senderAgentId || agents[0] || ''}
+                          onChange={(event) => setSenderAgentId(event.target.value)}
+                        >
+                          {agents.map((agent) => (
+                            <option key={agent} value={agent}>{agent}</option>
+                          ))}
+                        </select>
+                      </label>
+                    );
+                  })()}
+                  <label className="flex items-start gap-2 rounded-lg border border-[var(--border)] px-3 py-2 text-xs leading-5 text-[var(--muted-foreground)]">
+                    <input
+                      type="checkbox"
+                      data-blind-relay
+                      className="mt-0.5"
+                      checked={blindRelay}
+                      onChange={(event) => setBlindRelay(event.target.checked)}
+                    />
+                    <span>
+                      盲转加密（P2-9）：payload 端到端加密，中继只见密文。收件方须已发布
+                      目录卡（含公钥）；确认通过时加密固化，披露标记与溯源仍为明文。
+                    </span>
+                  </label>
+                </div>
               )}
 
               <div className="space-y-1.5">
