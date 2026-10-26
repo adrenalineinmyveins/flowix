@@ -233,3 +233,9 @@ CREATE TABLE thread_revisions (...);  -- 照 note_revisions（对话历史免费
 **顺带观察（预存行为，未改）**：每轮移动端成功回合产生**两条**云端 revision——app 推送（rev N）+ ~30s 后桌面 echo 重推（rev N+1，体积差 3-9B）。后者为桌面桥 reconcile 的投影归一化差异（桌面本地投影 hash ≠ 云端基线 → 误判 dirty → 重推自己投影；acknowledge 后基线对齐收敛、无回环放大）。正确性无影响，仅每轮多一次小 blob 写入；待投影序列化完全对齐后自然消失，或后续在 hash 比对前做投影规范化。失败回合补丁后移动端每轮成功回合会多一次 user-only 中间推送（同样小 blob，幂等收敛）。
 
 **本轮改动**：[chat.rs](../app/flowix-mobile/src/agent/chat.rs)（enqueue 前移 + 模块注释）、[agent-conversation-detail.tsx](../app/flowix-web/features/agent/components/agent-conversation-detail.tsx)（threads-changed 订阅）、本文档。验证：tsc 零错 + cargo check 零新告警 + 模拟器新 APK 实测（上）。
+
+## 15. 附：笔记「桌面→云→手机」同步评估与待办（2026-10-26）
+
+**评估结论：功能可用**。Loop 笔记本（桌面已启用云同步）三路径实测：产品内新建（编辑器/CLI）**~15s** 端到端（创建→云端→手机列表可见、正文完整）；编辑已有笔记（含外部工具直改文件）**2s**（写入→云端 revision 更新）→ 手机拉取渲染完整（202 字含新增行）；附件同步 A5 已验证。
+
+**待办：外部工具新建文件的 memo 注册滞后，同步挂起时间不可控**。实测外部进程直接在笔记本目录新建 md：watcher 秒级捕获并记 dirty ✅、搜索索引（notebook.db `notes` 表）秒级收录 ✅，但 **memo 注册（`memos`/`memo_lifecycles`，列表实体 + 云同步组装依赖）不发生** → dirty 挂起、pass 无法组装上传，实测 **4 分 21 秒**无推送，直到 CLI create 触发注册对账才连带补上（补注册与 CLI 新笔记注册时间戳相差 120ms 佐证同批）；若无后续产品内操作，可能挂到重启。根因：[processor.rs](../app/flowix-desktop/src/watcher/processor.rs) Create/Modify 路径只调 `refresh_note_path`（搜索索引层），无 memo 注册步骤；memo 注册对账（含 memo_id 分配）只由产品内创建类操作或启动流程触发。**修改已有文件不受影响**（memo 已注册，modify→dirty→push 全链秒级）。影响面：第三方编辑器（Typora/Obsidian 等）直接往笔记本目录新建文件的协作场景。修复方向（待做）：watcher Create 事件路径补 memo 注册，或云同步 pass 组装时发现 dirty note 无 memo 行即触发注册对账——涉及 memo_id 分配核心逻辑，需独立改动并配测试。
