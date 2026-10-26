@@ -7,7 +7,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -19,6 +19,11 @@ const RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 thread_local! {
     static NOTEBOOK_READ_LOCKS: RefCell<HashMap<(PathBuf, String), Rc<OsLock>>> = RefCell::new(HashMap::new());
+    /// 本线程当前持有的 notebook 独占锁（key 与 NOTEBOOK_READ_LOCKS 一致）。
+    /// notebook_change 持有期间，同线程再申请该笔记本的 shared 锁直接放行
+    ///（Exclusive 语义覆盖 Shared）——否则 fs2 新句柄自等自死锁
+    ///（消解器持锁调 register→refresh_note_path 的实测场景）。
+    static THREAD_EXCLUSIVE_NOTEBOOKS: RefCell<HashSet<(PathBuf, String)>> = RefCell::new(HashSet::new());
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,25 +43,42 @@ struct OsLock {
     file: File,
     path: PathBuf,
     operation: String,
+    mode: LockMode,
     acquired_at: Instant,
+}
+
+/// 进程内独占锁持有登记：notebook shared 锁超时时点名持有者。
+/// 文件锁本身无法枚举跨进程持有者；进程内登记覆盖自查场景
+///（桌面实测死锁均为进程内持有不释放）。
+fn exclusive_holders() -> &'static std::sync::Mutex<HashMap<PathBuf, (String, Instant)>> {
+    static HOLDERS: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, (String, Instant)>>> =
+        std::sync::OnceLock::new();
+    HOLDERS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
 impl Drop for OsLock {
     fn drop(&mut self) {
+        if self.mode == LockMode::Exclusive {
+            if let Ok(mut holders) = exclusive_holders().lock() {
+                holders.remove(&self.path);
+            }
+        }
         let _ = fs2::FileExt::unlock(&self.file);
         tracing::debug!(operation = %self.operation, lock = %self.path.display(), held_ms = self.acquired_at.elapsed().as_millis(), "operation lock released");
     }
 }
 
 pub struct NotebookReadGuard {
-    lock: Rc<OsLock>,
+    /// `None` = 同线程重入（本线程已持该笔记本 Exclusive），无需真实锁。
+    lock: Option<Rc<OsLock>>,
     key: (PathBuf, String),
 }
 
 impl Drop for NotebookReadGuard {
     fn drop(&mut self) {
+        let Some(lock) = &self.lock else { return };
         NOTEBOOK_READ_LOCKS.with_borrow_mut(|locks| {
-            if Rc::strong_count(&self.lock) == 2 {
+            if Rc::strong_count(lock) == 2 {
                 locks.remove(&self.key);
             }
         });
@@ -66,7 +88,18 @@ impl Drop for NotebookReadGuard {
 pub struct NotebookChangeGuard {
     _locks: Vec<OsLock>,
     _legacy_gate: OsLock,
+    keys: Vec<(PathBuf, String)>,
     _not_send: PhantomData<Rc<()>>,
+}
+
+impl Drop for NotebookChangeGuard {
+    fn drop(&mut self) {
+        THREAD_EXCLUSIVE_NOTEBOOKS.with_borrow_mut(|held| {
+            for key in &self.keys {
+                held.remove(key);
+            }
+        });
+    }
 }
 
 pub struct NotebookMaintenanceGuard {
@@ -128,13 +161,40 @@ impl OperationLocks {
                         || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
                 {
                     if started.elapsed() >= LOCK_TIMEOUT {
+                        // 点名进程内持有者：独占登记 + 持有时长，直接定位
+                        // 不释放的长事务（跨进程持有者只能靠锁文件句柄排查）。
+                        let holders = exclusive_holders()
+                            .lock()
+                            .map(|holders| {
+                                holders
+                                    .iter()
+                                    .map(|(path, (operation, acquired_at))| {
+                                        format!(
+                                            "{} ({} held {}ms)",
+                                            operation,
+                                            path.display(),
+                                            acquired_at.elapsed().as_millis()
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("; ")
+                            })
+                            .unwrap_or_default();
+                        tracing::warn!(
+                            operation,
+                            lock = %path.display(),
+                            mode = ?mode,
+                            in_process_exclusive_holders = %holders,
+                            "operation lock wait timed out"
+                        );
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             format!(
-                                "{operation}: timed out waiting for {} lock {} after {} ms",
+                                "{operation}: timed out waiting for {} lock {} after {} ms; in-process exclusive holders: {}",
                                 if mode == LockMode::Shared { "notebook shared" } else { "exclusive" },
                                 path.display(),
                                 started.elapsed().as_millis(),
+                                if holders.is_empty() { "(none)" } else { &holders },
                             ),
                         ));
                     }
@@ -143,8 +203,13 @@ impl OperationLocks {
                 Err(error) => return Err(error),
             }
         }
+        if mode == LockMode::Exclusive {
+            if let Ok(mut holders) = exclusive_holders().lock() {
+                holders.insert(path.clone(), (operation.to_owned(), Instant::now()));
+            }
+        }
         tracing::debug!(operation, lock = %path.display(), mode = ?mode, wait_ms = started.elapsed().as_millis(), "operation lock acquired");
-        Ok(OsLock { file, path, operation: operation.to_owned(), acquired_at: Instant::now() })
+        Ok(OsLock { file, path, operation: operation.to_owned(), mode, acquired_at: Instant::now() })
     }
 
     /// Attempt a single non-blocking lock acquisition. Returns `Ok(None)` when
@@ -165,8 +230,13 @@ impl OperationLocks {
         };
         match result {
             Ok(()) => {
+                if mode == LockMode::Exclusive {
+                    if let Ok(mut holders) = exclusive_holders().lock() {
+                        holders.insert(path.clone(), (operation.to_owned(), Instant::now()));
+                    }
+                }
                 tracing::debug!(operation, lock = %path.display(), mode = ?mode, "operation lock acquired (non-blocking)");
-                Ok(Some(OsLock { file, path, operation: operation.to_owned(), acquired_at: Instant::now() }))
+                Ok(Some(OsLock { file, path, operation: operation.to_owned(), mode, acquired_at: Instant::now() }))
             }
             Err(error)
                 if error.kind() == io::ErrorKind::WouldBlock
@@ -200,15 +270,21 @@ impl OperationLocks {
     pub fn notebook_read(&self, notebook_id: &str, operation: &str) -> io::Result<NotebookReadGuard> {
         let relative = Self::notebook_lock_path(notebook_id)?;
         let key = (self.config_dir.clone(), notebook_id.to_owned());
+        if THREAD_EXCLUSIVE_NOTEBOOKS.with_borrow(|held| held.contains(&key)) {
+            // 同线程已持该笔记本 Exclusive：直接放行（语义覆盖），避免
+            // fs2 新句柄自等自死锁。
+            return Ok(NotebookReadGuard { lock: None, key });
+        }
         if let Some(lock) = NOTEBOOK_READ_LOCKS.with_borrow(|locks| locks.get(&key).cloned()) {
-            return Ok(NotebookReadGuard { lock, key });
+            return Ok(NotebookReadGuard { lock: Some(lock), key });
         }
         let lock = Rc::new(self.lock_file(&relative, LockMode::Shared, operation)?);
         NOTEBOOK_READ_LOCKS.with_borrow_mut(|locks| {
             locks.insert(key.clone(), lock.clone());
         });
         Ok(NotebookReadGuard {
-            lock, key,
+            lock: Some(lock),
+            key,
         })
     }
 
@@ -227,10 +303,17 @@ impl OperationLocks {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "cannot upgrade notebook shared lock to exclusive"));
         }
         let mut locks = Vec::with_capacity(ids.len());
+        let mut keys = Vec::with_capacity(ids.len());
         for id in ids {
             locks.push(self.lock_file(&Self::notebook_lock_path(id)?, LockMode::Exclusive, operation)?);
+            keys.push((self.config_dir.clone(), id.to_string()));
         }
-        Ok(NotebookChangeGuard { _locks: locks, _legacy_gate: legacy_gate, _not_send: PhantomData })
+        THREAD_EXCLUSIVE_NOTEBOOKS.with_borrow_mut(|held| {
+            for key in &keys {
+                held.insert(key.clone());
+            }
+        });
+        Ok(NotebookChangeGuard { _locks: locks, _legacy_gate: legacy_gate, keys, _not_send: PhantomData })
     }
 
     pub fn notebook_maintenance(&self, notebook_id: &str, operation: &str) -> io::Result<NotebookMaintenanceGuard> {
@@ -455,6 +538,28 @@ mod tests {
         // than already finished.
         assert!(receiver.recv_timeout(Duration::from_millis(150)).is_err());
         drop(_change);
+        receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+    }
+
+    /// 消解器场景：持 notebook_change（Exclusive）的同线程再拿 notebook_read
+    ///（Shared）必须立即成功（重入放行）——修复前 fs2 新句柄自等自死锁。
+    #[test]
+    fn notebook_read_is_reentrant_while_holding_change_on_same_thread() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        let locks = OperationLocks::new(config.clone());
+        let change = locks.notebook_change(&["book"], "resolve_cloud_file_put_conflict").unwrap();
+        // 修复前：这一步内部自等 5s 后 TimedOut。
+        let read = locks.notebook_read("book", "refresh_note_index_path").unwrap();
+        // 重入 guard 不得占用真实文件锁：drop change 后其他线程能立即拿 Exclusive。
+        drop(read);
+        drop(change);
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _change = OperationLocks::new(config).notebook_change(&["book"], "other").unwrap();
+            sender.send(()).unwrap();
+        });
         receiver.recv_timeout(Duration::from_secs(2)).unwrap();
         worker.join().unwrap();
     }
