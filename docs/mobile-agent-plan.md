@@ -239,3 +239,19 @@ CREATE TABLE thread_revisions (...);  -- 照 note_revisions（对话历史免费
 **评估结论：功能可用**。Loop 笔记本（桌面已启用云同步）三路径实测：产品内新建（编辑器/CLI）**~15s** 端到端（创建→云端→手机列表可见、正文完整）；编辑已有笔记（含外部工具直改文件）**2s**（写入→云端 revision 更新）→ 手机拉取渲染完整（202 字含新增行）；附件同步 A5 已验证。
 
 **待办：外部工具新建文件的 memo 注册滞后，同步挂起时间不可控**。实测外部进程直接在笔记本目录新建 md：watcher 秒级捕获并记 dirty ✅、搜索索引（notebook.db `notes` 表）秒级收录 ✅，但 **memo 注册（`memos`/`memo_lifecycles`，列表实体 + 云同步组装依赖）不发生** → dirty 挂起、pass 无法组装上传，实测 **4 分 21 秒**无推送，直到 CLI create 触发注册对账才连带补上（补注册与 CLI 新笔记注册时间戳相差 120ms 佐证同批）；若无后续产品内操作，可能挂到重启。根因：[processor.rs](../app/flowix-desktop/src/watcher/processor.rs) Create/Modify 路径只调 `refresh_note_path`（搜索索引层），无 memo 注册步骤；memo 注册对账（含 memo_id 分配）只由产品内创建类操作或启动流程触发。**修改已有文件不受影响**（memo 已注册，modify→dirty→push 全链秒级）。影响面：第三方编辑器（Typora/Obsidian 等）直接往笔记本目录新建文件的协作场景。修复方向（待做）：watcher Create 事件路径补 memo 注册，或云同步 pass 组装时发现 dirty note 无 memo 行即触发注册对账——涉及 memo_id 分配核心逻辑，需独立改动并配测试。
+
+## 16. 附：笔记本锁死循环——外部文档会话导致云同步停摆 + 本地编辑被覆盖（2026-10-26，高优先级待办）
+
+**用户实测报告**：桌面编辑 `Untitled.md` 保存多次，手机端始终未收到，最终本地内容回到编辑前原文（**编辑丢失**）。
+
+**根因链**（实测取证，两次全新进程 100% 复现）：
+1. **桌面云同步 pass 全灭**：pass 的 memo index 阶段（`refresh_note_index_path`）申请 notebook **shared** 文锁 5s 超时（`locks/notebooks/<id>.lock`），说明进程内某任务持有该笔记本 **Exclusive**（`notebook_change`）不释放。与 **workspace 恢复打开的 Untitled.md 外部文档会话**强相关：重启 dev 后 11 秒内（首轮 pass）即复发；无其他 flowix 进程在场（已排查残留 CLI）。
+2. **失败 pass 的 apply 阶段每轮回写远端版本到本地磁盘**：external-watch 观测 Untitled.md 每 ~5.7s（与 pass 超时周期锁步）被 modified 一次、偶发 deleted+重建；因 pass 失败不 acknowledge，下轮再 apply 再回写——**把用户本地编辑覆盖回云端旧版**（本地 14:18 起内容回到原文、size 179 稳定）。
+3. **手机端编辑器自动保存回写云端**（打开笔记即「已保存」回写 put，云端 changes seq 165-172 连续 5 次 Untitled put）→ 双端回声循环，桌面确认失败期间云端版本被手机持续刷新。
+4. 用户桌面 dirty 挂起（generation 2→9），`last_success_at` 停在 2026-10-26 06:04:52Z，之后所有 pass 失败；`blob_reservations` 无新行（push 从未到达 blob 阶段）。
+
+**影响**：任一「外部文档打开 + 云端存在该笔记新版本」的组合下，该笔记本云同步完全停摆、本地编辑被静默覆盖丢失。严重级。
+
+**修复方向（待做，需专项）**：① 定位 Exclusive 持有路径——外部文档会话生命周期（`external_document_watch` / document-session / workspace restore 链）中拿 `notebook_change` 后不释放或与 apply 回写形成锁序死锁；建议先给 `operation_locks.rs` 的 acquire/release 加 tracing（operation 名落日志），复现时直接读出持有者；② 复查 pass 失败路径：apply 回写后 memo index 失败时应**回滚或不回写**（当前「apply 已落盘 + pass 失败不 ack」组合正是覆盖用户编辑的机制）；③ 手机端编辑器「打开即自动保存回写」应加内容比对（无变化不 put），消除回声源。
+
+**临时规避（待验证）**：关闭桌面对应外部文档标签（恢复会话不再打开它）后观察 pass 是否恢复；本记录时点桌面 dev 仍处于死锁状态（第二轮复现中）。
