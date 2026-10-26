@@ -92,6 +92,17 @@ export function ChatScreen({ threadId, onBack, onThreadCreated }: Props) {
     };
   }, [reload]);
 
+  // 远端（另一端）消息经同步到达时刷新当前会话；与本地流式互不干扰
+  //（reload 幂等重读，live 增量独立渲染在已落库消息之后）。
+  useEffect(() => {
+    const unlisten = listenEvent('threads-changed', () => {
+      void reload();
+    }).catch(() => Promise.resolve(() => {}));
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, [reload]);
+
   // 新内容自动滚底
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
