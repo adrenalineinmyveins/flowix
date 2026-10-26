@@ -150,6 +150,8 @@ fn automatic_sync_available(app: &AppHandle, notebook_id: &str) -> bool {
 fn automatic_sync_target_available(app: &AppHandle, target: &SyncTarget) -> bool {
     match target {
         SyncTarget::Notebook(notebook_id) => automatic_sync_available(app, notebook_id),
+        // 账户级 pass 不依赖任何笔记本启用：threads 桥跟认证走
+        //（引擎 inbound 按 enabled 过滤笔记，threads 不过滤）。
         SyncTarget::FullAccount => {
             let state = app.state::<AppState>();
             state
@@ -157,11 +159,6 @@ fn automatic_sync_target_available(app: &AppHandle, target: &SyncTarget) -> bool
                 .state()
                 .map(|cloud| cloud.authenticated)
                 .unwrap_or(false)
-                && !state
-                    .cloud_sync
-                    .v2_enabled_notebooks()
-                    .unwrap_or_default()
-                    .is_empty()
         }
     }
 }
@@ -764,17 +761,15 @@ pub(crate) fn start_cloud_sync_polling(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(CLOUD_POLL_INTERVAL).await;
+            // threads 桥跟认证走：笔记本未启用也保持账户级 poll
+            //（引擎 inbound 按 enabled 过滤笔记，threads 不过滤）。
             let should_poll = {
                 let state = app.state::<AppState>();
-                let cloud_state = state.cloud_sync.state().ok();
-                matches!(
-                    cloud_state,
-                    Some(CloudState { authenticated: true, .. })
-                ) && !state
+                state
                     .cloud_sync
-                    .v2_enabled_notebooks()
-                    .unwrap_or_default()
-                    .is_empty()
+                    .state()
+                    .map(|cloud| cloud.authenticated)
+                    .unwrap_or(false)
             };
             if should_poll {
                 if let Err(error) = send_sync_request(&app, SyncCoordinatorRequest::Poll) {
