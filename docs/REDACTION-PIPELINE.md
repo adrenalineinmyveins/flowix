@@ -322,7 +322,7 @@ pub async fn run_redaction(req: RedactionRequest, ctx: &PipelineCtx) -> Result<R
 
 未决事项：
 
-1. approval 新增 disclosure 类别还是复用 permissions 类别（影响 dsh-appserver 改动面）`[To be confirmed]`
+1. approval 新增 disclosure 类别还是复用 permissions 类别（影响 dsh-appserver 改动面）`[已决策 2026-10-21]` 复用 permissions 类别——disclosure 审批不在 DSH approval 层建模，权威执法点保持在应用层确认门（F5 `redaction_confirm_wait` + outbox 留档 + byte-equal 单点出门）。理由：permissions（能力授予）与 disclosure（数据流出）语义正交；DSH 层另建 disclosure 类别会形成双审批入口，破坏留档一致性；confirm 档 toolGrants 逐命令审批走既有 permission request/response 通路，dsh-appserver 零协议扩展
 2. 占位符回填默认关闭，是否提供用户显式开启的「查看回填」能力（仅本地预览、不回传）`[To be confirmed]`
-3. 平台对 `disclosure.hopsRemaining` 的消费与执法契约（路线 B 云端设计时定）`[Hypothesis]`
-4. 蒸馏默认走哪个 Agent 类型/模型（建议跟随用户当前默认 Agent，配置可覆盖）`[To be confirmed]`
+3. 平台对 `disclosure.hopsRemaining` 的消费与执法契约（路线 B 云端设计时定）`[已闭环 2026-10-20]` FD-11 v2 中继落地跳数执法（回程 hops 递减、0 拒投），见 F5-CROSS-USER-NETWORK §8 M5 验收
+4. 蒸馏默认走哪个 Agent 类型/模型（建议跟随用户当前默认 Agent，配置可覆盖）`[已闭环 2026-10-18]` FD-8 落地 `distillAgentType` 配置字段，空 = 默认 deepseek-harness

@@ -157,6 +157,37 @@ receiptId 去重）。
 客户端改动面：`redaction/transport.rs`（签名+命名空间）、`outbox.rs`（地址解析）、
 身份卡（公钥管理 + 目录卡分享）；F6 管线零改动。
 
+### 8.2 v2 backlog 提前交付（2026-10-21，P2 四项）
+
+F5 §1「不做」清单四项经用户确认提前执行，形态各收敛为最小可用：
+
+- **P2-6 计量报表层**（FD-1 维持「只计量不结算」）：中继 `GET /v2/usage/summary?days=N`
+  （usage_events 按天聚合 + 当前套餐配额档）；客户端「中继账号与目录」区近 7 天
+  用量报表（懒加载展开，逐日投递/拉取/目录写 + 套餐行）。无支付集成。
+- **P2-7 联邦一跳转发**：`--peers url1,url2` 启动参数；本中继无此 agent 时向对端
+  逐个转发（任一 2xx 即成功，伪 queueId `fed:<peer>`）；`X-Forwarded-From` 已途径
+  列表防环；转发计量主体 `fed:<第一跳>`（配额同认证档；header 伪造收益上限 =
+  注册账号，记录在案）。信任传递靠信封签名 + 目录卡跨中继可查（地址含中继 URL）。
+  不做路由表/多跳/全网目录同步。测试：`federation_one_hop_forward_and_loop_guard`
+  （双 relay 转发 + 防环 + 无 peers 404）。
+- **P2-8 SSE 推送**：中继 `GET /v2/events`（Bearer；broadcast 通道，按 token 拥有的
+  agent 过滤，20s keep-alive）；投递入队后广播 agentId。客户端 `redaction_push_start/stop`
+  进程级单订阅（fetch 流式解析，5s 起步指数退避封顶 60s 重连），命中本机注册 agent
+  时 emit `redaction-inbound`；收件箱监听后 3s 去抖自动拉取。**消费语义不变**
+  （at-least-once + ack），SSE 只是「该来拉了」的信号。
+- **P2-9 E2E 盲转加密**（F5 §6 边界不破：仅 payload.text，disclosure/provenance 恒明文）：
+  wire `WirePayload.cipherText` 可选字段（旧端忽略）；NaCl box（X25519+XSalsa20-Poly1305），
+  密钥**不引入新体系**——账号 Ed25519 经标准 NaCl 映射转换（公钥 to_montgomery /
+  私钥 clamp(sha512(seed)[..32])，libsodium 互操作）。链路：preview 时勾选盲转 →
+  预取收件方目录卡公钥固化留档（无卡拒开）→ 确认通过时**先加密后签名**（签名覆盖
+  密文，密文随档固化，byte-equal 不变）→ text 置空中继只见密文。收端拉取时用
+  本机账号私钥解密（发起方公钥 = 签名 keyId，缺签名回退目录卡），失败留占位
+  提示人审；留档 `encrypted` 标记，收件卡片显示「盲转加密信封」。
+
+测试：relay 31 测全绿（含联邦 + 举报幂等 + SSE 路由编译）；desktop redaction 53 测
+全绿（含 e2e roundtrip/防篡改/签名共存 + 盲转留档）；cross_user_m5 + network_roundtrip
+不回退；前端 tsc 0 错、redaction 相关 19 测全绿。
+
 ## 9. 风险与对策
 
 | 风险 | 对策 |
