@@ -282,3 +282,24 @@ CREATE TABLE thread_revisions (...);  -- 照 note_revisions（对话历史免费
 
 **遗留待办（非本功能引入）**：① 移动端**新建笔记首推不生效**——note_create/note_save 记 dirty 后 pass 上传 0（LoopCardTest.md 十余分钟未上云），而编辑已有云笔记（loop-note-1）dirty 推送正常；新 note 无 baseline 时内容对账也跳过，需查 dirty 队列消费路径。② 桌面生产包（旧版）云同步轮询停摆：18:03 后未再拉取云端 put（dev 版未登录云）；重启生产包 + dev 均未恢复，与本轮 thread card 无关，归入 §15/§16 既有挂起问题族。③ 桌面打开移动端卡的视觉确认随 ② 恢复后补做。
 - **修复验证**：新版 APK 重装后续发一轮（before 2 → after 4 条气泡，user/assistant 各一条），重复显示消除；旧对话重开加载亦干净。
+
+## 18. 桌面云同步停摆排查与修复 + thread card 跨端双卡互认（2026-10-26）
+
+**现象**：桌面生产/dev 进程 18:03 拉取一次后再不拉取云端新 put（移动端 18:11-18:12 三连 put 未达桌面），重启进程也不恢复。
+
+**根因链（两层）**：
+1. **登录态丢失（触发）**：服务端 refresh token **单次使用**（[auth.rs](../app/flowix-cloud/src/auth.rs) refresh 即 DELETE 旧行签新行）。旧 dev 进程持登录态运行中 access 过期自动 refresh 轮换；进程被 `Stop-Process -Force` 强杀落在「服务端已消费旧 token、客户端 secrets 未写回新 token」窗口 → secrets 里残留已消费 token → 新进程启动 restore → 服务端 INVALID_REFRESH_TOKEN → 客户端 [auth.rs L123-131](../app/flowix-sync/src/manager/auth.rs) 自动清账号（clear_v2_account：sync.db states/cursor/synced_notebooks 全清 + 删 secrets token）→ 后续所有进程读到的都是未登录态，云同步静默不跑。
+2. **重新登录后 bootstrap 冲突死循环（暴露的第二层）**：恢复登录（API 登录注入 refreshToken + 重建 synced_notebooks 行）后 pass 报 `CLOUD_LOCAL_EDIT_CONFLICT: local file preserved at <file>` 循环不收敛。根因：[v2_local_content_diverged](../app/flowix-sync/src/v2.rs) 的 `(本地存在, 无基线)` 判据——logout 清空 states 后 bootstrap 从 cursor 0 重放全量历史 changes，本地内容（最终态）与任何一条**历史版本**都不相等，且分页拉取使批内去重也无法覆盖跨页历史 → 每条历史 put 都报冲突 → cursor 永不推进。
+
+**修复**（[remote_apply.rs](../app/flowix-desktop/src/commands/cloud/local_adapter/remote_apply.rs) 三处）：
+- P0-2 回声抑制去掉 old_path 条件：disk hash == expected 即跳过写盘（登出重登后无基线时本地与远端一致的场景不再误入 P1-3）；
+- 同批 changes 按 filename 去重只 apply 最后一条（中间版本只可能来自 cursor 重放，逐条落盘会把本地反复覆盖回旧版）；
+- put 路径的 P1-3 判据去掉 `(Some, None)`（无基线≠分叉；本地领先的兜底改由 has_pending dirty 队列承担），并在无基线覆盖前把本地字节**首次归档**一份 conflict 副本（副本路径按 note_id 固定、已存在则跳过，重放不覆盖真本地版）——任何场景本地内容不丢。删除路径的 (Some, None) 保护语义未动。
+
+**验证**：修复后 dev 热重编，cursor 0→225 一轮收敛、threads bootstrap 完成、零 WARN；本地与云端 8 文件全量一致、无冲突副本残留（对齐场景走 P0-2 skip）；外部直写 2026-10-26test.md（双卡版 562B）30s 内经 watcher→dirty→push 上云（seq 226）。cloud 相关 35 单测零回归（含 delete 路径无基线保护用例）。
+
+**thread card 跨端双卡互认（实机闭环）**：桌面卡（deepseek-harness，threadId 为本地 runtime 线程）+ 移动端卡（mobile，threadId 空）写入同一笔记上云后，移动端打开渲染 **2 张卡**：mobile 卡可对话（composer 在）、桌面卡只读（「桌面端 AI 会话 · 只读」，线程未上云时提示「会话尚未同步到本机」）；移动端自动保存回写后云端 blob 双 marker 完整保留（48=2×24 字符）。桌面→云→手机、手机→云→（桌面文件层）双向均通。
+
+**操作备查**：dev 连自建云必须带 `FLOWIX_CLOUD_API_BASE=http://8.160.162.251:8787`（默认 cloud.flowix.cc，登录会 INVALID_CREDENTIALS）；桌面 dev WebView 调试用 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9223` 后 CDP 直连（可 invoke cloud_login/cloud_sync_now）。账号 loop@selfhost.local。
+
+**遗留**：① 强杀落 refresh 轮换窗口丢登录态的窗口期风险（服务端单次消费 + 客户端写回非原子）——低频可接受，后续可考虑服务端 token 宽限或客户端原子写回；② 移动端新建笔记首推不生效（§17 待办①，仍未查）。

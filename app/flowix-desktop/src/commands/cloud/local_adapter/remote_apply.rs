@@ -97,13 +97,35 @@ fn apply_v2_note_changes(
     changes: &[&V2RemoteApply],
 ) -> Result<(), String> {
     let memo_file = read_lock(&state.memo_file, "memo_file");
+    // 同一文件的中间版本只可能来自 cursor 重放（logout 清零后 bootstrap 从头拉取
+    // 全量历史），逐条落盘会把本地内容反复覆盖回旧版，且每条历史 put 都可能撞
+    // P1-3 的无基线误判。按 filename 去重、只 apply 流内最后一条（最终态）。
+    let mut deduped: Vec<&V2RemoteApply> = Vec::with_capacity(changes.len());
+    let mut last_index_by_file: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    for change in changes {
+        let filename = match change {
+            V2RemoteApply::Note { filename, .. } => filename.as_str(),
+            other => {
+                deduped.push(other);
+                continue;
+            }
+        };
+        match last_index_by_file.get(filename) {
+            Some(&index) => deduped[index] = change,
+            None => {
+                last_index_by_file.insert(filename, deduped.len());
+                deduped.push(change);
+            }
+        }
+    }
     let mut deferred: Vec<DeferredIndexAction> = Vec::new();
     let result = apply_v2_note_changes_locked(
         &memo_file,
         state,
         app,
         notebook_id,
-        changes,
+        &deduped,
         &mut deferred,
     );
     // 排他锁在此（result 内部 guard 已 drop）后执行全部索引动作；无论成败
@@ -355,10 +377,10 @@ fn apply_v2_note_changes_locked(
             let disk_hash = disk_bytes.as_ref().map(|bytes| v2_content_hash(bytes));
 
             // P0-2: 回声 / 内容已一致 → 跳过写盘与事件（避免监听器把“内容未变”的
-            // 写盘误判为外部编辑）。
-            if matches!(&old_path, Some(path) if path == &desired_path)
-                && disk_hash.as_deref() == Some(expected_hash)
-            {
+            // 写盘误判为外部编辑）。不依赖 old_path：登出重登后 states 清空、基线为
+            // None，bootstrap 首轮拉取时同名文件即使内容与远端一致，也会被 P1-3 的
+            // (本地存在, 无基线) 判据误判为本地分叉——内容一致时本就无需写盘。
+            if disk_hash.as_deref() == Some(expected_hash) {
                 deferred.push(DeferredIndexAction::RegisterNote {
                     path: desired_path,
                 });
@@ -372,6 +394,9 @@ fn apply_v2_note_changes_locked(
             //   ② 磁盘正文偏离同步基线 note_state.content_hash —— 即时读盘+读同步状态，
             //     堵住 ① 的延迟窗口：快速编辑时编辑器刚保存、watcher 还没 mark dirty，
             //     但磁盘已领先于同步基线，据此判定本地已编辑、不覆盖。
+            // 注意不采用 (本地存在, 无基线) 判分叉：logout 清空 states 后 bootstrap 会
+            // 从 cursor 0 重放全量历史，本地（最终态）与任何一条历史版本都不相等，
+            // 若以无基线判分叉则每条历史 put 都报冲突，pass 永远无法收敛。
             let baseline_hash = state
                 .cloud_sync
                 .v2_note_state(note_id)
@@ -382,15 +407,35 @@ fn apply_v2_note_changes_locked(
                 .cloud_sync
                 .has_pending_v2_note_change(note_id)
                 .unwrap_or(false);
-            let locally_edited = v2_local_content_diverged(
-                disk_hash.as_deref(),
-                baseline_hash.as_deref(),
-                has_pending_change,
-            );
+            let locally_edited = has_pending_change
+                || matches!(
+                    (disk_hash.as_deref(), baseline_hash.as_deref()),
+                    (Some(local), Some(acknowledged)) if local != acknowledged
+                );
             if locally_edited {
                 return Err(format!(
                     "CLOUD_LOCAL_EDIT_CONFLICT: local file preserved at {filename}"
                 ));
+            }
+            // 无基线（bootstrap 重放）时本地磁盘内容先归档一份 conflict 副本再落远端
+            // 版本——无基线下无法区分「本地与云端一致」与「本地领先未推送」，归档
+            // 保证任何场景本地字节不丢。副本路径按 note_id 固定且只在首次写入，
+            // 历史重放后续轮次不覆盖已归档的最初本地版本。
+            if baseline_hash.is_none() {
+                if let Some(bytes) = disk_bytes.as_deref() {
+                    let preserved = cloud_conflict_copy_path(&desired_path, note_id);
+                    if !preserved.exists() {
+                        if flowix_core::memo_file::atomic_create_bytes(&preserved, bytes)
+                            .map_err(sync_error)
+                            .is_ok()
+                        {
+                            deferred.push(DeferredIndexAction::RegisterConflictCopy {
+                                path: preserved,
+                                attachment: false,
+                            });
+                        }
+                    }
+                }
             }
             if let Some(path) = &old_path {
                 crate::watcher::runtime::mark_self_write_for(app, path);
