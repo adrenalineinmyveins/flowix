@@ -1,10 +1,16 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Info, ListTodo } from 'lucide-react';
+import { CloudUpload, Info, ListTodo } from 'lucide-react';
 import type { CSSProperties } from 'react';
 import mcpPluginIcon from '@/assets/mcp-plugin.svg';
 import { Tooltip } from '@shared/ui/tooltip';
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+} from '@shared/ui/dropdown-menu';
 import type { Notebook } from '@features/memo/store/note-store';
 import { NotebookSelectorPopup } from '@features/shell/components/status-bar/notebook-selector-popup';
 import { ProductUpdatePill } from '@features/shell/components/status-bar/product-update-pill';
@@ -20,6 +26,7 @@ import { useI18n } from '@/lib/i18n';
 import { toast } from '@/lib/toast';
 import { cloudSyncErrorMessage } from '@platform/tauri/errors';
 import { useDocumentMetricsStore } from '@features/document/store/document-metrics-store';
+import { useDocumentStore } from '@features/document/store/document-store';
 import { useNoteStore } from '@features/memo/store/note-store';
 import { CloudStatusIcon } from '@shared/icons/cloud-status-icon';
 import { TagSvgIcon } from '@shared/ui/tag-icon';
@@ -219,6 +226,35 @@ export function StatusBar({
     });
   }, [t]);
 
+  // 「复制到云端笔记本」：把当前打开的笔记复制到任一启用云同步的其他
+  // 笔记本。语义是加入双向同步（复制后云端/移动端可见，之后双向续传）。
+  const activeSession = useDocumentStore((state) => state.activeExternalSession);
+  const currentNoteRef = activeSession?.notebookId && activeSession?.relativePath
+    ? { notebookId: activeSession.notebookId, relativePath: activeSession.relativePath }
+    : null;
+  const cloudCopyTargets = currentNoteRef
+    ? notebooks.filter((notebook) =>
+      cloudSyncedNotebookIds.has(notebook.id) && notebook.id !== currentNoteRef.notebookId)
+    : [];
+  const copyNoteToCloud = useCallback((targetId: string, targetName: string) => {
+    if (!currentNoteRef) return;
+    void cloud
+      .copyNoteToCloudNotebook(currentNoteRef.notebookId, currentNoteRef.relativePath, targetId)
+      .then(() => {
+        toast.success(t('shell.statusBar.copyToCloudDone', { name: targetName }));
+      })
+      .catch((error) => {
+        toast.error(cloudSyncErrorMessage(error, t));
+      });
+  }, [currentNoteRef, t]);
+  const handleCopyToCloudClick = useCallback(() => {
+    if (cloudCopyTargets.length === 0) {
+      toast.info(t('shell.statusBar.copyToCloudNoTarget'));
+    } else if (cloudCopyTargets.length === 1) {
+      copyNoteToCloud(cloudCopyTargets[0].id, cloudCopyTargets[0].name);
+    }
+  }, [cloudCopyTargets, copyNoteToCloud, t]);
+
   useEffect(() => {
     if (!cloudSyncInProgress) {
       setCloudPendingOperationCount(0);
@@ -305,6 +341,41 @@ export function StatusBar({
           </button>
         )}
         <ProductUpdatePill updater={updater} />
+        {cloudSyncAvailable && cloudCopyTargets.length > 1 && (
+          <DropdownMenu>
+            <Tooltip content={t('shell.statusBar.copyToCloud')} side="top">
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  className="h-full flex items-center justify-center px-1.5 py-0 text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)]"
+                  aria-label={t('shell.statusBar.copyToCloud')}
+                >
+                  <CloudUpload className="h-3.5 w-3.5" />
+                </button>
+              </DropdownMenuTrigger>
+            </Tooltip>
+            <DropdownMenuContent align="end" side="top">
+              {cloudCopyTargets.map((target) => (
+                <DropdownMenuItem key={target.id} onClick={() => copyNoteToCloud(target.id, target.name)}>
+                  {target.name}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
+        {cloudSyncAvailable && cloudCopyTargets.length <= 1 && (
+          <Tooltip content={t('shell.statusBar.copyToCloud')} side="top">
+            <button
+              type="button"
+              onClick={handleCopyToCloudClick}
+              disabled={!currentNoteRef}
+              className="h-full flex items-center justify-center px-1.5 py-0 text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)] disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent"
+              aria-label={t('shell.statusBar.copyToCloud')}
+            >
+              <CloudUpload className="h-3.5 w-3.5" />
+            </button>
+          </Tooltip>
+        )}
         {cloudSyncAvailable && (
           <Tooltip content={t('preferences.cloud.syncNow')} side="top">
             <button

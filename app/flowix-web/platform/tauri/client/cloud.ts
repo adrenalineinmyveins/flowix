@@ -143,6 +143,8 @@ export const cloud = {
     invoke<CloudCheckout>('cloud_create_checkout', { productId }),
   syncNow: (notebookId?: string) =>
     invoke<CloudSyncResult>('cloud_sync_now', { notebookId }),
+  copyNoteToCloudNotebook: (fromNotebookId: string, relativePath: string, toNotebookId: string) =>
+    invoke<string>('copy_note_to_cloud_notebook', { fromNotebookId, relativePath, toNotebookId }),
   noteHistory: (notebookId: string, relativePath: string) =>
     invoke<CloudNoteHistory>('cloud_note_history', { notebookId, relativePath }),
   previewNoteRevision: (notebookId: string, relativePath: string, revision: string) =>

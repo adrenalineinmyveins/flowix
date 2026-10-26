@@ -570,6 +570,7 @@ pub fn run() {
             commands::cloud::cloud_list_products,
             commands::cloud::cloud_create_checkout,
             commands::cloud::cloud_sync_now,
+            commands::cloud::copy_note_to_cloud_notebook,
             commands::cloud::cloud_note_history,
             commands::cloud::list_local_path_archives,
             commands::cloud::restore_local_path_version,

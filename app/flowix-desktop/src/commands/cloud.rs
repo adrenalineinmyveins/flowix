@@ -370,6 +370,73 @@ pub async fn cloud_sync_now(
     coordinator::sync_now(notebook_id, app).await
 }
 
+/// 复制一篇笔记到另一个笔记本（「复制到云端笔记本」入口）。
+/// 文件级复制（frontmatter 随文件原样保留）+ memo 注册 + Created 事件 +
+/// 立即调度目标笔记本同步——目标启用云同步时几秒内上云、移动端可见。
+#[tauri::command]
+pub fn copy_note_to_cloud_notebook(
+    from_notebook_id: String,
+    relative_path: String,
+    to_notebook_id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    if from_notebook_id == to_notebook_id {
+        return Err("COPY_NOTE_SAME_NOTEBOOK".into());
+    }
+    let memo_file = read_lock(&state.memo_file, "memo_file");
+    let _guard = memo_file
+        .operation_locks()
+        .notebook_change(&[&to_notebook_id], "copy_note_to_cloud_notebook")
+        .map_err(sync_error)?;
+    let from_notebook = memo_file
+        .get_notebook_config_by_id(&from_notebook_id)
+        .ok_or_else(|| "NOTEBOOK_NOT_FOUND".to_string())?;
+    let to_notebook = memo_file
+        .get_notebook_config_by_id(&to_notebook_id)
+        .ok_or_else(|| "NOTEBOOK_NOT_FOUND".to_string())?;
+    let source = local_adapter::safe_cloud_note_path(Path::new(&from_notebook.path), &relative_path)?;
+    if !source.is_file() {
+        return Err("COPY_NOTE_SOURCE_MISSING".into());
+    }
+    let filename = source
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "COPY_NOTE_INVALID_NAME".to_string())?
+        .to_owned();
+    // 目标重名：`stem (cloud).md` 起步，存在则递增序号。
+    let to_root = Path::new(&to_notebook.path);
+    let mut destination = to_root.join(&filename);
+    if destination.exists() {
+        let stem = source.file_stem().and_then(|v| v.to_str()).unwrap_or("note");
+        let mut counter = 2;
+        loop {
+            destination = to_root.join(format!("{stem} (cloud {counter}).md"));
+            if !destination.exists() {
+                break;
+            }
+            counter += 1;
+        }
+    }
+    crate::watcher::runtime::mark_self_write_for(&app, &destination);
+    std::fs::copy(&source, &destination).map_err(sync_error)?;
+    let created = memo_file
+        .register_existing_file_for_notebook_id(&to_notebook_id, &destination)?;
+    memo_events::emit(
+        &app,
+        MemoEvent::Created {
+            memo: created,
+            notebook_id: to_notebook_id.clone(),
+            derived_changed: MemoDerivedChanged::default(),
+            source: MemoChangeSource::UserImport,
+        },
+    );
+    schedule_notebook_sync(app, to_notebook_id);
+    let created_relative =
+        flowix_core::memo_file::notebook_relative_path(to_root, &destination)?;
+    Ok(created_relative)
+}
+
 #[tauri::command]
 pub async fn cloud_note_history(
     notebook_id: String,
