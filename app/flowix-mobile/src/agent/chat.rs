@@ -48,14 +48,56 @@ pub(crate) fn request_stop(thread_id: &str) {
     }
 }
 
+/// 笔记上下文（P1a）：卡片发送时携带所在笔记，首条消息注入 [CONTEXT] 块。
+/// 与桌面 store/context-block.ts 同款格式；落库 content 仍存用户原文，
+/// 上下文只在请求瞬间拼接（等价桌面 content/llmContent 分离）。
+#[derive(Debug, Clone)]
+pub(crate) struct ChatNoteContext {
+    pub notebook_id: String,
+    pub relative_path: String,
+}
+
+pub(crate) const CONTEXT_PROMPT_MARKER: &str = "<## CONTEXT PROMPT ##>";
+const CONTEXT_NOTE_PREVIEW_CHARS: usize = 500;
+
+/// 读笔记并构造上下文块（读失败静默降级为无上下文，不阻断发送）。
+fn build_note_context_suffix(
+    state: &crate::cache::MobileState,
+    context: &ChatNoteContext,
+) -> Option<String> {
+    let notebook = state
+        .memo_file
+        .get_notebook_config_by_id(&context.notebook_id)?;
+    let path = crate::cache::path_from_relative(
+        std::path::Path::new(&notebook.path),
+        &context.relative_path,
+    )
+    .ok()?;
+    let content = std::fs::read_to_string(path).ok()?;
+    let preview: String = content
+        .replace("\r\n", "\n")
+        .trim()
+        .chars()
+        .take(CONTEXT_NOTE_PREVIEW_CHARS)
+        .collect();
+    if preview.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{CONTEXT_PROMPT_MARKER}\n\n当前笔记内容（前{CONTEXT_NOTE_PREVIEW_CHARS}字）:\n{preview}"
+    ))
+}
+
 /// 发送一条消息并流式收回答。立即返回；进度经 `agent-chunk` 事件推送。
 /// 前端不信本函数的返回值判定流结束——以 `stream_end` chunk 为准。
 pub(crate) async fn chat_send(
     app: AppHandle,
     agent: Arc<AgentState>,
     sync: Arc<flowix_sync::SyncManager>,
+    state: &crate::cache::MobileState,
     thread_id: Option<String>,
     content: String,
+    note_context: Option<ChatNoteContext>,
 ) -> Result<String, String> {
     let config = agent.provider_config()?;
     if !config.is_ready() {
@@ -81,6 +123,13 @@ pub(crate) async fn chat_send(
             created_at: now,
             messages: Vec::new(),
         });
+    // 上下文块只随首条消息注入（对齐桌面 isFirstMessage 语义），
+    // 且只进请求不落库——落库 content 恒为用户原文。
+    let llm_context_suffix = if payload.messages.is_empty() {
+        note_context.and_then(|context| build_note_context_suffix(state, &context))
+    } else {
+        None
+    };
     payload.messages.push(V2ThreadMessage {
         id: AgentState::new_message_id(),
         role: "user".into(),
@@ -106,7 +155,7 @@ pub(crate) async fn chat_send(
 
     // 2. spawn 流式任务（不阻塞 IPC）
     tauri::async_runtime::spawn(async move {
-        run_chat_turn(app, agent, sync, payload, config).await;
+        run_chat_turn(app, agent, sync, payload, config, llm_context_suffix).await;
     });
     Ok(thread_id)
 }
@@ -117,6 +166,7 @@ async fn run_chat_turn(
     sync: Arc<flowix_sync::SyncManager>,
     mut payload: V2ThreadPayload,
     config: super::AgentProviderConfig,
+    llm_context_suffix: Option<String>,
 ) {
     let thread_id = payload.thread_id.clone();
     let stop = stop_flag(&thread_id);
@@ -128,15 +178,28 @@ async fn run_chat_turn(
         },
     );
 
-    // 请求体：历史投影为 OpenAI 消息数组（reasoning/tool 只读字段不上行）
+    // 请求体：历史投影为 OpenAI 消息数组（reasoning/tool 只读字段不上行）。
+    // 最后一条 user 消息按需拼接上下文块（llmContent 语义，落库仍为原文）。
+    let last_user_index = payload
+        .messages
+        .iter()
+        .rposition(|message| message.role == "user");
     let messages: Vec<Value> = payload
         .messages
         .iter()
-        .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
-        .map(|message| {
+        .enumerate()
+        .filter(|(_, message)| matches!(message.role.as_str(), "user" | "assistant"))
+        .map(|(index, message)| {
+            let mut llm_content = message.content.clone();
+            if Some(index) == last_user_index {
+                if let Some(suffix) = llm_context_suffix.as_ref() {
+                    llm_content.push_str("\n");
+                    llm_content.push_str(suffix);
+                }
+            }
             serde_json::json!({
                 "role": message.role,
-                "content": message.content,
+                "content": llm_content,
             })
         })
         .collect();

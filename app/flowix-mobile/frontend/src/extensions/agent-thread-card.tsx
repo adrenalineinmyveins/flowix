@@ -5,6 +5,7 @@ import { NodeViewWrapper, ReactNodeViewRenderer } from '@tiptap/react';
 import { ArrowUp, ChevronDown, Square, Trash2 } from 'lucide-react';
 import { api, listenEvent, type AgentChunk, type ThreadMessage } from '../api';
 import { MessageBubble } from '../ChatScreen';
+import { renderChatMarkdown } from '../chat-render';
 
 // ── 桌面端 thread card 存储格式：纯函数在同目录 agent-thread-card-md.ts ──
 import {
@@ -21,6 +22,7 @@ import {
 function useThreadChat(
   threadId: string | null,
   onThreadResolved: (threadId: string) => void,
+  noteContext?: { notebookId: string; relativePath: string } | null,
 ) {
   const [messages, setMessages] = useState<ThreadMessage[] | null>(null);
   const [streaming, setStreaming] = useState(false);
@@ -31,6 +33,8 @@ function useThreadChat(
   const inflightRef = useRef(false);
   const resolvedCbRef = useRef(onThreadResolved);
   resolvedCbRef.current = onThreadResolved;
+  const noteContextRef = useRef(noteContext);
+  noteContextRef.current = noteContext;
 
   const adoptThreadId = useCallback((id: string) => {
     if (activeThreadRef.current === id) return;
@@ -114,7 +118,8 @@ function useThreadChat(
         { id: `pending-${Date.now()}`, role: 'user', content: trimmed, createdAt: Date.now() },
       ]);
       try {
-        const resolved = await api.agentChatSend(activeThreadRef.current, trimmed);
+        // P1a：卡片携带所在笔记上下文（仅首条消息生效，落库恒为原文）
+        const resolved = await api.agentChatSend(activeThreadRef.current, trimmed, noteContextRef.current);
         inflightRef.current = false;
         adoptThreadId(resolved);
         return true;
@@ -133,6 +138,11 @@ function useThreadChat(
 // ── 卡片视图 ────────────────────────────────────────────────────────────────
 // typeKey === 'mobile'（本机/云端移动端会话）：可对话；其余桌面 runtime 卡只读。
 
+interface ThreadCardOptions {
+  /** 卡片所在笔记（P1a 上下文注入；由 EditorScreen configure 传入） */
+  noteContext?: { notebookId: string; relativePath: string } | null;
+}
+
 function AgentThreadCardComponent({ node, editor, getPos, deleteNode }: NodeViewProps) {
   const attrs = node.attrs as {
     threadId: string | null;
@@ -140,6 +150,12 @@ function AgentThreadCardComponent({ node, editor, getPos, deleteNode }: NodeView
     typeKey: string;
     collapsed: boolean;
   };
+  // P1a：所在笔记经扩展 storage 读取（configure → addStorage），
+  // 避免包装 NodeView 组件破坏 ReactNodeViewRenderer 的组件身份
+  const noteContext =
+    (editor?.storage?.agentThreadCard as
+      | { noteContext?: { notebookId: string; relativePath: string } | null }
+      | undefined)?.noteContext ?? null;
   const interactive = attrs.typeKey === 'mobile' || !attrs.typeKey;
   const [draft, setDraft] = useState('');
 
@@ -166,6 +182,7 @@ function AgentThreadCardComponent({ node, editor, getPos, deleteNode }: NodeView
   const { messages, liveText, liveReasoning, streaming, error, send } = useThreadChat(
     attrs.threadId,
     handleThreadResolved,
+    noteContext,
   );
 
   const onSend = async () => {
@@ -212,9 +229,16 @@ function AgentThreadCardComponent({ node, editor, getPos, deleteNode }: NodeView
                   <div className="chat-reasoning-body">{liveReasoning}</div>
                 </details>
               ) : null}
-              <div className="chat-bubble-text">
-                {liveText || <span className="chat-cursor">▍</span>}
-              </div>
+              {liveText ? (
+                <div
+                  className="chat-bubble-text chat-md"
+                  dangerouslySetInnerHTML={{ __html: renderChatMarkdown(liveText) }}
+                />
+              ) : (
+                <div className="chat-bubble-text">
+                  <span className="chat-cursor">▍</span>
+                </div>
+              )}
             </div>
           ) : null}
           {error ? <div className="atc-m-error">{error}</div> : null}
@@ -278,12 +302,20 @@ function newInstanceId(): string {
     : `mi-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-export const AgentThreadCardMobile = Node.create({
+export const AgentThreadCardMobile = Node.create<ThreadCardOptions>({
   name: 'agentThreadCard',
   group: 'block',
   content: '',
   selectable: false,
   draggable: false,
+
+  addOptions() {
+    return { noteContext: null };
+  },
+
+  addStorage() {
+    return { noteContext: this.options.noteContext ?? null };
+  },
 
   addAttributes() {
     return {

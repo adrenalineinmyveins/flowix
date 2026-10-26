@@ -97,8 +97,11 @@ export function EditorScreen({ note, onBack }: { note: OpenNote; onBack: () => v
       TableCell,
       // 图片附件：asset://localhost 语法与桌面互认，跨设备按文件名回落
       MobileImage.configure({ notebookId: note.notebookId }),
-      // AI 对话卡片：HTML 注释存储与桌面互认；mobile 卡可对话，桌面卡只读
-      AgentThreadCardMobile,
+      // AI 对话卡片：HTML 注释存储与桌面互认；mobile 卡可对话，桌面卡只读。
+      // P1a：携带所在笔记，卡片首条消息自动注入笔记上下文
+      AgentThreadCardMobile.configure({
+        noteContext: { notebookId: note.notebookId, relativePath: note.relativePath },
+      }),
     ],
     content: '',
     editable: false,

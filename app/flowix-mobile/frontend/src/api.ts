@@ -155,8 +155,12 @@ export const api = {
     invoke<ThreadMessage[]>('agent_thread_messages', { threadId }),
   agentThreadDelete: (threadId: string) =>
     invoke<boolean>('agent_thread_delete', { threadId }),
-  agentChatSend: (threadId: string | null, content: string) =>
-    invoke<string>('agent_chat_send', { threadId, content }),
+  agentChatSend: (
+    threadId: string | null,
+    content: string,
+    noteContext?: { notebookId: string; relativePath: string } | null,
+  ) =>
+    invoke<string>('agent_chat_send', { threadId, content, noteContext }),
   agentChatStop: (threadId: string) => invoke<void>('agent_chat_stop', { threadId }),
 };
 

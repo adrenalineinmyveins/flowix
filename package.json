@@ -80,6 +80,7 @@
     "github-slugger": "^2.0.0",
     "katex": "^0.17.0",
     "lucide-react": "^1.33.0",
+    "marked": "^17.0.1",
     "mammoth": "^1.13.0",
     "markmap-lib": "^0.18.12",
     "markmap-view": "^0.18.12",

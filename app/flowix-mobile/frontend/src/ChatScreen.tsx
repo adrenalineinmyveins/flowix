@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ArrowUp, Square } from 'lucide-react';
+import { ArrowUp, Check, ChevronDown, Copy, Square, Terminal } from 'lucide-react';
 import { api, listenEvent, AgentChunk, ThreadMessage } from './api';
+import { renderChatMarkdown, toolCallSummary } from './chat-render';
 
 interface Props {
   threadId: string;
@@ -8,29 +9,136 @@ interface Props {
   onThreadCreated: (threadId: string) => void;
 }
 
+function formatMessageTime(timestamp: number): string {
+  const date = new Date(timestamp);
+  const now = new Date();
+  const sameDay =
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate();
+  const hm = `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+  return sameDay ? hm : `${date.getMonth() + 1}月${date.getDate()}日 ${hm}`;
+}
+
+function CopyButton({ text, className }: { text: string; className: string }) {
+  const [copied, setCopied] = useState(false);
+  const onCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch {
+      // WebView 剪贴板权限被拒时静默
+    }
+  };
+  return (
+    <button
+      className={className}
+      aria-label="复制"
+      onClick={(event) => {
+        event.stopPropagation();
+        void onCopy();
+      }}
+    >
+      {copied ? <Check size={13} /> : <Copy size={13} />}
+    </button>
+  );
+}
+
+/** 工具调用行：名字 + 命令摘要，点击展开入参/结果（数据已上云，只读）。 */
+function ToolCallRow({ message }: { message: ThreadMessage }) {
+  const [expanded, setExpanded] = useState(false);
+  const summary = toolCallSummary(message.toolName, message.toolInput);
+  return (
+    <div className={`chat-tool-row ${expanded ? 'expanded' : ''}`}>
+      <button className="chat-tool-row-header" onClick={() => setExpanded((v) => !v)}>
+        <Terminal size={13} />
+        <span className="chat-tool-row-name">{message.toolName || 'tool'}</span>
+        {summary ? <span className="chat-tool-row-summary">{summary}</span> : null}
+        <ChevronDown size={14} className="chat-tool-row-chevron" />
+      </button>
+      {expanded ? (
+        <div className="chat-tool-row-detail">
+          {message.toolInput ? (
+            <pre className="chat-tool-row-block">
+              <code>{message.toolInput}</code>
+            </pre>
+          ) : null}
+          {message.toolData ? (
+            <pre className="chat-tool-row-block">
+              <code>{message.toolData}</code>
+            </pre>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/** 单条消息富渲染：markdown（assistant/system）、工具行、复制、时间戳。
+ * 与桌面 thread card 消息渲染对齐（P0），卡片与全屏对话共用。 */
 export function MessageBubble({ message }: { message: ThreadMessage }) {
+  // 代码块「复制」角标的事件委托：CSS ::after 角标不可单独绑定
+  const onBubbleClick = (event: React.MouseEvent<HTMLDivElement>) => {
+    const target = event.target as HTMLElement;
+    const pre = target.closest?.('pre.chat-code');
+    if (!pre) return;
+    // 点击区域限制在角标附近（右上 64x24）
+    const rect = pre.getBoundingClientRect();
+    const nearBadge =
+      event.clientX > rect.right - 72 && event.clientY < rect.top + 26;
+    if (!nearBadge) return;
+    const code = pre.querySelector('code')?.textContent ?? '';
+    navigator.clipboard.writeText(code).catch(() => {});
+  };
   if (message.role === 'user') {
-    return <div className="chat-bubble chat-bubble-user">{message.content}</div>;
+    return (
+      <div className="chat-bubble chat-bubble-user">
+        <div className="chat-bubble-text">{message.content}</div>
+        <div className="chat-bubble-meta">{formatMessageTime(message.createdAt)}</div>
+      </div>
+    );
+  }
+  if (message.role === 'tool' || (message.toolName && message.role !== 'assistant')) {
+    return <ToolCallRow message={message} />;
   }
   if (message.role === 'assistant') {
     return (
-      <div className="chat-bubble chat-bubble-assistant">
+      <div className="chat-bubble chat-bubble-assistant" onClick={onBubbleClick}>
         {message.reasoning ? (
           <details className="chat-reasoning">
             <summary>思考过程</summary>
             <div className="chat-reasoning-body">{message.reasoning}</div>
           </details>
         ) : null}
-        <div className="chat-bubble-text">
-          {message.content || <span className="chat-cursor">▍</span>}
-        </div>
-        {message.toolName ? (
-          <div className="chat-tool">工具 {message.toolName}（只读快照）</div>
+        {message.content ? (
+          <div
+            className="chat-bubble-text chat-md"
+            dangerouslySetInnerHTML={{ __html: renderChatMarkdown(message.content) }}
+          />
+        ) : (
+          <div className="chat-bubble-text">
+            <span className="chat-cursor">▍</span>
+          </div>
+        )}
+        {message.toolName ? <ToolCallRow message={message} /> : null}
+        {message.content ? (
+          <div className="chat-bubble-actions">
+            <span className="chat-bubble-meta">{formatMessageTime(message.createdAt)}</span>
+            <CopyButton text={message.content} className="chat-copy-btn" />
+          </div>
         ) : null}
       </div>
     );
   }
-  return <div className="chat-bubble chat-bubble-system">{message.content}</div>;
+  return (
+    <div className="chat-bubble chat-bubble-system">
+      <div
+        className="chat-bubble-text chat-md"
+        dangerouslySetInnerHTML={{ __html: renderChatMarkdown(message.content) }}
+      />
+    </div>
+  );
 }
 
 /** 聊天屏：流式渲染走 `agent-chunk` 事件（不信 IPC await）。 */
@@ -175,9 +283,12 @@ export function ChatScreen({ threadId, onBack, onThreadCreated }: Props) {
                     <div className="chat-reasoning-body">{liveReasoning}</div>
                   </details>
                 ) : null}
-                <div className="chat-bubble-text">
-                  {liveText || <span className="chat-cursor">▍</span>}
+                <div
+                  className="chat-bubble-text chat-md"
+                  dangerouslySetInnerHTML={{ __html: renderChatMarkdown(liveText) }}
+                >
                 </div>
+                {!liveText && !liveReasoning ? <span className="chat-cursor">▍</span> : null}
               </div>
             ) : null}
             {messages.length === 0 && !streaming ? (

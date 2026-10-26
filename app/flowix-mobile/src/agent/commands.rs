@@ -60,17 +60,40 @@ pub async fn agent_thread_delete(
     Ok(removed)
 }
 
+/// 卡片所在笔记（P1a 上下文注入）。嵌套结构体字段不随命令参数做
+/// camelCase 自动转换，需显式声明（前端传 notebookId/relativePath）。
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentNoteContext {
+    pub notebook_id: String,
+    pub relative_path: String,
+}
+
 /// 发送消息并流式接收。立即返回 thread_id；进度走 `agent-chunk` 事件。
 #[tauri::command]
 pub async fn agent_chat_send(
     app: AppHandle,
     agent: State<'_, Arc<AgentState>>,
     sync: State<'_, Arc<flowix_sync::SyncManager>>,
+    state: State<'_, crate::cache::MobileState>,
     thread_id: Option<String>,
     content: String,
+    note_context: Option<AgentNoteContext>,
 ) -> Result<String, String> {
-    super::chat::chat_send(app, agent.inner().clone(), sync.inner().clone(), thread_id, content)
-        .await
+    let note_context = note_context.map(|context| super::chat::ChatNoteContext {
+        notebook_id: context.notebook_id,
+        relative_path: context.relative_path,
+    });
+    super::chat::chat_send(
+        app,
+        agent.inner().clone(),
+        sync.inner().clone(),
+        state.inner(),
+        thread_id,
+        content,
+        note_context,
+    )
+    .await
 }
 
 #[tauri::command]

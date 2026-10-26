@@ -303,3 +303,34 @@ CREATE TABLE thread_revisions (...);  -- 照 note_revisions（对话历史免费
 **操作备查**：dev 连自建云必须带 `FLOWIX_CLOUD_API_BASE=http://8.160.162.251:8787`（默认 cloud.flowix.cc，登录会 INVALID_CREDENTIALS）；桌面 dev WebView 调试用 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9223` 后 CDP 直连（可 invoke cloud_login/cloud_sync_now）。账号 loop@selfhost.local。
 
 **遗留**：① 强杀落 refresh 轮换窗口丢登录态的窗口期风险（服务端单次消费 + 客户端写回非原子）——低频可接受，后续可考虑服务端 token 宽限或客户端原子写回；② 移动端新建笔记首推不生效（§17 待办①，仍未查）。
+
+## 19. 移动端对话窗 P0 渲染层 + P1a 上下文注入（2026-10-26，已交付）
+
+评估文档（mobile-chat-parity-eval.md 第二版）双端分工模型的第一、二步落地：**P0 消息渲染对齐** + **P1a 笔记上下文注入**。P1b（会话管理）/P2（图片输入）待后续。
+
+### P0：消息渲染对齐（纯前端）
+
+- **chat-render.ts**（新）：桌面渲染管线移植——marked v17 实例（gfm + breaks），html renderer 全转义只放行 `<a>`（`sanitizeHref` http/https/相对路径白名单，template 解码后再过白名单防 `javascript&#x3A;` 绕过）、image href 白名单、**CJK 加粗边界修正**（`agentCjkStrong` 扩展）、code renderer 输出 `pre.chat-code[data-lang]`。Shiki/KaTeX 未移植（P2b 按需）。
+- **ChatScreen.tsx**：`MessageBubble` 富渲染——user 纯文本+时间戳、tool 消息 → `ToolCallRow`（Terminal 图标+名字+摘要+展开 toolInput/toolData）、assistant（reasoning details + markdown + 流式光标 + CopyButton）、system markdown；`renderChatMarkdown` + `dangerouslySetInnerHTML`；流式 liveText 阶段同样按 markdown 渲染。
+- **事件委托复制**：`pre.chat-code` 右上角点击复制（CSS `::after` 角标 + 命中区）；代码块语言标签 `::before content:attr(data-lang)`。
+- **CSS**：`.chat-md` 排版（p/h/list/blockquote/a/img/hr/table/code）、`pre.chat-code` 横向滚动、工具行/操作行样式。
+- `package.json` 显式声明 `marked` 依赖（原为传递依赖，防断供）。
+
+### P1a：笔记上下文注入（移动端对话窗核心能力）
+
+- **chat.rs**：`ChatNoteContext { notebook_id, relative_path }` + `build_note_context_suffix`（get_notebook_config_by_id → 读文件 → 前 500 字 → `<## CONTEXT PROMPT ##>` 块，对齐桌面 context-block.ts 格式；读失败静默降级）。**仅首条消息注入**（`payload.messages.is_empty()` 时拼接），落库 content 恒为用户原文（llmContent 只进请求）——与桌面 content/llmContent 分离语义一致。
+- **commands.rs**：`agent_chat_send` 加 `note_context: Option<AgentNoteContext>` 参数；`AgentNoteContext` 必须 `#[serde(rename_all = "camelCase")]`（**Tauri 2 命令参数顶层自动 camel→snake，嵌套结构体字段不转**，否则报 missing field `notebook_id`）。
+- **前端接线**：扩展 `addOptions/addStorage` 携带 `noteContext`（EditorScreen configure 传入当前笔记），组件内读 `editor.storage.agentThreadCard.noteContext`（**不能用包装组件传参**——`(props) => Component(props, extra)` 破坏 ReactNodeViewRenderer 组件身份，新卡发送后气泡不渲染）；`useThreadChat` 第三参 + send 时随 `agentChatSend` 上送。
+
+### 验证（模拟器 CDP 实机）
+
+mock 引擎（mock-llm.cjs，PORT=18900）回复 markdown 富内容并回显最后一条 user 消息尾部 700 字。verify-p0-p1a.mjs 全绿：
+
+- **P0**：strong/em/blockquote/ol/rust 代码块/text 回显块/语言角标×2/复制按钮/时间戳×2 全部命中；
+- **P1a**：回显含 `CONTEXT PROMPT` marker + 笔记内容（`loop note one`）；user 气泡落库干净（无 CONTEXT 块）。
+
+**验证脚本坑**：多卡笔记里 `document.querySelector('.agent-thread-card-m .atc-m-input')` 命中**文档序第一张卡**（旧卡），消息发错卡——必须先取 `cards[last]` 再在其内部 querySelector。
+
+### 交付文件
+
+chat-render.ts（新）/ ChatScreen.tsx / extensions/agent-thread-card.tsx / agent/chat.rs / agent/commands.rs / api.ts / EditorScreen.tsx / styles/screens.css / package.json。
