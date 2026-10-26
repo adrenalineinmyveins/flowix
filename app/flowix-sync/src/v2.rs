@@ -139,6 +139,15 @@ pub struct V2ThreadPayload {
     pub archived: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct V2MessageAttachment {
+    /// 文件名（跨端按同名文件回落，与笔记图片附件同语义）
+    pub file_name: String,
+    /// 本设备绝对路径（attachment_save 返回；他端不可用时走回落）
+    pub storage_key: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct V2ThreadMessage {
@@ -158,6 +167,10 @@ pub struct V2ThreadMessage {
     /// 溯源（"desktop:pi" / "mobile" 等），纯展示用途。
     #[serde(default)]
     pub origin: Option<String>,
+    /// 图片附件（P2a）：content 仍为文字；空时序列化省略，
+    /// 保证旧消息字节稳定（apply 幂等/云端 hash 不漂移）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<V2MessageAttachment>,
 }
 
 /// 消息级合并：双方消息按 id 求并集（同 id 保留 local——同源生成概率≈0），
@@ -924,8 +937,8 @@ pub struct V2PushResult {
 mod tests {
     use super::{
         collect_v2_attachments, new_v2_operation_id, v2_content_hash,
-        v2_local_content_diverged, v2_merge_thread_payloads, v2_path_note_id, V2NotePut,
-        V2PushOperation, V2ThreadMessage, V2ThreadPayload,
+        v2_local_content_diverged, v2_merge_thread_payloads, v2_path_note_id, V2MessageAttachment,
+        V2NotePut, V2PushOperation, V2ThreadMessage, V2ThreadPayload,
     };
 
     fn thread_message(id: &str, role: &str, created_at: i64) -> V2ThreadMessage {
@@ -939,6 +952,7 @@ mod tests {
             tool_data: None,
             created_at,
             origin: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -1084,14 +1098,27 @@ mod tests {
                 tool_data: Some("<result>".into()),
                 created_at: 42,
                 origin: Some("desktop:pi".into()),
+                attachments: vec![V2MessageAttachment {
+                    file_name: "shot.png".into(),
+                    storage_key: "/data/attachments/shot.png".into(),
+                }],
             }],
         );
         let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["threadId"], "th_wire");
         assert_eq!(json["messages"][0]["toolName"], "search");
         assert_eq!(json["messages"][0]["createdAt"], 42);
+        assert_eq!(json["messages"][0]["attachments"][0]["fileName"], "shot.png");
         let parsed: V2ThreadPayload = serde_json::from_value(json).unwrap();
         assert_eq!(parsed, payload);
+    }
+
+    #[test]
+    fn thread_message_without_attachments_omits_field() {
+        // P2a：无附件消息序列化不含 attachments 键（旧消息字节稳定）
+        let message = thread_message("msg_n", "user", 1);
+        let json = serde_json::to_value(&message).unwrap();
+        assert!(json.get("attachments").is_none());
     }
 
     #[test]

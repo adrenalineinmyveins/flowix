@@ -27,6 +27,8 @@ export function App() {
   const [notebooks, setNotebooks] = useState<NotebookInfo[]>([]);
   const [note, setNote] = useState<OpenNote | null>(null);
   const [threadId, setThreadId] = useState<string>('');
+  // 会话附件锚定笔记本（P2a）：卡片全屏进入时为该笔记所在笔记本，否则第一个笔记本
+  const [chatNotebookId, setChatNotebookId] = useState<string | null>(null);
   const notesRefreshRef = useRef<() => void>(() => {});
 
   const enterApp = useCallback(async () => {
@@ -48,8 +50,9 @@ export function App() {
     navigate(next, nextNote);
   }, []);
 
-  const openChat = useCallback((nextThreadId: string) => {
+  const openChat = useCallback((nextThreadId: string, notebookId?: string | null) => {
     setThreadId(nextThreadId);
+    setChatNotebookId(notebookId ?? null);
     setScreen('chat');
     navigate('chat', null, nextThreadId);
   }, []);
@@ -204,6 +207,7 @@ export function App() {
           threadId={threadId}
           onBack={() => back('chats')}
           onThreadCreated={(resolved) => setThreadId(resolved)}
+          attachmentNotebookId={chatNotebookId ?? notebooks[0]?.id ?? null}
         />
       </div>
     );

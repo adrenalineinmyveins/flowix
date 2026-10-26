@@ -375,3 +375,32 @@ chat-render.ts（新）/ ChatScreen.tsx / extensions/agent-thread-card.tsx / age
 ### 交付文件
 
 flowix-sync/v2.rs / flowix-desktop cloud_bridge.rs / flowix-mobile agent（mod.rs/commands.rs/chat.rs/lib.rs）/ 前端（thread-read.ts 新、ChatListScreen 重写、ChatScreen、agent-thread-card、EditorScreen、App、api.ts、screens.css）。
+
+## 21. 移动端对话窗 P2a 图片输入（2026-10-26，已交付）
+
+评估文档第四步落地。P2b（KaTeX/生成图片条/turn 时长）未做，按需后续。
+
+### schema：V2ThreadMessage.attachments
+
+- `V2MessageAttachment { file_name, storage_key }`（fileName 跨端按同名文件回落、storageKey 本机绝对路径）——与笔记图片附件同语义。
+- `#[serde(default, skip_serializing_if = "Vec::is_empty")]`：**无附件消息序列化不含该键**，旧消息字节稳定（apply 幂等/云端 hash 不漂移）。roundtrip 单测覆盖 camelCase 与省略行为。
+- 消息按 id 并集合并，attachments 随消息走，merge 无需额外逻辑。
+
+### 发送链路（chat.rs）
+
+- `agent_chat_send` 加 `attachments` 参数（嵌套结构体 serde camelCase）；空文本 + 空附件报 `AGENT_CHAT_EMPTY`；纯图消息标题占位 `[图片]`。
+- 带附件的 user 消息投影为 **vision 数组 content**：`[{type:text},{type:image_url,image_url:{url:data:image/png;base64,...}}]`；`attachment_data_url` 读 storageKey → base64（mime 按扩展推断），读失败静默跳过降级纯文本。历史重发中他端绝对路径失效时同样降级（本机生成的附件在本机重发有效）。
+
+### 前端
+
+- **ChatScreen**：选图按钮（file input → FileReader → `attachment_save`）→ 待发缩略图条（可移除）→ 随消息上送；附件锚定笔记本 = 卡片全屏进入带的笔记笔记本 ?? 第一个笔记本（App `chatNotebookId`）；乐观消息带 attachments。
+- **渲染**：`AttachmentThumbs`（attachment_read 读回 dataURL，失败文件名占位）挂在 user 气泡内，卡片与全屏共用（`attachmentNotebookId` prop：卡片传 noteContext.notebookId）。
+- 卡片输入不带图（跳全屏发，附件渲染两边同源）。
+
+### 验证（模拟器 CDP 实机全绿）
+
+verify-p2-image.mjs：1×1 PNG 经 attachment_save 落 Loop/attachments/ → 新线程带附件发送 → mock 回复含「收到 1 张图片」（vision 投影 ✓）→ 落库消息 attachments=["p2-test.png"]（✓）→ ChatScreen user 气泡缩略图渲染（✓）→ 选图按钮存在（✓）。CDP 无法驱动原生文件选择器，UI 选图路径以 invoke 等价验证 + DOM 断言覆盖。
+
+### 交付文件
+
+flowix-sync（v2.rs/lib.rs 导出）/ flowix-desktop cloud_bridge.rs（构造点补字段）/ flowix-mobile agent（chat.rs/commands.rs）/ 前端（ChatScreen、agent-thread-card、App、api.ts、screens.css）。

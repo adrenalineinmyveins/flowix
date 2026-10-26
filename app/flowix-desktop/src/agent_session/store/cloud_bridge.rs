@@ -139,6 +139,7 @@ impl ThreadManager {
                         tool_data: truncate_tool_data(row.get(4)?),
                         created_at: message_timestamp_to_millis(&row.get::<_, String>(7)?),
                         origin: Some("desktop".into()),
+                        attachments: Vec::new(),
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -386,6 +387,7 @@ mod tests {
                     tool_data: None,
                     created_at: 100,
                     origin: Some("mobile".into()),
+                    attachments: Vec::new(),
                 },
                 V2ThreadMessage {
                     id: "msg_cloud".into(),
@@ -397,6 +399,7 @@ mod tests {
                     tool_data: None,
                     created_at: 200,
                     origin: Some("mobile".into()),
+                    attachments: Vec::new(),
                 },
             ],
             starred: false,
@@ -441,6 +444,7 @@ mod tests {
                 tool_data: None,
                 created_at: 50,
                 origin: Some("mobile".into()),
+                attachments: Vec::new(),
             }],
             starred: false,
             archived: false,

@@ -96,6 +96,11 @@ export interface ThreadSummary {
   archived: boolean;
 }
 
+export interface ChatAttachment {
+  fileName: string;
+  storageKey: string;
+}
+
 export interface ThreadMessage {
   id: string;
   role: string;
@@ -106,6 +111,7 @@ export interface ThreadMessage {
   toolData?: string | null;
   createdAt: number;
   origin?: string | null;
+  attachments?: ChatAttachment[];
 }
 
 export type AgentChunk =
@@ -165,8 +171,14 @@ export const api = {
     threadId: string | null,
     content: string,
     noteContext?: { notebookId: string; relativePath: string } | null,
+    attachments?: ChatAttachment[],
   ) =>
-    invoke<string>('agent_chat_send', { threadId, content, noteContext }),
+    invoke<string>('agent_chat_send', {
+      threadId,
+      content,
+      noteContext: noteContext ?? undefined,
+      attachments: attachments && attachments.length > 0 ? attachments : undefined,
+    }),
   agentChatStop: (threadId: string) => invoke<void>('agent_chat_stop', { threadId }),
 };
 

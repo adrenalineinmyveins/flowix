@@ -94,6 +94,14 @@ pub struct AgentNoteContext {
     pub relative_path: String,
 }
 
+/// 消息图片附件（P2a）：attachment_save 的产物随消息上送。
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentAttachmentInput {
+    pub file_name: String,
+    pub storage_key: String,
+}
+
 /// 发送消息并流式接收。立即返回 thread_id；进度走 `agent-chunk` 事件。
 #[tauri::command]
 pub async fn agent_chat_send(
@@ -104,11 +112,20 @@ pub async fn agent_chat_send(
     thread_id: Option<String>,
     content: String,
     note_context: Option<AgentNoteContext>,
+    attachments: Option<Vec<AgentAttachmentInput>>,
 ) -> Result<String, String> {
     let note_context = note_context.map(|context| super::chat::ChatNoteContext {
         notebook_id: context.notebook_id,
         relative_path: context.relative_path,
     });
+    let attachments = attachments
+        .unwrap_or_default()
+        .into_iter()
+        .map(|input| flowix_sync::V2MessageAttachment {
+            file_name: input.file_name,
+            storage_key: input.storage_key,
+        })
+        .collect();
     super::chat::chat_send(
         app,
         agent.inner().clone(),
@@ -117,6 +134,7 @@ pub async fn agent_chat_send(
         thread_id,
         content,
         note_context,
+        attachments,
     )
     .await
 }

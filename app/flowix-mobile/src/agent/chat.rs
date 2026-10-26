@@ -98,10 +98,14 @@ pub(crate) async fn chat_send(
     thread_id: Option<String>,
     content: String,
     note_context: Option<ChatNoteContext>,
+    attachments: Vec<flowix_sync::V2MessageAttachment>,
 ) -> Result<String, String> {
     let config = agent.provider_config()?;
     if !config.is_ready() {
         return Err("AGENT_PROVIDER_NOT_CONFIGURED".into());
+    }
+    if content.trim().is_empty() && attachments.is_empty() {
+        return Err("AGENT_CHAT_EMPTY".into());
     }
     let thread_id = match thread_id {
         Some(id) if id.starts_with("th_") => id,
@@ -142,10 +146,15 @@ pub(crate) async fn chat_send(
         tool_data: None,
         created_at: now,
         origin: Some("mobile".into()),
+        attachments,
     });
-    // 首条消息自动生成标题（与桌面体验一致）
+    // 首条消息自动生成标题（与桌面体验一致；纯图消息用占位）
     if payload.title.trim().is_empty() {
-        let title: String = content.chars().take(30).collect();
+        let title = if content.trim().is_empty() {
+            "[图片]".to_string()
+        } else {
+            content.chars().take(30).collect()
+        };
         payload.title = title.trim().to_string();
     }
     agent.save_thread_payload(&payload)?;
@@ -182,6 +191,8 @@ async fn run_chat_turn(
 
     // 请求体：历史投影为 OpenAI 消息数组（reasoning/tool 只读字段不上行）。
     // 最后一条 user 消息按需拼接上下文块（llmContent 语义，落库仍为原文）。
+    // 带附件的 user 消息用 vision 数组 content（image_url data URL）；
+    // 附件读取失败静默跳过（降级纯文本，不阻断请求）。
     let last_user_index = payload
         .messages
         .iter()
@@ -197,6 +208,23 @@ async fn run_chat_turn(
                 if let Some(suffix) = llm_context_suffix.as_ref() {
                     llm_content.push_str("\n");
                     llm_content.push_str(suffix);
+                }
+            }
+            if message.role == "user" && !message.attachments.is_empty() {
+                let mut parts = vec![serde_json::json!({ "type": "text", "text": llm_content })];
+                for attachment in &message.attachments {
+                    if let Some(url) = attachment_data_url(attachment) {
+                        parts.push(serde_json::json!({
+                            "type": "image_url",
+                            "image_url": { "url": url }
+                        }));
+                    }
+                }
+                if parts.len() > 1 {
+                    return serde_json::json!({
+                        "role": message.role,
+                        "content": parts,
+                    });
                 }
             }
             serde_json::json!({
@@ -340,6 +368,7 @@ async fn run_chat_turn(
             tool_data: None,
             created_at: now,
             origin: Some("mobile".into()),
+            attachments: Vec::new(),
         });
         if let Err(error) = agent.save_thread_payload(&payload) {
             emit_error_and_end(&app, &thread_id, &format!("AGENT_PERSIST_FAILED: {error}"));
@@ -354,6 +383,32 @@ async fn run_chat_turn(
         },
     );
     let _ = app.emit(THREADS_CHANGED_EVENT, ());
+}
+
+/// 附件 → data URL（读失败/空文件返回 None，调用方跳过该附件）。
+/// mime 按文件名扩展推断，缺省 png。
+fn attachment_data_url(attachment: &flowix_sync::V2MessageAttachment) -> Option<String> {
+    let bytes = std::fs::read(&attachment.storage_key).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let mime = match attachment
+        .file_name
+        .rsplit('.')
+        .next()
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        _ => "image/png",
+    };
+    use base64::Engine as _;
+    Some(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
 }
 
 fn emit_error_and_end(app: &AppHandle, thread_id: &str, message: &str) {

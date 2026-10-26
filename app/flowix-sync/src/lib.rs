@@ -31,7 +31,7 @@ pub use v2::{
     V2History, V2HistoryRevision,
     V2ConflictMaterial,
     V2DirtyEntity, V2EntityType, V2FreezeOperation, V2InflightOperation, V2LocalAttachment,
-    V2LocalNote, V2LocalNotebook, V2LocalThread, V2NoteState, V2NotebookState, V2NotebookPut, V2NotePut, V2OperationData, V2OperationError,
+    V2LocalNote, V2LocalNotebook, V2LocalThread, V2MessageAttachment, V2NoteState, V2NotebookState, V2NotebookPut, V2NotePut, V2OperationData, V2OperationError,
     V2OperationKind, V2OperationResult, V2ThreadPayload, V2ThreadMessage, V2ThreadPut, V2ThreadState, V2Usage,
     V2PendingMove,
     V2PushOperation, V2PushResult, V2RemoteApply, V2RemoteAttachment, V2SyncStatus,

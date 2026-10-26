@@ -141,8 +141,8 @@ function useThreadChat(
 interface ThreadCardOptions {
   /** 卡片所在笔记（P1a 上下文注入；由 EditorScreen configure 传入） */
   noteContext?: { notebookId: string; relativePath: string } | null;
-  /** 全屏打开会话（P1b：EditorScreen 传入 App 的 openChat） */
-  onOpenThread?: ((threadId: string) => void) | null;
+  /** 全屏打开会话（P1b：EditorScreen 传入 App 的 openChat；带附件锚定笔记本） */
+  onOpenThread?: ((threadId: string, notebookId?: string | null) => void) | null;
 }
 
 function AgentThreadCardComponent({ node, editor, getPos, deleteNode }: NodeViewProps) {
@@ -157,7 +157,7 @@ function AgentThreadCardComponent({ node, editor, getPos, deleteNode }: NodeView
   const storage = editor?.storage?.agentThreadCard as
     | {
         noteContext?: { notebookId: string; relativePath: string } | null;
-        onOpenThread?: ((threadId: string) => void) | null;
+        onOpenThread?: ((threadId: string, notebookId?: string | null) => void) | null;
       }
     | undefined;
   const noteContext = storage?.noteContext ?? null;
@@ -220,7 +220,7 @@ function AgentThreadCardComponent({ node, editor, getPos, deleteNode }: NodeView
           <button
             className="atc-m-icon"
             aria-label="全屏打开会话"
-            onClick={() => onOpenThread(attrs.threadId as string)}
+            onClick={() => onOpenThread(attrs.threadId as string, noteContext?.notebookId ?? null)}
           >
             <Maximize2 size={14} />
           </button>
@@ -241,7 +241,11 @@ function AgentThreadCardComponent({ node, editor, getPos, deleteNode }: NodeView
             <div className="atc-m-hint">会话尚未同步到本机</div>
           ) : null}
           {messages?.map((message) => (
-            <MessageBubble key={message.id} message={message} />
+            <MessageBubble
+              key={message.id}
+              message={message}
+              attachmentNotebookId={noteContext?.notebookId ?? null}
+            />
           ))}
           {liveText || liveReasoning || streaming ? (
             <div className="chat-bubble chat-bubble-assistant">

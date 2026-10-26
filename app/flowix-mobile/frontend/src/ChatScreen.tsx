@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ArrowUp, Check, ChevronDown, Copy, Square, Terminal } from 'lucide-react';
-import { api, listenEvent, AgentChunk, ThreadMessage } from './api';
+import { ArrowUp, Check, ChevronDown, Copy, ImagePlus, Square, Terminal, X } from 'lucide-react';
+import { api, listenEvent, AgentChunk, ChatAttachment, ThreadMessage } from './api';
 import { renderChatMarkdown, toolCallSummary } from './chat-render';
 import { markThreadRead } from './thread-read';
 
@@ -8,6 +8,8 @@ interface Props {
   threadId: string;
   onBack: () => void;
   onThreadCreated: (threadId: string) => void;
+  /** 附件锚定笔记本（P2a）：图片存该笔记本 attachments/ 随云同步 */
+  attachmentNotebookId?: string | null;
 }
 
 export function formatMessageTime(timestamp: number): string {
@@ -96,9 +98,64 @@ function saveDraft(threadId: string, value: string): void {
   }
 }
 
+/** 附件缩略图（P2a）：attachment_read 读回 dataURL（跨端按文件名回落），
+ * 读失败显示文件名占位；笔记本缺省（无锚点）时全部占位。 */
+function AttachmentThumbs({
+  attachments,
+  notebookId,
+}: {
+  attachments: ChatAttachment[];
+  notebookId?: string | null;
+}) {
+  const [urls, setUrls] = useState<Record<string, string>>({});
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!notebookId || attachments.length === 0) return;
+      const next: Record<string, string> = {};
+      for (const attachment of attachments) {
+        try {
+          next[attachment.storageKey] = await api.attachmentRead(notebookId, attachment.storageKey);
+        } catch {
+          // 留空 → 文件名占位（附件未同步到本机等场景）
+        }
+      }
+      if (!cancelled) setUrls(next);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [attachments, notebookId]);
+  if (attachments.length === 0) return null;
+  return (
+    <div className="chat-attachments">
+      {attachments.map((attachment) =>
+        urls[attachment.storageKey] ? (
+          <img
+            key={attachment.storageKey}
+            className="chat-attachment-thumb"
+            src={urls[attachment.storageKey]}
+            alt={attachment.fileName}
+          />
+        ) : (
+          <div key={attachment.storageKey} className="chat-attachment-missing">
+            {attachment.fileName}
+          </div>
+        ),
+      )}
+    </div>
+  );
+}
+
 /** 单条消息富渲染：markdown（assistant/system）、工具行、复制、时间戳。
  * 与桌面 thread card 消息渲染对齐（P0），卡片与全屏对话共用。 */
-export function MessageBubble({ message }: { message: ThreadMessage }) {
+export function MessageBubble({
+  message,
+  attachmentNotebookId,
+}: {
+  message: ThreadMessage;
+  attachmentNotebookId?: string | null;
+}) {
   // 代码块「复制」角标的事件委托：CSS ::after 角标不可单独绑定
   const onBubbleClick = (event: React.MouseEvent<HTMLDivElement>) => {
     const target = event.target as HTMLElement;
@@ -115,7 +172,10 @@ export function MessageBubble({ message }: { message: ThreadMessage }) {
   if (message.role === 'user') {
     return (
       <div className="chat-bubble chat-bubble-user">
-        <div className="chat-bubble-text">{message.content}</div>
+        {message.attachments && message.attachments.length > 0 ? (
+          <AttachmentThumbs attachments={message.attachments} notebookId={attachmentNotebookId} />
+        ) : null}
+        {message.content ? <div className="chat-bubble-text">{message.content}</div> : null}
         <div className="chat-bubble-meta">{formatMessageTime(message.createdAt)}</div>
       </div>
     );
@@ -163,12 +223,15 @@ export function MessageBubble({ message }: { message: ThreadMessage }) {
 }
 
 /** 聊天屏：流式渲染走 `agent-chunk` 事件（不信 IPC await）。 */
-export function ChatScreen({ threadId, onBack, onThreadCreated }: Props) {
+export function ChatScreen({ threadId, onBack, onThreadCreated, attachmentNotebookId }: Props) {
   const [messages, setMessages] = useState<ThreadMessage[] | null>(null);
   const [draft, setDraft] = useState(() => loadDraft(threadId));
   const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState('');
   const [title, setTitle] = useState('');
+  // 待发附件（P2a）：attachment_save 已落盘 + 本地预览
+  const [pending, setPending] = useState<(ChatAttachment & { previewUrl: string })[]>([]);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   // 流式中的 assistant 增量（独立于已落库消息；stream_end 后由后端落库刷新）
   const [liveText, setLiveText] = useState('');
   const [liveReasoning, setLiveReasoning] = useState('');
@@ -288,14 +351,46 @@ export function ChatScreen({ threadId, onBack, onThreadCreated }: Props) {
     };
   }, []);
 
-  const send = async () => {
-    const content = draft.trim();
-    if (!content || streaming) return;
-    setDraft('');
-    saveDraft(threadId, '');
+  // 选图（P2a）：WebView 文件选择器 → base64 → attachment_save（笔记本 attachments/，
+  // 随云同步；跨端按文件名回落）
+  const onPickImage = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    if (!attachmentNotebookId) {
+      setError('ATTACHMENT_NOTEBOOK_UNAVAILABLE');
+      return;
+    }
     setError('');
     try {
-      const resolved = await api.agentChatSend(threadId, content);
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.onerror = () => reject(new Error('READ_FILE_FAILED'));
+        reader.readAsDataURL(file);
+      });
+      const base64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
+      const saved = await api.attachmentSave(attachmentNotebookId, file.name, base64);
+      setPending((current) => [
+        ...current,
+        { fileName: file.name, storageKey: saved.absolutePath, previewUrl: dataUrl },
+      ]);
+    } catch (err) {
+      setError(`图片添加失败：${String(err)}`);
+    }
+  };
+
+  const send = async () => {
+    const content = draft.trim();
+    if (streaming) return;
+    if (!content && pending.length === 0) return;
+    const attachments = pending.map(({ fileName, storageKey }) => ({ fileName, storageKey }));
+    setDraft('');
+    saveDraft(threadId, '');
+    setPending([]);
+    setError('');
+    try {
+      const resolved = await api.agentChatSend(threadId, content, undefined, attachments);
       if (resolved !== threadId) onThreadCreated(resolved);
       // 乐观追加用户消息（stream_start 前先渲染，避免等待感）
       setMessages((current) => [
@@ -305,12 +400,19 @@ export function ChatScreen({ threadId, onBack, onThreadCreated }: Props) {
           role: 'user',
           content,
           createdAt: Date.now(),
+          attachments,
         },
       ]);
     } catch (err) {
       setError(String(err));
       setDraft(content);
       saveDraft(threadId, content);
+      setPending((current) =>
+        attachments.map((attachment) => ({
+          ...attachment,
+          previewUrl: current.find((item) => item.storageKey === attachment.storageKey)?.previewUrl ?? '',
+        })),
+      );
     }
   };
 
@@ -330,7 +432,11 @@ export function ChatScreen({ threadId, onBack, onThreadCreated }: Props) {
         ) : (
           <>
             {messages.map((message) => (
-              <MessageBubble key={message.id} message={message} />
+              <MessageBubble
+                key={message.id}
+                message={message}
+                attachmentNotebookId={attachmentNotebookId}
+              />
             ))}
             {liveText || liveReasoning || streaming ? (
               <div className="chat-bubble chat-bubble-assistant">
@@ -359,41 +465,76 @@ export function ChatScreen({ threadId, onBack, onThreadCreated }: Props) {
       {error ? <div className="chat-error">{error}</div> : null}
 
       <footer className="chat-input-bar">
-        <textarea
-          className="chat-input"
-          value={draft}
-          placeholder={streaming ? '回复生成中…' : '输入消息'}
-          disabled={streaming}
-          rows={Math.min(4, Math.max(1, draft.split('\n').length))}
-          onChange={(event) => {
-            setDraft(event.target.value);
-            saveDraft(threadId, event.target.value);
-          }}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
-              event.preventDefault();
-              void send();
-            }
-          }}
+        {pending.length > 0 ? (
+          <div className="chat-pending-bar">
+            {pending.map((item) => (
+              <div key={item.storageKey} className="chat-pending-thumb">
+                <img src={item.previewUrl} alt={item.fileName} />
+                <button
+                  className="chat-pending-remove"
+                  aria-label="移除图片"
+                  onClick={() =>
+                    setPending((current) => current.filter((p) => p.storageKey !== item.storageKey))
+                  }
+                >
+                  <X size={12} />
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : null}
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*"
+          className="file-input-hidden"
+          onChange={(event) => void onPickImage(event)}
         />
-        {streaming ? (
+        <div className="chat-input-row">
           <button
-            className="m-icon-btn chat-send chat-send-stop"
-            aria-label="停止生成"
-            onClick={() => void api.agentChatStop(activeThreadRef.current)}
+            className="m-icon-btn chat-pick-btn"
+            aria-label="添加图片"
+            disabled={streaming}
+            onClick={() => fileInputRef.current?.click()}
           >
-            <Square size={16} />
+            <ImagePlus size={19} />
           </button>
-        ) : (
-          <button
-            className="m-icon-btn chat-send"
-            aria-label="发送"
-            disabled={!draft.trim()}
-            onClick={() => void send()}
-          >
-            <ArrowUp size={18} />
-          </button>
-        )}
+          <textarea
+            className="chat-input"
+            value={draft}
+            placeholder={streaming ? '回复生成中…' : '输入消息'}
+            disabled={streaming}
+            rows={Math.min(4, Math.max(1, draft.split('\n').length))}
+            onChange={(event) => {
+              setDraft(event.target.value);
+              saveDraft(threadId, event.target.value);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+                event.preventDefault();
+                void send();
+              }
+            }}
+          />
+          {streaming ? (
+            <button
+              className="m-icon-btn chat-send chat-send-stop"
+              aria-label="停止生成"
+              onClick={() => void api.agentChatStop(activeThreadRef.current)}
+            >
+              <Square size={16} />
+            </button>
+          ) : (
+            <button
+              className="m-icon-btn chat-send"
+              aria-label="发送"
+              disabled={!draft.trim() && pending.length === 0}
+              onClick={() => void send()}
+            >
+              <ArrowUp size={18} />
+            </button>
+          )}
+        </div>
       </footer>
     </div>
   );
