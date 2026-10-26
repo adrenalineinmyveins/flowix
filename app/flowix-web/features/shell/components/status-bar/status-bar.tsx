@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Info, ListTodo } from 'lucide-react';
 import type { CSSProperties } from 'react';
 import mcpPluginIcon from '@/assets/mcp-plugin.svg';
@@ -17,6 +17,8 @@ import {
 import { useAgentRuntimeStore } from '@features/agent/store/agent-runtime-store';
 import { normalizeAgentRuntimeStatus } from '@features/agent/runtime/agent-runtime-status';
 import { useI18n } from '@/lib/i18n';
+import { toast } from '@/lib/toast';
+import { cloudSyncErrorMessage } from '@platform/tauri/errors';
 import { useDocumentMetricsStore } from '@features/document/store/document-metrics-store';
 import { useNoteStore } from '@features/memo/store/note-store';
 import { CloudStatusIcon } from '@shared/icons/cloud-status-icon';
@@ -209,6 +211,14 @@ export function StatusBar({
     || status.state === 'finalizing',
   );
 
+  // 立即同步（手动 pass）：全账户范围（threads + 全部已启用笔记本）。
+  // 自动 10s 轮询之外的即时入口；进行中禁用防重复排队。
+  const handleSyncNow = useCallback(() => {
+    void cloud.syncNow().catch((error) => {
+      toast.error(cloudSyncErrorMessage(error, t));
+    });
+  }, [t]);
+
   useEffect(() => {
     if (!cloudSyncInProgress) {
       setCloudPendingOperationCount(0);
@@ -295,6 +305,19 @@ export function StatusBar({
           </button>
         )}
         <ProductUpdatePill updater={updater} />
+        {cloudSyncAvailable && (
+          <Tooltip content={t('preferences.cloud.syncNow')} side="top">
+            <button
+              type="button"
+              onClick={handleSyncNow}
+              disabled={cloudSyncInProgress}
+              className="h-full flex items-center justify-center px-1.5 py-0 text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)] disabled:cursor-default disabled:opacity-60 disabled:hover:bg-transparent"
+              aria-label={t('preferences.cloud.syncNow')}
+            >
+              <CloudStatusIcon status="connected" size={14} />
+            </button>
+          </Tooltip>
+        )}
         {cloudSyncInProgress && (
           <div
             className="inline-flex h-[22px] items-center gap-1 px-1.5 text-xs leading-none text-[var(--muted-foreground)]"
