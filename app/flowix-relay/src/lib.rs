@@ -20,5 +20,8 @@ pub fn build_router(state: Arc<routes::AppState>) -> axum::Router {
         .route("/v2/directory", axum::routing::get(routes::search_directory))
         .route("/v2/directory/:user/:agent", axum::routing::get(routes::get_directory_card))
         .route("/v2/directory/:user/:agent", axum::routing::put(routes::put_directory_card))
+        .route("/v2/reports", axum::routing::post(routes::post_report))
+        .route("/v2/events", axum::routing::get(routes::get_events))
+        .route("/v2/usage/summary", axum::routing::get(routes::get_usage_summary))
         .with_state(state)
 }

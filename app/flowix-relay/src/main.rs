@@ -17,8 +17,13 @@ async fn main() {
     let state_path = arg_value(&args, "--state")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("relay-state.db"));
-    let state = Arc::new(flowix_relay::routes::AppState::new(
+    // FD-11 P2-7：联邦对端（逗号分隔）。本中继无此 agent 时向对端一跳转发。
+    let peers: Vec<String> = arg_value(&args, "--peers")
+        .map(|raw| raw.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect())
+        .unwrap_or_default();
+    let state = Arc::new(flowix_relay::routes::AppState::with_peers(
         flowix_relay::store::Store::persisted(state_path),
+        peers,
     ));
     let app = flowix_relay::build_router(state);
     let listener = tokio::net::TcpListener::bind(&addr)

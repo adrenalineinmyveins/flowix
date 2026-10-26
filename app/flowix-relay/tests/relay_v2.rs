@@ -25,7 +25,7 @@ fn namespaced_envelope(to: &str) -> WireEnvelope {
             expires_at: 4_102_444_800,
             allowed_scopes: Vec::new(),
         },
-        payload: WirePayload { kind: "consultation".into(), text: "跨用户咨询…".into() },
+        payload: WirePayload { kind: "consultation".into(), text: "跨用户咨询…".into(), cipher_text: None },
         provenance: WireProvenance {
             pipeline_version: "1".into(),
             rule_set_version: "rs1".into(),
@@ -204,16 +204,16 @@ async fn namespace_mismatch_rejected() {
 #[tokio::test]
 async fn anonymous_and_poll_quotas_enforced() {
     // 注入小配额：匿名投递 2/h，拉取 1/h。
-    let state = Arc::new(AppState {
-        store: Store::in_memory(),
-        quotas: QuotaConfig {
+    let state = Arc::new(AppState::with_quotas(
+        Store::in_memory(),
+        QuotaConfig {
             window_secs: 3600,
             deliver_authenticated: 30,
             deliver_anonymous: 2,
             poll: 1,
             ..QuotaConfig::default()
         },
-    });
+    ));
     let base = spawn_relay(state).await;
     let client = reqwest::Client::new();
 
@@ -269,16 +269,16 @@ async fn anonymous_and_poll_quotas_enforced() {
 
 #[tokio::test]
 async fn usage_endpoint_reports_window() {
-    let state = Arc::new(AppState {
-        store: Store::in_memory(),
-        quotas: QuotaConfig {
+    let state = Arc::new(AppState::with_quotas(
+        Store::in_memory(),
+        QuotaConfig {
             window_secs: 3600,
             deliver_authenticated: 30,
             deliver_anonymous: 3,
             poll: 120,
             ..QuotaConfig::default()
         },
-    });
+    ));
     let base = spawn_relay(state).await;
     let client = reqwest::Client::new();
     let key = SigningKey::from_bytes(&[7u8; 32]);
@@ -409,4 +409,74 @@ async fn restart_recovers_accounts_queue_and_usage() {
         .unwrap();
     let usage: serde_json::Value = response.json().await.unwrap();
     assert_eq!(usage["poll"]["used"].as_i64().unwrap(), 1);
+}
+
+/// FD-11 P2-7 联邦一跳转发：A 中继无此 agent → 转发到 peer B 落队；
+/// 已途径列表防环（X-Forwarded-From 含 B → 不再转投 → 404）。
+#[tokio::test]
+async fn federation_one_hop_forward_and_loop_guard() {
+    let client = reqwest::Client::new();
+
+    // B 中继：注册 carol/analyst。
+    let b_base = spawn_relay(Arc::new(AppState::new(Store::in_memory()))).await;
+    let b_token = client
+        .post(format!("{b_base}/v1/devices"))
+        .json(&serde_json::json!({ "agentIds": ["carol/analyst"] }))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap()["deviceToken"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A 中继：无该 agent，peers = [B]。
+    let a_base = spawn_relay(Arc::new(AppState::with_peers(
+        Store::in_memory(),
+        vec![b_base.clone()],
+    )))
+    .await;
+
+    // 向 A 投递 → A 转发 B，2xx + 伪 queueId `fed:*`。
+    let response = client
+        .post(format!("{a_base}/v1/outbox"))
+        .json(&namespaced_envelope("carol/analyst"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK, "联邦转发应成功");
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(body["queueId"].as_str().unwrap().starts_with("fed:"));
+
+    // B 侧收件可拉到。
+    let response = client
+        .get(format!("{b_base}/v1/inbox?agentId=carol%2Fanalyst"))
+        .bearer_auth(&b_token)
+        .send()
+        .await
+        .unwrap();
+    let inbox: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(inbox["envelopes"].as_array().unwrap().len(), 1, "B 应收到转发信封");
+
+    // 防环：请求已途径 B（X-Forwarded-From）→ A 不再向 B 转发 → 404。
+    let response = client
+        .post(format!("{a_base}/v1/outbox"))
+        .header("X-Forwarded-From", &b_base)
+        .json(&namespaced_envelope("nobody/none"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND, "已途径对端应防环拒转");
+
+    // 无 peers 的中继：未知 agent 直接 404（不参与联邦）。
+    let c_base = spawn_relay(Arc::new(AppState::new(Store::in_memory()))).await;
+    let response = client
+        .post(format!("{c_base}/v1/outbox"))
+        .json(&namespaced_envelope("carol/analyst"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
 }

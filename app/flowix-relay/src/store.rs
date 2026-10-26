@@ -89,7 +89,14 @@ impl Store {
                 updated_at INTEGER NOT NULL,
                 PRIMARY KEY(user_id, agent_slug));
             CREATE INDEX IF NOT EXISTS idx_directory_search
-                ON directory(visibility, updated_at);",
+                ON directory(visibility, updated_at);
+            CREATE TABLE IF NOT EXISTS reports(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reporter_token TEXT NOT NULL,
+                target_agent_id TEXT NOT NULL,
+                receipt_id TEXT NOT NULL,
+                at INTEGER NOT NULL,
+                UNIQUE(reporter_token, receipt_id));",
         )?;
         Ok(Self { conn: Mutex::new(conn) })
     }
@@ -229,6 +236,19 @@ impl Store {
             .optional()
             .unwrap_or(None)
             .is_some_and(|owner| owner == token)
+    }
+
+    /// token 拥有的全部 agent（P2-8 SSE 订阅过滤用）。
+    pub fn agents_of_token(&self, token: &str) -> Vec<String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .prepare("SELECT agent_id FROM agent_owner WHERE token = ?1")
+            .expect("agents_of_token prepare")
+            .query_map([token], |row| row.get::<_, String>(0))
+            .expect("agents_of_token query")
+            .filter_map(Result::ok)
+            .collect()
     }
 
     pub fn agent_registered(&self, agent_id: &str) -> bool {
@@ -433,6 +453,67 @@ impl Store {
             )
             .unwrap_or(0)
     }
+
+    // ------------------------------------------------------------------
+    // 举报（FD-11 §5/§7：收端举报 → 人工审核队列）
+    // ------------------------------------------------------------------
+
+    /// 落一条举报。同一举报方对同一 receipt 幂等（重复返回 false）。
+    /// 「升级至人工审核」= 进本表待管理员处置，不做自动封禁。
+    pub fn insert_report(
+        &self,
+        reporter_token: &str,
+        target_agent_id: &str,
+        receipt_id: &str,
+        now: i64,
+    ) -> bool {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO reports(reporter_token, target_agent_id, receipt_id, at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![reporter_token, target_agent_id, receipt_id, now],
+            )
+            .is_ok()
+    }
+
+    /// 被举报次数（跨举报方累计；管理侧观察用）。
+    pub fn report_count_of(&self, target_agent_id: &str) -> i64 {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM reports WHERE target_agent_id = ?1",
+                [target_agent_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0)
+    }
+
+    // ------------------------------------------------------------------
+    // 计量报表（FD-11 P2-6：按天聚合，计量不结算）
+    // ------------------------------------------------------------------
+
+    /// 某主体自 `since` 起的按天用量：`(UTC 天序号, action, count)`。
+    /// 调用方按天拼装报表；计量与配额同源（usage_events）。
+    pub fn usage_daily(&self, subject: &str, since: i64) -> Vec<(i64, String, i64)> {
+        self.conn
+            .lock()
+            .unwrap()
+            .prepare(
+                "SELECT at / 86400 AS day, action, COUNT(*) FROM usage_events
+                 WHERE subject = ?1 AND at >= ?2
+                 GROUP BY day, action ORDER BY day",
+            )
+            .expect("usage_daily prepare")
+            .query_map(params![subject, since], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+            })
+            .expect("usage_daily query")
+            .filter_map(Result::ok)
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -575,5 +656,16 @@ mod tests {
         assert_eq!(split_namespaced("agt_b"), None);
         assert_eq!(split_namespaced("alice/"), None);
         assert_eq!(split_namespaced("/researcher"), None);
+    }
+
+    #[test]
+    fn report_insert_idempotent_per_reporter() {
+        let store = Store::in_memory();
+        assert!(store.insert_report("dev_a", "alice/spam", "rct_1", 100));
+        // 同举报方同 receipt：幂等拒绝。
+        assert!(!store.insert_report("dev_a", "alice/spam", "rct_1", 101));
+        // 另一举报方可独立举报。
+        assert!(store.insert_report("dev_b", "alice/spam", "rct_1", 102));
+        assert_eq!(store.report_count_of("alice/spam"), 2);
     }
 }

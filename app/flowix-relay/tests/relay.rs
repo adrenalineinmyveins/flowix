@@ -22,7 +22,7 @@ fn sample_envelope() -> WireEnvelope {
             expires_at: 4_102_444_800,
             allowed_scopes: vec!["tag:finance/财报".into()],
         },
-        payload: WirePayload { kind: "consultation".into(), text: "问题…".into() },
+        payload: WirePayload { kind: "consultation".into(), text: "问题…".into(), cipher_text: None },
         provenance: WireProvenance {
             pipeline_version: "1".into(),
             rule_set_version: "rs1".into(),

@@ -25,7 +25,7 @@ fn envelope_to(to: &str) -> WireEnvelope {
             expires_at: 4_102_444_800,
             allowed_scopes: Vec::new(),
         },
-        payload: WirePayload { kind: "consultation".into(), text: "咨询…".into() },
+        payload: WirePayload { kind: "consultation".into(), text: "咨询…".into(), cipher_text: None },
         provenance: WireProvenance {
             pipeline_version: "1".into(),
             rule_set_version: "rs1".into(),
@@ -333,10 +333,10 @@ async fn publish_guards_namespace_and_fields() {
 
 #[tokio::test]
 async fn directory_write_quota_enforced() {
-    let state = Arc::new(AppState {
-        store: Store::in_memory(),
-        quotas: QuotaConfig { directory_write: 1, ..QuotaConfig::default() },
-    });
+    let state = Arc::new(AppState::with_quotas(
+        Store::in_memory(),
+        QuotaConfig { directory_write: 1, ..QuotaConfig::default() },
+    ));
     let base = spawn_relay(state).await;
     let client = reqwest::Client::new();
     let (token, _) = setup_alice_with_agent(&client, &base, "researcher").await;
@@ -367,10 +367,10 @@ async fn signed_envelope_delivery_with_directory_trust_anchor() {
     use flowix_relay::envelope::{canonical_bytes, WireSignature};
 
     // 本测试匿名投递 4 次，放宽匿名配额避免误触 429。
-    let state = Arc::new(AppState {
-        store: Store::in_memory(),
-        quotas: QuotaConfig { deliver_anonymous: 30, ..QuotaConfig::default() },
-    });
+    let state = Arc::new(AppState::with_quotas(
+        Store::in_memory(),
+        QuotaConfig { deliver_anonymous: 30, ..QuotaConfig::default() },
+    ));
     let base = spawn_relay(state).await;
     let client = reqwest::Client::new();
     let (token, public_key) = setup_alice_with_agent(&client, &base, "researcher").await;

@@ -1,6 +1,8 @@
 //! 信封 wire 契约 v1（`flowix.consult.v1`）的类型与校验。
 //! 契约文档：docs/F5-NETWORK-RELAY.md §3。
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 pub const ENVELOPE_VERSION: &str = "flowix.consult.v1";
@@ -58,6 +60,11 @@ pub struct WirePayload {
     /// `consultation` | `reply`
     pub kind: String,
     pub text: String,
+    /// FD-11 P2-9 盲转模式：NaCl box（X25519+XSalsa20-Poly1305）密文
+    /// base64；置位时 `text` 为空，中继只见密文（F5 §6：仅 payload.text
+    /// 可加密，disclosure/provenance 恒明文）。旧端反序列化忽略未知字段。
+    #[serde(default)]
+    pub cipher_text: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,7 +140,14 @@ pub fn validate_structure(envelope: &WireEnvelope, now_unix: i64) -> Result<(), 
     if envelope.provenance.receipt_id.is_empty() {
         return Err(RejectReason::DisclosureIncomplete);
     }
-    if envelope.payload.text.len() > PAYLOAD_MAX_BYTES {
+    // 明文与密文合计限长（盲转密文含 nonce+tag，约 +48B）。
+    let cipher_len = envelope
+        .payload
+        .cipher_text
+        .as_ref()
+        .map(|cipher| BASE64.decode(cipher.trim()).map(|bytes| bytes.len()).unwrap_or(usize::MAX))
+        .unwrap_or(0);
+    if envelope.payload.text.len() + cipher_len > PAYLOAD_MAX_BYTES {
         return Err(RejectReason::PayloadTooLarge);
     }
     if disclosure.expires_at <= now_unix {
@@ -159,7 +173,7 @@ pub(crate) mod tests {
                 expires_at: 4_102_444_800,
                 allowed_scopes: vec!["tag:finance/财报".into()],
             },
-            payload: WirePayload { kind: "consultation".into(), text: "问题…".into() },
+            payload: WirePayload { kind: "consultation".into(), text: "问题…".into(), cipher_text: None },
             provenance: WireProvenance {
                 pipeline_version: "1".into(),
                 rule_set_version: "rs1".into(),

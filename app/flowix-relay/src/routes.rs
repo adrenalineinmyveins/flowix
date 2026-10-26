@@ -40,11 +40,33 @@ impl Default for QuotaConfig {
 pub struct AppState {
     pub store: Store,
     pub quotas: QuotaConfig,
+    /// FD-11 P2-8：入队通知广播（payload = agentId）。SSE 订阅按
+    /// token 拥有的 agent 过滤后推送，客户端据此触发拉取。
+    pub events: tokio::sync::broadcast::Sender<String>,
+    /// FD-11 P2-7：联邦对端中继 URL 列表（一跳转发；空 = 不参与联邦）。
+    pub federation_peers: Vec<String>,
 }
 
 impl AppState {
     pub fn new(store: Store) -> Self {
-        Self { store, quotas: QuotaConfig::default() }
+        let (events, _) = tokio::sync::broadcast::channel(256);
+        Self { store, quotas: QuotaConfig::default(), events, federation_peers: Vec::new() }
+    }
+
+    /// 测试注入配额用。
+    pub fn with_quotas(store: Store, quotas: QuotaConfig) -> Self {
+        let (events, _) = tokio::sync::broadcast::channel(256);
+        Self { store, quotas, events, federation_peers: Vec::new() }
+    }
+
+    pub fn with_peers(store: Store, peers: Vec<String>) -> Self {
+        let (events, _) = tokio::sync::broadcast::channel(256);
+        Self {
+            store,
+            quotas: QuotaConfig::default(),
+            events,
+            federation_peers: peers.into_iter().filter(|p| !p.trim().is_empty()).map(|p| p.trim_end_matches('/').to_string()).collect(),
+        }
     }
 }
 
@@ -116,6 +138,11 @@ pub async fn post_outbox(
         return Err((StatusCode::UNPROCESSABLE_ENTITY, Json(RejectResponse { code: reason.code() })));
     }
     if !state.store.agent_registered(&envelope.to.agent_id) {
+        // FD-11 P2-7：本中继无此 agent → 按联邦配置向对端一跳转发；
+        // 全部对端不可达/拒收才回 404（对发起方仍是「不存在」）。
+        if let Some(queued) = forward_to_peers(&state, &headers, &envelope).await {
+            return Ok(Json(queued));
+        }
         return Err((
             StatusCode::NOT_FOUND,
             Json(RejectResponse { code: RejectReason::RecipientUnknown.code() }),
@@ -156,15 +183,25 @@ pub async fn post_outbox(
         }
     }
     let now = now();
-    // 配额主体：带 Bearer（任意 deviceToken）= 认证档；匿名按来源 IP 降额
-    // （M4 信封签名落地后按 keyId 精确化，见 FD-11 §5）。
+    // 配额主体：带 Bearer（任意 deviceToken）= 认证档；联邦转发
+    // （X-Forwarded-From）按 `fed:<第一跳>` 计量（同认证档）；匿名按 IP 降额。
     let (subject, limit) = match bearer_token(&headers) {
         Some(token) => (token, state.quotas.deliver_authenticated),
         None => {
-            let peer = connect_info
-                .map(|axum::extract::ConnectInfo(addr)| addr.ip().to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            (format!("ip:{peer}"), state.quotas.deliver_anonymous)
+            if let Some(origin) = headers
+                .get(FORWARDED_FROM)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|raw| raw.split(',').next())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                (format!("fed:{origin}"), state.quotas.deliver_authenticated)
+            } else {
+                let peer = connect_info
+                    .map(|axum::extract::ConnectInfo(addr)| addr.ip().to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                (format!("ip:{peer}"), state.quotas.deliver_anonymous)
+            }
         }
     };
     if state.store.count_usage(&subject, "deliver", now - state.quotas.window_secs) >= limit {
@@ -173,6 +210,8 @@ pub async fn post_outbox(
     let recipient = envelope.to.agent_id.clone();
     let queue_id = state.store.enqueue(&recipient, envelope, now);
     state.store.record_usage(&subject, "deliver", now);
+    // P2-8：通知订阅方有新信封（agentId 级，无内容）。
+    let _ = state.events.send(recipient);
     Ok(Json(OutboxResponse { accepted_at: now, queue_id }))
 }
 
@@ -180,6 +219,66 @@ pub async fn post_outbox(
 #[serde(rename_all = "camelCase")]
 pub struct RejectResponse {
     pub code: &'static str,
+}
+
+// ----------------------------------------------------------------------
+// FD-11 P2-7：联邦一跳转发（最小形态）
+// ----------------------------------------------------------------------
+
+/// 联邦转发标记头：逗号分隔的「已途径中继」URL 列表（防环 + 计量主体）。
+const FORWARDED_FROM: &str = "X-Forwarded-From";
+
+/// 向联邦对端转发信封。任一对端 2xx 即成功（返回伪 queueId `fed:<peer>`）。
+/// 已在途径列表中的对端不再转发（一跳语义 + 防环）。
+/// 信任模型：转发主体按 `fed:<第一跳>` 计量（配额同认证档）；header 可伪造
+/// 的收益上限 = 认证档配额，与注册账号等同，v2 记录在案（F5 §8.2）。
+async fn forward_to_peers(
+    state: &AppState,
+    headers: &HeaderMap,
+    envelope: &WireEnvelope,
+) -> Option<OutboxResponse> {
+    if state.federation_peers.is_empty() {
+        return None;
+    }
+    let visited: Vec<String> = headers
+        .get(FORWARDED_FROM)
+        .and_then(|value| value.to_str().ok())
+        .map(|raw| raw.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect())
+        .unwrap_or_default();
+    // 本中继自标识：从环境变量取（无则用 agent 目标前缀占位，测试注入方便）。
+    let self_url = std::env::var("FLOWIX_RELAY_SELF_URL").unwrap_or_default();
+    let mut next_hops: Vec<String> = Vec::new();
+    let mut chain = visited.clone();
+    if !self_url.is_empty() {
+        chain.push(self_url.clone());
+    }
+    let chain_value = chain.join(", ");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .ok()?;
+    for peer in &state.federation_peers {
+        if visited.iter().any(|v| v == peer) || *peer == self_url {
+            continue; // 已途径：防环。
+        }
+        next_hops.push(peer.clone());
+    }
+    for peer in next_hops {
+        let url = format!("{peer}/v1/outbox");
+        let mut request = client.post(&url).json(envelope);
+        if !chain_value.is_empty() {
+            request = request.header(FORWARDED_FROM, &chain_value);
+        }
+        if let Ok(response) = request.send().await {
+            if response.status().is_success() {
+                return Some(OutboxResponse {
+                    accepted_at: now(),
+                    queue_id: format!("fed:{peer}"),
+                });
+            }
+        }
+    }
+    None
 }
 
 #[derive(Serialize)]
@@ -371,6 +470,93 @@ pub async fn get_usage(
 }
 
 // ----------------------------------------------------------------------
+// v2 计量报表（FD-11 P2-6：按天聚合 + 当前套餐档；计量不结算）
+// ----------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDayRow {
+    /// `YYYY-MM-DD`（UTC）。
+    pub date: String,
+    pub deliver: i64,
+    pub poll: i64,
+    pub directory: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageSummaryResponse {
+    pub days: Vec<UsageDayRow>,
+    /// 当前套餐配额档（小时窗/天窗）。
+    pub plan: PlanQuotas,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanQuotas {
+    pub deliver_per_hour: i64,
+    pub poll_per_hour: i64,
+    pub directory_per_day: i64,
+}
+
+/// 近 N 天（1-90，默认 7）按天用量报表。与配额同源（usage_events）。
+pub async fn get_usage_summary(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<SummaryQuery>,
+) -> Result<Json<UsageSummaryResponse>, (StatusCode, Json<RejectResponse>)> {
+    let token = bearer_token(&headers)
+        .ok_or((StatusCode::UNAUTHORIZED, Json(RejectResponse { code: "UNAUTHORIZED" })))?;
+    let days = params.days.unwrap_or(7).clamp(1, 90);
+    let since = now() - days * 86_400;
+    let mut by_day: std::collections::BTreeMap<i64, UsageDayRow> = Default::default();
+    for (day, action, count) in state.store.usage_daily(&token, since) {
+        let row = by_day.entry(day).or_insert_with(|| UsageDayRow {
+            date: unix_day_to_date(day),
+            deliver: 0,
+            poll: 0,
+            directory: 0,
+        });
+        match action.as_str() {
+            "deliver" => row.deliver += count,
+            "poll" => row.poll += count,
+            "directory" | "directory_write" => row.directory += count,
+            _ => {}
+        }
+    }
+    Ok(Json(UsageSummaryResponse {
+        days: by_day.into_values().collect(),
+        plan: PlanQuotas {
+            deliver_per_hour: state.quotas.deliver_authenticated,
+            poll_per_hour: state.quotas.poll,
+            directory_per_day: state.quotas.directory_write,
+        },
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct SummaryQuery {
+    days: Option<i64>,
+}
+
+fn unix_day_to_date(day: i64) -> String {
+    let secs = day * 86_400;
+    let days_since_epoch = secs.div_euclid(86_400);
+    // 简化 civil-from-days 算法（Howard Hinnant）。
+    let z = days_since_epoch + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+// ----------------------------------------------------------------------
 // v2 目录（FD-11 §4：公开卡、三档可见性、搜索）
 // ----------------------------------------------------------------------
 
@@ -541,6 +727,76 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
     let token = value.strip_prefix("Bearer ")?;
     Some(token.to_string())
+}
+
+// ----------------------------------------------------------------------
+// v2 举报（FD-11 §5/§7：收端一键举报，中继落人工审核队列）
+// ----------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportRequest {
+    /// 被举报信封的 from agentId（如 `alice/researcher` 或裸 `agt_…`）。
+    pub target_agent: String,
+    /// 被举报信封的 receiptId（溯源锚点）。
+    pub receipt_id: String,
+}
+
+/// 举报（需 Bearer 账号 token：举报方身份可追责，防举报滥用）。
+/// 同一举报方对同一 receipt 幂等：重复 → 409 REPORT_DUPLICATE。
+pub async fn post_report(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(body): Json<ReportRequest>,
+) -> Result<StatusCode, (StatusCode, Json<RejectResponse>)> {
+    let token = bearer_token(&headers)
+        .ok_or((StatusCode::UNAUTHORIZED, Json(RejectResponse { code: "UNAUTHORIZED" })))?;
+    if state.store.account_of_token(&token).is_none() {
+        return Err((StatusCode::UNAUTHORIZED, Json(RejectResponse { code: "UNAUTHORIZED" })));
+    }
+    let target = body.target_agent.trim();
+    let receipt = body.receipt_id.trim();
+    if target.is_empty() || receipt.is_empty() {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, Json(RejectResponse { code: "REPORT_INVALID" })));
+    }
+    if state.store.insert_report(&token, target, receipt, now()) {
+        Ok(StatusCode::CREATED)
+    } else {
+        Err((StatusCode::CONFLICT, Json(RejectResponse { code: "REPORT_DUPLICATE" })))
+    }
+}
+
+// ----------------------------------------------------------------------
+// v2 SSE 推送（FD-11 P2-8：新信封入队通知，客户端据此触发拉取）
+// ----------------------------------------------------------------------
+/// SSE 事件流：`data: {"agentId": "alice/researcher"}`。
+/// 鉴权 = Bearer deviceToken；仅推送该 token 拥有的 agent 的入队事件。
+/// 消费语义不变（at-least-once 拉取 + ack），SSE 只是「该来拉了」的信号。
+pub async fn get_events(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<impl axum::response::IntoResponse, (StatusCode, Json<RejectResponse>)> {
+    use tokio_stream::StreamExt as _;
+
+    let token = bearer_token(&headers)
+        .ok_or((StatusCode::UNAUTHORIZED, Json(RejectResponse { code: "UNAUTHORIZED" })))?;
+    let owned: std::collections::HashSet<String> =
+        state.store.agents_of_token(&token).into_iter().collect();
+    let stream = tokio_stream::wrappers::BroadcastStream::new(state.events.subscribe())
+        .filter_map(move |item| {
+            let agent_id = item.ok()?;
+            if !owned.contains(&agent_id) {
+                return None;
+            }
+            Some(Ok::<_, std::convert::Infallible>(
+                axum::response::sse::Event::default()
+                    .data(serde_json::json!({ "agentId": agent_id }).to_string()),
+            ))
+        });
+    let sse = axum::response::Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::default().interval(std::time::Duration::from_secs(20)),
+    );
+    Ok(sse)
 }
 
 #[derive(Serialize)]
