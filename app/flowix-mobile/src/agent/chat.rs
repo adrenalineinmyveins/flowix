@@ -109,6 +109,12 @@ pub(crate) async fn chat_send(
     }
     let thread_id = match thread_id {
         Some(id) if id.starts_with("th_") => id,
+        // 桌面同步卡携带桌面本地 id（无 th_ 前缀）：归一到已同步的 th_ 实体
+        // 续聊；未同步到本机时报错，不静默新建分叉线程。
+        Some(id) => match agent.thread_payload_normalized(&id)? {
+            Some((normalized, _)) => normalized,
+            None => return Err("AGENT_THREAD_NOT_SYNCED".into()),
+        },
         _ => AgentState::new_thread_id(),
     };
     if stop_flag(&thread_id).load(Ordering::SeqCst) {

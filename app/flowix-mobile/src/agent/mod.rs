@@ -134,6 +134,26 @@ impl AgentState {
         })
     }
 
+    /// 线程 id 归一查询：桌面同步卡存的 threadId 是桌面本地 id（无 `th_`
+    /// 前缀），而本地线程库与云端实体恒为 `th_{本地id}`（桌面
+    /// cloud_thread_id 映射）。原 id miss 且无前缀时按 `th_{id}` 重试；
+    /// 命中返回归一后的 id 与 payload。
+    pub(crate) fn thread_payload_normalized(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<(String, V2ThreadPayload)>, String> {
+        if let Some(payload) = self.thread_payload(thread_id)? {
+            return Ok(Some((thread_id.to_string(), payload)));
+        }
+        if !thread_id.starts_with("th_") {
+            let normalized = format!("th_{thread_id}");
+            if let Some(payload) = self.thread_payload(&normalized)? {
+                return Ok(Some((normalized, payload)));
+            }
+        }
+        Ok(None)
+    }
+
     /// 列表行（不反序列化消息体，轻量）。
     pub(crate) fn thread_summaries(&self) -> Result<Vec<ThreadSummary>, String> {
         let ids = self.thread_ids()?;
@@ -314,4 +334,55 @@ pub(crate) fn enqueue_thread_change_and_sync(
     }
     let _ = agent; // 保留参数形状与桌面桥对齐
     crate::sync::spawn_debounced_sync(app.clone());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_agent_state(tag: &str) -> (AgentState, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("flowix-agent-test-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        (AgentState::new(&dir).unwrap(), dir)
+    }
+
+    fn payload_with_id(thread_id: &str) -> V2ThreadPayload {
+        V2ThreadPayload {
+            version: 1,
+            thread_id: thread_id.to_string(),
+            agent_id: "mobile".into(),
+            title: "t".into(),
+            created_at: 1,
+            messages: Vec::new(),
+            starred: false,
+            archived: false,
+        }
+    }
+
+    /// 桌面同步卡存桌面本地 id（无 th_ 前缀）；本地库为云端 id（th_ 前缀）。
+    /// 归一查询应命中 th_ 版本并返回归一 id；已带前缀的 id 不做二次重试。
+    #[test]
+    fn thread_payload_normalized_resolves_desktop_local_id() {
+        let (agent, dir) = temp_agent_state("normalize");
+        agent
+            .save_thread_payload(&payload_with_id("th_mobile-local-abc"))
+            .unwrap();
+
+        let hit = agent
+            .thread_payload_normalized("mobile-local-abc")
+            .unwrap()
+            .expect("unprefixed desktop id resolves");
+        assert_eq!(hit.0, "th_mobile-local-abc");
+
+        let direct = agent
+            .thread_payload_normalized("th_mobile-local-abc")
+            .unwrap()
+            .expect("prefixed id resolves directly");
+        assert_eq!(direct.0, "th_mobile-local-abc");
+
+        assert!(agent.thread_payload_normalized("th_missing").unwrap().is_none());
+        assert!(agent.thread_payload_normalized("missing").unwrap().is_none());
+
+        std::fs::remove_dir_all(dir).ok();
+    }
 }

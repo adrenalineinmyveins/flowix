@@ -33,9 +33,10 @@ pub fn agent_thread_messages(
     agent: State<'_, Arc<AgentState>>,
     thread_id: String,
 ) -> Result<Vec<V2ThreadMessage>, String> {
+    // 桌面同步卡携带无 th_ 前缀的桌面本地 id：归一查询（thread_payload_normalized）
     Ok(agent
-        .thread_payload(&thread_id)?
-        .map(|payload| payload.messages)
+        .thread_payload_normalized(&thread_id)?
+        .map(|(_, payload)| payload.messages)
         .unwrap_or_default())
 }
 
@@ -141,5 +142,12 @@ pub async fn agent_chat_send(
 
 #[tauri::command]
 pub fn agent_chat_stop(thread_id: String) {
+    // 与 chat_send 同口径归一（桌面同步卡存无前缀本地 id），确保命中
+    // 运行中回合的停止位
+    let thread_id = if thread_id.starts_with("th_") || thread_id.is_empty() {
+        thread_id
+    } else {
+        format!("th_{thread_id}")
+    };
     super::chat::request_stop(&thread_id);
 }
