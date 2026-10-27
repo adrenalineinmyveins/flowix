@@ -168,14 +168,51 @@ impl SyncManager {
         Ok(self_sync_seqs)
     }
 
-    pub async fn v2_conflict_material(
-        &self,
-        notebook_id: &str,
-        note_id: &str,
-        operation_id: &str,
-    ) -> Result<crate::v2::V2ConflictMaterial, SyncError> {
-        let generation = self.auth_generation();
-        let mut token = self.access_token(generation).await?;
+    /// 判定一组内容 hash 是否为云端已知内容（blob 存在）。
+///
+/// 用途：无基线（relink/logout 后 states 清空）的 bootstrap 重放中，本地
+/// 磁盘内容与云端最新版不一致时，若本地 hash 的 blob 仍在云端，说明本地
+/// 只是云端的某个历史版本而非未推送的本地编辑——apply 可直接落远端版，
+/// 无需归档冲突副本。探查失败的 hash 不进结果（按未知处理，保守归档）。
+pub async fn v2_content_known_to_cloud(
+    &self,
+    hashes: &[String],
+) -> Result<std::collections::HashSet<String>, SyncError> {
+    let mut known = std::collections::HashSet::new();
+    if hashes.is_empty() {
+        return Ok(known);
+    }
+    let generation = self.auth_generation();
+    let mut token = self.access_token(generation).await?;
+    for hash in hashes {
+        // 纯 envelope 探查：200=已知，404=不存在
+        let probe = self.client.v2_blob_exists(&token, hash).await;
+        match probe {
+            Ok(true) => {
+                known.insert(hash.clone());
+            }
+            Ok(false) => {}
+            Err(error) if error.is_unauthorized() => {
+                token = self.force_refresh_access_token(generation).await?;
+                if self.client.v2_blob_exists(&token, hash).await.unwrap_or(false) {
+                    known.insert(hash.clone());
+                }
+            }
+            // 网络等瞬态错误：按未知处理，保守归档不丢数据
+            Err(_) => {}
+        }
+    }
+    Ok(known)
+}
+
+pub async fn v2_conflict_material(
+    &self,
+    notebook_id: &str,
+    note_id: &str,
+    operation_id: &str,
+) -> Result<crate::v2::V2ConflictMaterial, SyncError> {
+    let generation = self.auth_generation();
+    let mut token = self.access_token(generation).await?;
         let baseline = self.store.v2_note_state(note_id)?;
         let mut page = self.client.v2_bootstrap_page(&token, None).await?;
         let snapshot_cursor = page.cursor;
@@ -845,6 +882,97 @@ impl SyncManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NullRefreshStore;
+    impl crate::RefreshTokenStore for NullRefreshStore {
+        fn load(&self) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+        fn save(&self, _token: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn delete(&self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// blob 存在性探查（副本风暴修复 B）：无基线归档前，本地 hash 的 blob
+    /// 仍在云端 → 云端已知内容（历史版本），apply 不归档；404 → 未知。
+    /// mock 按 hash 分发：known-hash → 200 envelope，其余 → 404 错误体。
+    #[tokio::test]
+    async fn content_known_to_cloud_distinguishes_history_from_local_only() {
+        let known_hash = crate::v2::v2_content_hash(b"cloud-history-version");
+        let local_only_hash = crate::v2::v2_content_hash(b"local-unpushed-edit");
+        let known_path = format!("/v2/blobs/{known_hash}/access");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let expected = known_path.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for _ in 0..2 {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = [0u8; 4096];
+                let read = socket.read(&mut buffer).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let (status, body) = if head.contains(&expected) {
+                    (
+                        "200 OK",
+                        r#"{"data":{"contentHash":"x"},"download":{"method":"GET","path":"/v2/blobs/x"}}"#.to_string(),
+                    )
+                } else {
+                    (
+                        "404 Not Found",
+                        r#"{"error":{"status":404,"code":"BLOB_NOT_FOUND","message":"no blob"}}"#.to_string(),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let manager = SyncManager::new_with_session_dependencies(
+            &format!("http://{addr}"),
+            temp.path().join("sync.db"),
+            std::sync::Arc::new(NullRefreshStore),
+            std::sync::Arc::new(|_| {}),
+        )
+        .unwrap();
+        manager
+            .store
+            .save_v2_account(&crate::v2::V2CloudAccount {
+                user: crate::models::CloudUser {
+                    id: "usr_probe".into(),
+                    email: "p@t.local".into(),
+                    display_name: "P".into(),
+                    system_role: "user".into(),
+                },
+                protocol_epoch: 2,
+            })
+            .unwrap();
+        manager.auth.write().unwrap().session = Some(crate::models::RuntimeSession {
+            access_token: "access-test".into(),
+            access_token_expires_at: i64::MAX,
+            refresh_token: "refresh-test".into(),
+            refresh_token_expires_at: i64::MAX,
+        });
+
+        let known = manager
+            .v2_content_known_to_cloud(&[known_hash.clone(), local_only_hash.clone()])
+            .await
+            .unwrap();
+        assert!(known.contains(&known_hash), "云端历史版本应判定为已知");
+        assert!(
+            !known.contains(&local_only_hash),
+            "云端没有的本地内容应判定为未知"
+        );
+    }
 
     #[test]
     fn repeated_local_observation_only_requests_sync_for_a_new_generation() {

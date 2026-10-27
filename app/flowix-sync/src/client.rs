@@ -480,6 +480,28 @@ impl CloudClient {
         .map(|value| value.data)
     }
 
+    /// 内容存在性探查：只请求下载凭据 envelope，不下载 blob 本体。
+    /// 200 = 云端已知该内容；404 = blob 不存在。
+    pub async fn v2_blob_exists(
+        &self,
+        access_token: &str,
+        content_hash: &str,
+    ) -> Result<bool, SyncError> {
+        match self
+            .send::<V2BlobDownloadEnvelope>(
+                Method::GET,
+                &format!("/v2/blobs/{content_hash}/access"),
+                Some(access_token),
+                None,
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(SyncError::Api { status: 404, .. }) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn v2_download_blob(
         &self,
         access_token: &str,

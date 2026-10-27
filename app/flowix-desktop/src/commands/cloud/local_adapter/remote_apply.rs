@@ -90,11 +90,77 @@ enum DeferredIndexAction {
     PruneDeleted { memo: flowix_core::memo_file::Memo },
 }
 
+/// 无基线归档判定的云端佐证预取（async 层，供同步 apply 查询）。
+///
+/// 粗筛与本文件 locked 阶段同一套判据：本地磁盘存在、无同步基线、且内容
+/// 与远端最新版不一致的笔记，其本地 hash 可能只是云端历史版本——批量向
+/// 云端探查 blob 存在性。存在集合传给 apply，归档分支据此跳过历史版本。
+/// 任何失败返回空集合（apply 侧按未知处理，保守归档）。
+async fn probe_cloud_known_hashes(
+    state: &AppState,
+    notebook_id: &str,
+    changes: &[&V2RemoteApply],
+) -> std::collections::HashSet<String> {
+    let notebook = {
+        let memo_file = read_lock(&state.memo_file, "memo_file");
+        match memo_file.get_notebook_config_by_id(notebook_id) {
+            Some(config) => PathBuf::from(&config.path),
+            None => return std::collections::HashSet::new(),
+        }
+    };
+    let mut candidates = std::collections::HashSet::new();
+    for change in changes {
+        let V2RemoteApply::Note {
+            note_id,
+            filename,
+            content_hash,
+            deleted,
+            ..
+        } = change
+        else {
+            continue;
+        };
+        if *deleted || filename.starts_with("attachments/") {
+            continue;
+        }
+        let has_baseline = state
+            .cloud_sync
+            .v2_note_state(note_id)
+            .ok()
+            .flatten()
+            .and_then(|stored| stored.content_hash)
+            .is_some();
+        if has_baseline {
+            continue;
+        }
+        let Ok(desired_path) = safe_cloud_note_path(&notebook, filename) else {
+            continue;
+        };
+        let local_hash = match std::fs::read(&desired_path) {
+            Ok(bytes) => v2_content_hash(&bytes),
+            Err(_) => continue,
+        };
+        if Some(local_hash.as_str()) != content_hash.as_deref() {
+            candidates.insert(local_hash);
+        }
+    }
+    if candidates.is_empty() {
+        return std::collections::HashSet::new();
+    }
+    let hashes: Vec<String> = candidates.into_iter().collect();
+    state
+        .cloud_sync
+        .v2_content_known_to_cloud(&hashes)
+        .await
+        .unwrap_or_default()
+}
+
 fn apply_v2_note_changes(
     state: &AppState,
     app: &AppHandle,
     notebook_id: &str,
     changes: &[&V2RemoteApply],
+    cloud_known: &std::collections::HashSet<String>,
 ) -> Result<(), String> {
     let memo_file = read_lock(&state.memo_file, "memo_file");
     // 同一文件的中间版本只可能来自 cursor 重放（logout 清零后 bootstrap 从头拉取
@@ -126,6 +192,7 @@ fn apply_v2_note_changes(
         app,
         notebook_id,
         &deduped,
+        cloud_known,
         &mut deferred,
     );
     // 排他锁在此（result 内部 guard 已 drop）后执行全部索引动作；无论成败
@@ -198,6 +265,7 @@ fn apply_v2_note_changes_locked(
     app: &AppHandle,
     notebook_id: &str,
     changes: &[&V2RemoteApply],
+    cloud_known: &std::collections::HashSet<String>,
     deferred: &mut Vec<DeferredIndexAction>,
 ) -> Result<(), String> {
     let _write_guard = memo_file
@@ -417,11 +485,18 @@ fn apply_v2_note_changes_locked(
                     "CLOUD_LOCAL_EDIT_CONFLICT: local file preserved at {filename}"
                 ));
             }
-            // 无基线（bootstrap 重放）时本地磁盘内容先归档一份 conflict 副本再落远端
-            // 版本——无基线下无法区分「本地与云端一致」与「本地领先未推送」，归档
-            // 保证任何场景本地字节不丢。副本路径按 note_id 固定且只在首次写入，
-            // 历史重放后续轮次不覆盖已归档的最初本地版本。
-            if baseline_hash.is_none() {
+            // 无基线（bootstrap 重放）时本地磁盘内容与远端不一致的处置：
+            // 本地 hash 的 blob 仍在云端 → 本地只是云端的某个历史版本
+            //（relink/logout 后 states 清空的典型情形），直接落远端版，
+            // 不归档；blob 不存在 → 本地内容云端从未见过（可能未推送的
+            // 本地编辑），归档一份 conflict 副本保证字节不丢。副本路径按
+            // note_id 固定且只在首次写入，历史重放后续轮次不覆盖已归档的
+            // 最初本地版本。探查失败按未知处理（保守归档）。
+            if baseline_hash.is_none()
+                && !disk_hash
+                    .as_deref()
+                    .is_some_and(|hash| cloud_known.contains(hash))
+            {
                 if let Some(bytes) = disk_bytes.as_deref() {
                     let preserved = cloud_conflict_copy_path(&desired_path, note_id);
                     if !preserved.exists() {
@@ -534,7 +609,8 @@ pub(crate) async fn apply_v2_report(
     }
 
     for (notebook_id, changes) in note_changes {
-        apply_v2_note_changes(state, app, &notebook_id, &changes)?;
+        let cloud_known = probe_cloud_known_hashes(state, &notebook_id, &changes).await;
+        apply_v2_note_changes(state, app, &notebook_id, &changes, &cloud_known)?;
     }
 
     if !notebook_metadata.is_empty() {
