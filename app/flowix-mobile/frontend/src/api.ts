@@ -130,6 +130,8 @@ export const api = {
     invoke<CloudState>('cloud_register', { email, password, displayName }),
   logout: () => invoke<CloudState>('cloud_logout'),
   cloudState: () => invoke<CloudState>('cloud_get_state'),
+  cloudGetApiBase: () => invoke<string>('cloud_get_api_base'),
+  cloudSetApiBase: (apiBase: string) => invoke<string>('cloud_set_api_base', { apiBase }),
 
   refreshNotebooks: () => invoke<NotebookInfo[]>('cloud_refresh_notebooks'),
   syncNow: () => invoke<SyncSummary>('cloud_sync_now'),

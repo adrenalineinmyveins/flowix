@@ -27,7 +27,7 @@ pub fn run() {
                 cache_root,
             });
             let sync = cloud::setup(&app.handle(), dir.clone())?;
-            sync::spawn_auto_sync(app.handle().clone(), sync.clone());
+            sync::spawn_auto_sync(app.handle().clone());
             app.manage(sync);
             let agent = Arc::new(agent::AgentState::new(&dir)?);
             app.manage(agent);
@@ -39,6 +39,8 @@ pub fn run() {
             commands::cloud_register,
             commands::cloud_logout,
             commands::cloud_get_state,
+            commands::cloud_get_api_base,
+            commands::cloud_set_api_base,
             commands::cloud_refresh_notebooks,
             commands::cloud_sync_now,
             commands::notebook_list,

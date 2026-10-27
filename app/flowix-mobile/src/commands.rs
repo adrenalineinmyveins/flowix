@@ -44,6 +44,36 @@ pub fn cloud_get_state(sync: tauri::State<'_, Arc<SyncManager>>) -> Result<Cloud
     sync.state().map_err(|e| e.to_string())
 }
 
+/// 当前云端 API 地址（登录界面回显用）。
+#[tauri::command]
+pub fn cloud_get_api_base(app: tauri::AppHandle) -> Result<String, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    Ok(crate::cloud::resolve_api_base(&dir))
+}
+
+/// 切换云端 API 地址：仅未登录时允许（写 cloud_api_base + 重建 SyncManager）。
+#[tauri::command]
+pub async fn cloud_set_api_base(
+    app: tauri::AppHandle,
+    sync: tauri::State<'_, Arc<SyncManager>>,
+    api_base: String,
+) -> Result<String, String> {
+    let base = api_base.trim().trim_end_matches('/').to_string();
+    if !base.starts_with("http://") && !base.starts_with("https://") {
+        return Err("地址需以 http:// 或 https:// 开头".into());
+    }
+    let authenticated = sync.state().map(|s| s.authenticated).unwrap_or(false);
+    if authenticated {
+        return Err("请先退出登录再切换服务器地址".into());
+    }
+    // rebuild 内部会 unmanage 当前实例；State 借用旧数据，必须先释放再重建。
+    drop(sync);
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("cloud_api_base"), &base).map_err(|e| e.to_string())?;
+    crate::cloud::rebuild(&app, dir)?;
+    Ok(base)
+}
+
 // ── 笔记本 / 笔记 ────────────────────────────────────────────────────────
 
 #[derive(Serialize)]

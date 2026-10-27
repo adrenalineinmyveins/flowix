@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use flowix_sync::{CloudState, RefreshTokenStore, SyncManager, DEFAULT_CLOUD_API_BASE};
+use tauri::Manager;
 
 pub const CLOUD_STATE_EVENT: &str = "cloud-state-changed";
 
@@ -47,15 +48,19 @@ impl RefreshTokenStore for PrivateFileTokenStore {
     }
 }
 
-/// 在 App 私有目录上装配 SyncManager 并启动会话恢复服务。
-pub fn setup(app: &tauri::AppHandle, data_dir: PathBuf) -> Result<Arc<SyncManager>, flowix_sync::SyncError> {
-    // 开发期覆盖：私有目录下存在 cloud_api_base 文件时使用其内容作为 API 地址
-    // （adb push 写入，需重启 App 生效）；生产构建走 DEFAULT_CLOUD_API_BASE。
-    let api_base = std::fs::read_to_string(data_dir.join("cloud_api_base"))
+/// 解析当前云端 API 地址：私有目录下存在 cloud_api_base 文件时使用其内容
+/// （登录界面设置），否则走 DEFAULT_CLOUD_API_BASE。
+pub fn resolve_api_base(data_dir: &std::path::Path) -> String {
+    std::fs::read_to_string(data_dir.join("cloud_api_base"))
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_CLOUD_API_BASE.to_string());
+        .unwrap_or_else(|| DEFAULT_CLOUD_API_BASE.to_string())
+}
+
+/// 在 App 私有目录上装配 SyncManager 并启动会话恢复服务。
+pub fn setup(app: &tauri::AppHandle, data_dir: PathBuf) -> Result<Arc<SyncManager>, flowix_sync::SyncError> {
+    let api_base = resolve_api_base(&data_dir);
     let token_store = Arc::new(PrivateFileTokenStore::new(
         data_dir.join("cloud_refresh_token"),
     ));
@@ -75,4 +80,17 @@ pub fn setup(app: &tauri::AppHandle, data_dir: PathBuf) -> Result<Arc<SyncManage
         service.run_session_service().await;
     });
     Ok(sync)
+}
+
+/// 重建 SyncManager 并替换 Tauri 托管实例（未登录时切换云端地址用）。
+/// 旧实例可能仍被后台任务持有，但均为无 token 的空闲会话，随引用释放退出。
+///
+/// unmanage 标记 deprecated 是因为悬垂 State；本函数仅在未登录（cloud_set_api_base
+/// 守卫）且调用方已 drop 全部 State 后执行，无存活引用，可安全使用。
+pub fn rebuild(app: &tauri::AppHandle, data_dir: PathBuf) -> Result<(), String> {
+    let sync = setup(app, data_dir).map_err(|e| e.to_string())?;
+    #[allow(deprecated)]
+    app.unmanage::<Arc<SyncManager>>();
+    app.manage(sync);
+    Ok(())
 }

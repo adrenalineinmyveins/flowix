@@ -91,6 +91,25 @@
   text-align: center;
 }
 
+.login-server-toggle {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  min-height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  max-width: 340px;
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0 8px;
+}
+
+.login-server {
+  font-size: 13px;
+}
+
 /* ── Notes 主屏 ───────────────────────────────────────── */
 
 .notes-bar-btn {

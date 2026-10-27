@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { Eye, EyeOff } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Eye, EyeOff, Server } from 'lucide-react';
 import { api } from './api';
 
 /** 后端错误码 → 用户可读文案（桌面文案风格：简短、给动作建议）。 */
@@ -19,16 +19,35 @@ function readableError(error: unknown): string {
 export function LoginScreen({ onAuthenticated }: { onAuthenticated: () => Promise<void> }) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [server, setServer] = useState('');
+  const [currentServer, setCurrentServer] = useState('');
+  const [showServer, setShowServer] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [mode, setMode] = useState<'login' | 'register'>('login');
+
+  useEffect(() => {
+    api
+      .cloudGetApiBase()
+      .then((base) => {
+        setServer(base);
+        setCurrentServer(base);
+      })
+      .catch(() => undefined);
+  }, []);
 
   const submit = async () => {
     if (busy || !email || !password) return;
     setBusy(true);
     setError('');
     try {
+      // 服务器地址有变化：先切换（重建同步引擎），再认证
+      const next = server.trim().replace(/\/+$/, '');
+      if (next && next !== currentServer) {
+        await api.cloudSetApiBase(next);
+        setCurrentServer(next);
+      }
       if (mode === 'login') {
         await api.login(email, password);
       } else {
@@ -47,6 +66,29 @@ export function LoginScreen({ onAuthenticated }: { onAuthenticated: () => Promis
       <div className="login-logo">Flowix</div>
       <div className="login-sub">云端笔记本 · 移动端</div>
       <div className="login-form">
+        {showServer ? (
+          <div className="login-field">
+            <input
+              className="m-input login-server"
+              type="url"
+              autoCapitalize="off"
+              placeholder="服务器地址，如 http://192.168.1.10:8787"
+              value={server}
+              onChange={(e) => setServer(e.target.value)}
+            />
+            <button
+              className="m-icon-btn eye"
+              onClick={() => setShowServer(false)}
+              aria-label="收起服务器设置"
+            >
+              <Server />
+            </button>
+          </div>
+        ) : (
+          <button className="login-server-toggle" onClick={() => setShowServer(true)}>
+            服务器：{currentServer || '默认'}
+          </button>
+        )}
         <input
           className="m-input"
           type="email"

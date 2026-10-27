@@ -25,15 +25,18 @@ static SYNC_NOW_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(())
 /// 启动后自动同步循环：5 秒首同步（等会话恢复），之后 10 秒轮询
 ///（对端消息体感 ~10s 内到达；唤起时的 0 等待补拉由前端 visibilitychange
 /// 调 syncNow 负责）。仅在已认证时执行；错误吞掉等下一轮。
-pub fn spawn_auto_sync(app: tauri::AppHandle, sync: Arc<SyncManager>) {
+/// 每轮从 app.state() 取当前 SyncManager（未登录切换服务器地址会重建实例）。
+pub fn spawn_auto_sync(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         let mut first = true;
         loop {
             let delay = if first { Duration::from_secs(5) } else { Duration::from_secs(10) };
             first = false;
             tokio::time::sleep(delay).await;
+            let sync = app.state::<Arc<SyncManager>>();
             let authenticated = sync.state().map(|s| s.authenticated).unwrap_or(false);
             if authenticated {
+                drop(sync);
                 let _ = sync_now(&app).await;
             }
         }
