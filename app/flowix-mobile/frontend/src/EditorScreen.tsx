@@ -86,6 +86,22 @@ export function EditorScreen({
   const latestMarkdown = useRef('');
   const saveSeq = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // §16 修复③：已保存基线（frontmatter + markdown）+ 加载抑制标记。
+  // 加载/恢复触发的 setContent 不算编辑；内容与基线等价时不标 dirty
+  // 不保存——消除「打开笔记即回写 put」的回声源（桌面确认失败期间的
+  // 双端回声循环即由它触发）。
+  const savedContentRef = useRef<string | null>(null);
+  const loadingContentRef = useRef(false);
+
+  // 比较前规范化：桌面写盘可能是 CRLF，编辑器序列化恒 LF
+  const sameAsSaved = (markdown: string): boolean => {
+    const baseline = savedContentRef.current;
+    if (baseline === null) return false;
+    return (
+      (frontmatterRef.current + markdown).replace(/\r\n/g, '\n') ===
+      baseline.replace(/\r\n/g, '\n')
+    );
+  };
 
   const editor = useEditor({
     extensions: [
@@ -118,6 +134,13 @@ export function EditorScreen({
     onUpdate: ({ editor: instance }) => {
       latestMarkdown.current = instance.getMarkdown();
       setCharCount(instance.getText().length);
+      // 加载触发的 setContent 回写不算编辑（基线随后在加载流程里落）
+      if (loadingContentRef.current) return;
+      // 内容与已保存基线等价（撤销回原点/序列化 roundtrip）：不标 dirty 不保存
+      if (sameAsSaved(latestMarkdown.current)) {
+        setSaveState('saved');
+        return;
+      }
       setSaveState('dirty');
       // 800ms 停止输入后自动保存（后端另有 3s 同步防抖，两级不冲突）
       window.clearTimeout(saveTimer.current);
@@ -130,7 +153,10 @@ export function EditorScreen({
     const seq = ++saveSeq.current;
     setSaveState('saving');
     try {
-      await api.noteSave(note.notebookId, note.relativePath, frontmatterRef.current + markdown);
+      const full = frontmatterRef.current + markdown;
+      await api.noteSave(note.notebookId, note.relativePath, full);
+      // §16 修复③：保存成功推进基线（后续等价内容不再触发保存）
+      savedContentRef.current = full;
       if (seq === saveSeq.current) setSaveState('saved');
     } catch (e) {
       if (seq === saveSeq.current) {
@@ -214,12 +240,21 @@ export function EditorScreen({
         if (cancelled) return;
         const { frontmatter, body } = splitFrontmatter(content);
         frontmatterRef.current = frontmatter;
+        // §16 修复③：加载触发的 onUpdate 不算编辑（setContent 必触发）；
+        // 基线取「原始 frontmatter + 序列化 roundtrip 产物」——吸收
+        // parse→serialize 的非字节级差异（如 CRLF→LF），打开即保存的回声
+        // 才能被 sameAsSaved 判等拦下
+        loadingContentRef.current = true;
         // contentType: 'markdown' 与桌面端一致：否则 Markdown 被当纯文本灌入，
         // 序列化时段落换行退化为空格（单行化）
         editor?.commands.setContent(body, { contentType: 'markdown' });
+        loadingContentRef.current = false;
+        savedContentRef.current =
+          frontmatter + (editor ? editor.getMarkdown() : body);
         editor?.setEditable(true);
         setSaveState('saved');
       } catch (e) {
+        loadingContentRef.current = false;
         if (!cancelled) setError(String(e));
       } finally {
         if (!cancelled) setLoading(false);

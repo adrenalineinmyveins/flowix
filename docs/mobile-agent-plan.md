@@ -258,6 +258,8 @@ CREATE TABLE thread_revisions (...);  -- 照 note_revisions（对话历史免费
 
 **修复（2026-10-26，同日闭环）**：先给 [operation_locks.rs](../app/flowix-core/src/memo_file/operation_locks.rs) 加进程内独占锁持有登记（超时错误点名持有者 + tracing warn）复现取证——持有者为 **`resolve_cloud_file_put_conflict`**（409 消解器）。根因即上文②的自死锁变体：消解器持 notebook **Exclusive** 后调 `register_existing_file_for_notebook_id` → `sync_index_on_write` → `refresh_note_path` 内部 `notebook_read`（**Shared**）→ **同进程同线程新句柄自等自死锁 5s 超时**（fs2 不同句柄不识别同线程）→ 消解失败 → rebase 未执行 → dirty 保留 → 下轮 pass 再撞 409 → 无限循环（每轮消解写盘一次 = 5.7s 周期回写，本地编辑被反复覆盖）。修复（core 层统一，桌面/移动端 all-in）：`notebook_read` 增加同线程重入——本线程已持该笔记本 Exclusive 时直接放行（Exclusive 语义覆盖 Shared，无需真实文件锁），`NotebookChangeGuard` 在 thread-local 登记持有 key、drop 移除。测试：新增 `notebook_read_is_reentrant_while_holding_change_on_same_thread`（修复前该场景 5s 超时），锁模块 8/8 + flowix-core 355/355 零回归。**实机验证**：修复版 dev 重启后 90s 零锁超时 WARN；挂起 3 小时的 5 个 inflight op 与 dirty 全部清零；`last_success_at` 恢复实时推进；云端与本地内容一致收敛；「立即同步」按钮由常亮禁用恢复可点且手动 pass 无错。
 
+**修复③落地（2026-10-26 下午，移动端 EditorScreen）**：消除「打开笔记即自动保存回写」回声源——① 加载流程 `setContent` 必触发 `onUpdate`，加 `loadingContentRef` 抑制（加载回写不算编辑，不标 dirty 不排保存）；② `savedContentRef` 已保存基线 = 「原始 frontmatter + 加载后序列化 roundtrip 产物」（吸收 parse→serialize 非字节级差异），`onUpdate` 与基线 `sameAsSaved`（两侧 CRLF→LF 规范化后比较）等价则直接 saved——撤销回原点也不再触发保存；③ `performSave` 成功后推进基线。历史恢复走正常编辑链路（与基线不同即 dirty 保存，等价恢复则正确地不保存）。**实机验证（模拟器 CDP，全绿）**：CRLF 内容笔记（桌面写盘形态）打开 → saveState 恒「已保存」、关闭后 sync 差分 uploaded=0（修复前该场景序列化 LF ≠ 磁盘 CRLF 必 put）；编辑追加文字 → autosave 正常、uploaded=1、内容落盘含追加文本。
+
 ## 17. 移动端笔记内嵌 AI 对话卡片（thread card，2026-10-26）
 
 **需求**：桌面端可在笔记中插入 agent 对话卡片（HTML 注释存储，随笔记云同步）；移动端此前遇到该注释会**静默丢弃**（`@tiptap/markdown` 对 html token 走 `generateJSON`，DOM 解析丢注释）。本轮让移动端互认该格式：能显示、能新建、能对话。
