@@ -280,7 +280,7 @@ CREATE TABLE thread_revisions (...);  -- 照 note_revisions（对话历史免费
 - **上云**：在 Loop 本（云同步本）loop-note-1.md 文末插卡对话后，云端 blob 出现顶格注释 `<!-- flowix:agent-thread-card {"version":1,"instanceId":"58d06974-…","threadId":"th_m_01a177b1fa11…","agentType":"mobile",…} -->`（seq 202/203/205 三连 put），线程 th_m_01a177b1fa11… 同步上云。格式与桌面字节级一致（桌面读侧走同款 marker/解析，为其既有能力）。
 - **修复一处流式 bug**：`stream_end` 后 liveText/liveReasoning 未清空导致落库消息与流式气泡重复显示（卡片 hook 与 ChatScreen 同源同病，两处同步修复）。
 
-**遗留待办（非本功能引入）**：① 移动端**新建笔记首推不生效**——note_create/note_save 记 dirty 后 pass 上传 0（LoopCardTest.md 十余分钟未上云），而编辑已有云笔记（loop-note-1）dirty 推送正常；新 note 无 baseline 时内容对账也跳过，需查 dirty 队列消费路径。② 桌面生产包（旧版）云同步轮询停摆：18:03 后未再拉取云端 put（dev 版未登录云）；重启生产包 + dev 均未恢复，与本轮 thread card 无关，归入 §15/§16 既有挂起问题族。③ 桌面打开移动端卡的视觉确认随 ② 恢复后补做。
+**遗留待办（非本功能引入）**：① 移动端**新建笔记首推不生效**——note_create/note_save 记 dirty 后 pass 上传 0（LoopCardTest.md 十余分钟未上云），而编辑已有云笔记（loop-note-1）dirty 推送正常；新 note 无 baseline 时内容对账也跳过，需查 dirty 队列消费路径。**→ 已复核不复现（见 §18 遗留②）**。② 桌面生产包（旧版）云同步轮询停摆：18:03 后未再拉取云端 put（dev 版未登录云）；重启生产包 + dev 均未恢复，与本轮 thread card 无关，归入 §15/§16 既有挂起问题族。③ 桌面打开移动端卡的视觉确认随 ② 恢复后补做。
 - **修复验证**：新版 APK 重装后续发一轮（before 2 → after 4 条气泡，user/assistant 各一条），重复显示消除；旧对话重开加载亦干净。
 
 ## 18. 桌面云同步停摆排查与修复 + thread card 跨端双卡互认（2026-10-26）
@@ -302,7 +302,7 @@ CREATE TABLE thread_revisions (...);  -- 照 note_revisions（对话历史免费
 
 **操作备查**：dev 连自建云必须带 `FLOWIX_CLOUD_API_BASE=http://8.160.162.251:8787`（默认 cloud.flowix.cc，登录会 INVALID_CREDENTIALS）；桌面 dev WebView 调试用 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9223` 后 CDP 直连（可 invoke cloud_login/cloud_sync_now）。账号 loop@selfhost.local。
 
-**遗留**：① 强杀落 refresh 轮换窗口丢登录态的窗口期风险（服务端单次消费 + 客户端写回非原子）——低频可接受，后续可考虑服务端 token 宽限或客户端原子写回；② 移动端新建笔记首推不生效（§17 待办①，仍未查）。
+**遗留**：① 强杀落 refresh 轮换窗口丢登录态的窗口期风险（服务端单次消费 + 客户端写回非原子）——低频可接受，后续可考虑服务端 token 宽限或客户端原子写回；② ~~移动端新建笔记首推不生效~~ **已复核不复现（2026-10-26 下午）**：Loop 本 note_create 后手动 `cloud_sync_now`（uploaded=1）与自动路径（等 40s 防抖/轮询后差分 uploaded=0）均正常上云；初判 §17 当时现象为本节 bootstrap 冲突死循环同现场症状（pass 在冲突循环中失败，非独立 bug）。
 
 ## 19. 移动端对话窗 P0 渲染层 + P1a 上下文注入（2026-10-26，已交付）
 
