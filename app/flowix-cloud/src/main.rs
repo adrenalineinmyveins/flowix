@@ -21,7 +21,10 @@ async fn main() {
         .unwrap_or_else(|| PathBuf::from("flowix-cloud.db"));
     let db = flowix_cloud::db::CloudDb::open(&db_path)
         .unwrap_or_else(|error| panic!("open db {}: {error}", db_path.display()));
-    let state = Arc::new(flowix_cloud::AppState { db });
+    let state = Arc::new(flowix_cloud::AppState {
+        db,
+        refresh_grace: Default::default(),
+    });
     let app = flowix_cloud::build_router(state);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await

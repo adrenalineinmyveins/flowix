@@ -18,6 +18,8 @@ use std::sync::Arc;
 
 pub struct AppState {
     pub db: db::CloudDb,
+    /// refresh 轮换宽限缓存（§18 遗留①加固，见 auth.rs）
+    pub refresh_grace: auth::RefreshGrace,
 }
 
 pub type SharedState = Arc<AppState>;

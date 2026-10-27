@@ -16,7 +16,13 @@ use tower::ServiceExt;
 async fn serve() -> (axum::Router, tempfile::TempDir) {
     let temp = tempfile::tempdir().unwrap();
     let db = CloudDb::open(&temp.path().join("cloud.db")).unwrap();
-    (flowix_cloud::build_router(Arc::new(AppState { db })), temp)
+    (
+        flowix_cloud::build_router(Arc::new(AppState {
+            db,
+            refresh_grace: Default::default(),
+        })),
+        temp,
+    )
 }
 
 async fn request_json<T: serde::de::DeserializeOwned>(
@@ -65,7 +71,9 @@ async fn full_protocol_roundtrip() {
     let auth = auth.unwrap().data;
     assert_eq!(auth.user.email, email);
 
-    // 2. refresh 轮换：旧 token 用后失效
+    // 2. refresh 轮换 + 宽限重放（§18 遗留①加固）：
+    //    首次轮换旧→新A；旧 token 在宽限窗口内重放 → 200 且返回同一新A（幂等）；
+    //    新A 被再次轮换消费（→新B）后，旧 token 重放 → 401（验活失效，不能复活）
     let (status, refreshed) = request_json::<DataEnvelope<flowix_sync::RefreshData>>(
         &router,
         "POST",
@@ -75,7 +83,34 @@ async fn full_protocol_roundtrip() {
     )
     .await;
     assert_eq!(status, 200);
-    let new_access = refreshed.unwrap().data.session.access_token;
+    let rotated = refreshed.unwrap().data.session;
+    let (status, replayed) = request_json::<DataEnvelope<flowix_sync::RefreshData>>(
+        &router,
+        "POST",
+        "/v1/auth/refresh",
+        None,
+        Some(serde_json::json!({ "refreshToken": auth.session.refresh_token })),
+    )
+    .await;
+    assert_eq!(status, 200, "宽限窗口内旧 token 重放应幂等成功");
+    let replayed = replayed.unwrap().data.session;
+    assert_eq!(
+        replayed.refresh_token, rotated.refresh_token,
+        "宽限重放必须返回同一新 refresh token"
+    );
+    assert_eq!(replayed.access_token, rotated.access_token);
+    // 用宽限返回的新A 继续轮换 → 新B（正常链路）
+    let (status, next) = request_json::<DataEnvelope<flowix_sync::RefreshData>>(
+        &router,
+        "POST",
+        "/v1/auth/refresh",
+        None,
+        Some(serde_json::json!({ "refreshToken": rotated.refresh_token })),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let next = next.unwrap().data.session;
+    // 新A 已消费 → 旧 token 宽限验活失败 → 401
     let (status, _) = request_json::<DataEnvelope<AuthData>>(
         &router,
         "POST",
@@ -84,8 +119,23 @@ async fn full_protocol_roundtrip() {
         Some(serde_json::json!({ "refreshToken": auth.session.refresh_token })),
     )
     .await;
-    assert_eq!(status, 401, "旧 refresh token 应已轮换失效");
-    let token = new_access;
+    assert_eq!(status, 401, "新 token 已被再次轮换后，旧 token 宽限应失效");
+    // 新A 也已消费（→新B）→ 宽限窗口内重放返回新B（每次轮换的宽限同构）
+    let (status, replay_a) = request_json::<DataEnvelope<flowix_sync::RefreshData>>(
+        &router,
+        "POST",
+        "/v1/auth/refresh",
+        None,
+        Some(serde_json::json!({ "refreshToken": rotated.refresh_token })),
+    )
+    .await;
+    assert_eq!(status, 200, "新A 消费后宽限窗口内重放应幂等成功");
+    assert_eq!(
+        replay_a.unwrap().data.session.refresh_token,
+        next.refresh_token,
+        "新A 重放返回新B（同一 token 对）"
+    );
+    let token = next.access_token;
 
     // 3. blob 预约 → 上传 → 下载
     let content = "# 云端契约测试\n\n正文段落。\n".as_bytes().to_vec();
@@ -409,14 +459,20 @@ async fn multi_device_sessions_coexist() {
     assert_eq!(status, 200, "A 轮换后 B 不应被踢（多设备共存）");
     let b2 = b2.unwrap().data.session;
 
-    // 单次使用：A 旧 token 已随自己那次 refresh 作废
-    let (status, _) = request_json::<ApiErrorEnvelope>(
+    // 单次使用 + 宽限：A 旧 token 已随自己那次 refresh 作废；60s 宽限窗口内
+    // 重放幂等返回与 A 轮换相同的新 token 对（§18 遗留①加固语义）
+    let (status, a_replay) = request_json::<DataEnvelope<flowix_sync::RefreshData>>(
         &router, "POST", "/v1/auth/refresh", None,
         Some(serde_json::json!({ "refreshToken": a.refresh_token })),
     ).await;
-    assert_eq!(status, 401, "被消费的 refresh token 单次使用失效");
+    assert_eq!(status, 200, "宽限窗口内 A 旧 token 重放应幂等成功");
+    assert_eq!(
+        a_replay.unwrap().data.session.refresh_token,
+        a2.refresh_token,
+        "A 旧 token 重放返回其轮换出的同一新 token"
+    );
 
-    // logout 只下线自己：A logout → A 失效 → B 仍有效
+    // logout 只下线自己：A logout → A 失效（宽限随之失效）→ B 仍有效
     let (status, _) = request_json::<serde_json::Value>(
         &router, "POST", "/v1/auth/logout/refresh", None,
         Some(serde_json::json!({ "refreshToken": a2.refresh_token })),
@@ -427,6 +483,12 @@ async fn multi_device_sessions_coexist() {
         Some(serde_json::json!({ "refreshToken": a2.refresh_token })),
     ).await;
     assert_eq!(status, 401, "A logout 后自己的 token 应失效");
+    // logout 后 A 旧 token 的宽限验活失败（新行 a2 已删）→ 不能复活
+    let (status, _) = request_json::<ApiErrorEnvelope>(
+        &router, "POST", "/v1/auth/refresh", None,
+        Some(serde_json::json!({ "refreshToken": a.refresh_token })),
+    ).await;
+    assert_eq!(status, 401, "A logout 后旧 token 宽限应失效（不能复活会话）");
     let (status, _) = request_json::<DataEnvelope<flowix_sync::RefreshData>>(
         &router, "POST", "/v1/auth/refresh", None,
         Some(serde_json::json!({ "refreshToken": b2.refresh_token })),
