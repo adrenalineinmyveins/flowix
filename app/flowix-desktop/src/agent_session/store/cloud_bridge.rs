@@ -3,15 +3,18 @@
 //! - 出向：`thread_payload_for_cloud` 把 threads + thread_messages 投影成
 //!   整线程 JSON（消息按 (createdAt,id) 排序保证序列化确定性，使内容
 //!   哈希可作同步 fingerprint；tool_data 超限截断，R7 隐私/体积防线）。
+//!   harness（deepseek-harness）线程消息在 DSH 原生存储，出向走
+//!   `dsh_payload_for_cloud`（DSH 全量历史 ⋈ 本地表并集）。
 //! - 入向：`upsert_thread_from_cloud` 幂等落库（消息按 id INSERT OR
 //!   IGNORE，新消息按序分配 sequence），与引擎 409 消解的两段式约定
-//!   （"桥接层 upsert 后 re-dirty"）配套。
+//!   （"桥接层 upsert 后 re-dirty"）配套。harness 线程 apply 时过滤
+//!   origin=desktop 历史不落本表（权威在 DSH host）。
 //!
-//! 只投影产品线程（消息在 thread_messages 表）；外部 runtime 的消息在
-//! agent_external_events（C7 排除面），不参与云同步。
+//! codex / opencode / pi 等其余外部 runtime 尚不在同步范围。
 
 use super::ThreadManager;
 use crate::agent_session::error::ThreadError;
+use crate::agent_session::types::ChatMessage;
 use flowix_sync::{V2ThreadMessage, V2ThreadPayload};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::Arc;
@@ -123,27 +126,7 @@ impl ThreadManager {
             let Some(head) = read_thread_head(&conn, &local_thread_id)? else {
                 return Ok(None);
             };
-            let mut stmt = conn.prepare(
-                "SELECT id, role, content, tool_name, tool_data, tool_input, reasoning, timestamp
-                 FROM thread_messages WHERE thread_id = ?1 ORDER BY sequence",
-            )?;
-            let rows = stmt
-                .query_map([&local_thread_id], |row| {
-                    Ok(V2ThreadMessage {
-                        id: row.get(0)?,
-                        role: row.get(1)?,
-                        content: row.get(2)?,
-                        reasoning: row.get(6)?,
-                        tool_name: row.get(3)?,
-                        tool_input: row.get(5)?,
-                        tool_data: truncate_tool_data(row.get(4)?),
-                        created_at: message_timestamp_to_millis(&row.get::<_, String>(7)?),
-                        origin: Some("desktop".into()),
-                        attachments: Vec::new(),
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut messages = rows;
+            let mut messages = read_thread_messages_as_v2(&conn, &local_thread_id)?;
             messages.sort_by(|left, right| {
                 (left.created_at, &left.id).cmp(&(right.created_at, &right.id))
             });
@@ -157,6 +140,110 @@ impl ThreadManager {
                 starred: false,
                 archived: false,
             }))
+        })
+        .await
+    }
+
+    /// harness 线程增量扫描：`threads_dsh ⋈ threads`（`updated_at` 为准，
+    /// DSH 会话活动时同步推进；消息本体在 DSH 原生存储，不在
+    /// thread_messages，故不能用 `thread_ids_with_messages_since`）。
+    pub(crate) async fn dsh_thread_ids_since(
+        self: &Arc<Self>,
+        cutoff_ms: i64,
+    ) -> Result<Vec<(String, i64)>, ThreadError> {
+        self.run_blocking(move |tm| {
+            let conn = tm.lock_conn();
+            let mut stmt = conn.prepare(
+                "SELECT t.thread_id, t.updated_at FROM threads_dsh d
+                 JOIN threads t ON t.thread_id = d.thread_id
+                 WHERE t.updated_at > ?1
+                 ORDER BY t.updated_at",
+            )?;
+            let rows = stmt
+                .query_map([cutoff_ms], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+    }
+
+    /// 全部 harness 线程 id（删除对账基准 + reconcile 分流依据）。
+    pub(crate) async fn all_dsh_thread_ids(self: &Arc<Self>) -> Result<Vec<String>, ThreadError> {
+        self.run_blocking(move |tm| {
+            let conn = tm.lock_conn();
+            let mut stmt = conn.prepare("SELECT thread_id FROM threads_dsh")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+    }
+
+    pub(crate) async fn is_dsh_thread(
+        self: &Arc<Self>,
+        local_thread_id: &str,
+    ) -> Result<bool, ThreadError> {
+        let local_thread_id = local_thread_id.to_string();
+        self.run_blocking(move |tm| {
+            let conn = tm.lock_conn();
+            let found: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM threads_dsh WHERE thread_id = ?1)",
+                [&local_thread_id],
+                |row| row.get(0),
+            )?;
+            Ok(found)
+        })
+        .await
+    }
+
+    /// harness 出向投影：DSH 全量历史 ⋈ 本地 thread_messages（按 id 并集）。
+    /// 云端线程实体是整包 last-writer-wins：桌面必须推并集，否则手机
+    /// 续聊消息会被桌面投影从云端抹掉（push 震荡）。本地行只有其他端
+    /// 消息（DSH 历史在 apply 侧过滤不落本表），与 DSH 历史 id 无交集。
+    pub(crate) async fn dsh_payload_for_cloud(
+        self: &Arc<Self>,
+        local_thread_id: &str,
+        dsh_messages: Vec<ChatMessage>,
+    ) -> Result<Option<V2ThreadPayload>, ThreadError> {
+        let local_thread_id = local_thread_id.to_string();
+        self.run_blocking(move |tm| {
+            let conn = tm.lock_conn();
+            let Some(head) = read_thread_head(&conn, &local_thread_id)? else {
+                return Ok(None);
+            };
+            let mut dsh_messages: Vec<V2ThreadMessage> =
+                dsh_messages.iter().map(chat_message_to_v2).collect();
+            dsh_messages.sort_by(|left, right| {
+                (left.created_at, &left.id).cmp(&(right.created_at, &right.id))
+            });
+            let payload = V2ThreadPayload {
+                version: 1,
+                thread_id: Self::cloud_thread_id(&local_thread_id),
+                agent_id: head.agent_id,
+                title: head.title,
+                created_at: head.created_at,
+                messages: dsh_messages,
+                starred: false,
+                archived: false,
+            };
+            let mut local_messages = read_thread_messages_as_v2(&conn, &local_thread_id)?;
+            if local_messages.is_empty() {
+                return Ok(Some(payload));
+            }
+            local_messages.sort_by(|left, right| {
+                (left.created_at, &left.id).cmp(&(right.created_at, &right.id))
+            });
+            let local_payload = V2ThreadPayload {
+                version: payload.version,
+                thread_id: payload.thread_id.clone(),
+                agent_id: payload.agent_id.clone(),
+                title: payload.title.clone(),
+                created_at: payload.created_at,
+                messages: local_messages,
+                starred: payload.starred,
+                archived: payload.archived,
+            };
+            let merged = flowix_sync::v2_merge_thread_payloads(&payload, &local_payload)
+                .map_err(ThreadError::Join)?;
+            Ok(Some(merged))
         })
         .await
     }
@@ -269,6 +356,51 @@ fn read_thread_head(conn: &Connection, local_thread_id: &str) -> Result<Option<T
         .optional()?)
 }
 
+/// thread_messages 行 → 云消息（thread_payload_for_cloud 与 dsh 并集投影共用）。
+fn read_thread_messages_as_v2(
+    conn: &Connection,
+    local_thread_id: &str,
+) -> Result<Vec<V2ThreadMessage>, ThreadError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, role, content, tool_name, tool_data, tool_input, reasoning, timestamp
+         FROM thread_messages WHERE thread_id = ?1 ORDER BY sequence",
+    )?;
+    let rows = stmt
+        .query_map([local_thread_id], |row| {
+            Ok(V2ThreadMessage {
+                id: row.get(0)?,
+                role: row.get(1)?,
+                content: row.get(2)?,
+                reasoning: row.get(6)?,
+                tool_name: row.get(3)?,
+                tool_input: row.get(5)?,
+                tool_data: truncate_tool_data(row.get(4)?),
+                created_at: message_timestamp_to_millis(&row.get::<_, String>(7)?),
+                origin: Some("desktop".into()),
+                attachments: Vec::new(),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// DSH 原生历史 ChatMessage → 云消息。id 用 DSH 稳定消息 id
+/// （`message-*` / `call_*`，S1 实测重读稳定），是 union merge 幂等键。
+fn chat_message_to_v2(message: &ChatMessage) -> V2ThreadMessage {
+    V2ThreadMessage {
+        id: message.id.clone(),
+        role: message.role.clone(),
+        content: message.content.clone(),
+        reasoning: message.reasoning.clone(),
+        tool_name: message.tool_name.clone(),
+        tool_input: message.tool_input.as_ref().map(|value| value.to_string()),
+        tool_data: truncate_tool_data(message.tool_data.clone()),
+        created_at: message_timestamp_to_millis(&message.timestamp),
+        origin: Some("desktop".into()),
+        attachments: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +488,73 @@ mod tests {
         let first = serde_json::to_vec(&payload).unwrap();
         let second = serde_json::to_vec(&again).unwrap();
         assert_eq!(flowix_sync::v2_content_hash(&first), flowix_sync::v2_content_hash(&second));
+    }
+
+    #[tokio::test]
+    async fn dsh_scan_and_projection_unions_local_rows() {
+        let manager = ThreadManager::for_tests();
+        let thread = manager
+            .create_thread(AgentId("deepseek-harness".into()), "税务".into())
+            .await
+            .unwrap();
+        // 登记 harness 映射（threads_dsh）
+        {
+            let conn = manager.lock_conn();
+            conn.execute(
+                "INSERT INTO threads_dsh (thread_id, external_id) VALUES (?1, ?2)",
+                params![thread.thread_id, "session-test"],
+            )
+            .unwrap();
+        }
+        // 手机续聊消息落本地表（模拟 apply 过滤后的物化）
+        manager
+            .add_message(
+                &thread.thread_id,
+                message("mob_1", "user", "手机问", "2026-10-27T22:00:00+08:00"),
+            )
+            .await
+            .unwrap();
+
+        let ids = manager.dsh_thread_ids_since(0).await.unwrap();
+        assert!(
+            ids.iter().any(|(id, _)| id == &thread.thread_id),
+            "dsh 增量扫描命中"
+        );
+        assert!(manager.is_dsh_thread(&thread.thread_id).await.unwrap());
+        assert!(manager
+            .all_dsh_thread_ids()
+            .await
+            .unwrap()
+            .contains(&thread.thread_id));
+
+        // DSH 历史两条 → 投影为 3 条并集（云端整包语义：推并集防抹掉手机消息）
+        let dsh = vec![
+            message("message-a", "user", "桌面问", "2026-10-26T16:00:00+08:00"),
+            message("call-x", "tool", "", "2026-10-26T16:00:01+08:00"),
+        ];
+        let payload = manager
+            .dsh_payload_for_cloud(&thread.thread_id, dsh.clone())
+            .await
+            .unwrap()
+            .expect("payload exists");
+        assert_eq!(
+            payload.thread_id,
+            ThreadManager::cloud_thread_id(&thread.thread_id)
+        );
+        let mut ids: Vec<&str> = payload.messages.iter().map(|m| m.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["call-x", "message-a", "mob_1"]);
+
+        // 确定性：重复投影哈希一致（fingerprint 语义前提）
+        let again = manager
+            .dsh_payload_for_cloud(&thread.thread_id, dsh)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            flowix_sync::v2_content_hash(&serde_json::to_vec(&payload).unwrap()),
+            flowix_sync::v2_content_hash(&serde_json::to_vec(&again).unwrap())
+        );
     }
 
     #[tokio::test]
