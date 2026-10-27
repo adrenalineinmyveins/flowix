@@ -22,7 +22,8 @@ use super::{
 
 const SCHEMA_VERSION: i64 = 3;
 // Version 9 tolerates legacy malformed tags while retaining ordinary properties.
-const PARSER_VERSION: i64 = 9;
+// Version 10: conflict-copy titles collapse "(Flowix conflict …)" into "（冲突副本）".
+const PARSER_VERSION: i64 = 10;
 const NOTE_SEARCH_FTS_VERSION: i64 = 1;
 const NOTE_INDEX_REFRESH_PENDING: &str = "note-index-refresh-pending";
 const NOTE_INDEX_REFRESH_PENDING_DIR: &str = "note-index-refresh-pending.d";
@@ -92,7 +93,12 @@ fn display_title_from_relative_path(relative_path: &str) -> String {
     } else {
         0
     };
-    filename[..filename.len() - extension_len].to_owned()
+    let title = &filename[..filename.len() - extension_len];
+    // 冲突副本与主文件名同前缀，列表截断后无法区分；压缩长随机后缀为固定标记
+    match title.find("(Flowix conflict") {
+        Some(idx) => format!("{}（冲突副本）", &title[..idx]).trim_end().to_owned(),
+        None => title.to_owned(),
+    }
 }
 
 fn is_markdown_note_path(path: &Path) -> bool {
@@ -2540,6 +2546,25 @@ fn discard_legacy_v2_note_projection(conn: &mut Connection) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::memo_file::NotebookConfig;
+
+    #[test]
+    fn display_title_marks_conflict_copy_and_keeps_normal_name() {
+        assert_eq!(
+            display_title_from_relative_path(
+                "2026-10-26test (Flowix conflict VzDVgFvM8R1bSeaqUU2hXjDCb6SiR6hduZi16z9zaM).md"
+            ),
+            "2026-10-26test （冲突副本）"
+        );
+        // 嵌套副本同样收敛为单一标记，与主文件区分
+        assert_eq!(
+            display_title_from_relative_path(
+                "a (Flowix conflict x) (Flowix conflict y).md"
+            ),
+            "a （冲突副本）"
+        );
+        assert_eq!(display_title_from_relative_path("笔记.md"), "笔记");
+        assert_eq!(display_title_from_relative_path("doc.markdown"), "doc");
+    }
 
     #[test]
     fn parser_upgrade_repairs_null_tag_properties_without_changing_note() {
