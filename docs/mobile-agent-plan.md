@@ -282,7 +282,7 @@ CREATE TABLE thread_revisions (...);  -- 照 note_revisions（对话历史免费
 - **上云**：在 Loop 本（云同步本）loop-note-1.md 文末插卡对话后，云端 blob 出现顶格注释 `<!-- flowix:agent-thread-card {"version":1,"instanceId":"58d06974-…","threadId":"th_m_01a177b1fa11…","agentType":"mobile",…} -->`（seq 202/203/205 三连 put），线程 th_m_01a177b1fa11… 同步上云。格式与桌面字节级一致（桌面读侧走同款 marker/解析，为其既有能力）。
 - **修复一处流式 bug**：`stream_end` 后 liveText/liveReasoning 未清空导致落库消息与流式气泡重复显示（卡片 hook 与 ChatScreen 同源同病，两处同步修复）。
 
-**遗留待办（非本功能引入）**：① 移动端**新建笔记首推不生效**——note_create/note_save 记 dirty 后 pass 上传 0（LoopCardTest.md 十余分钟未上云），而编辑已有云笔记（loop-note-1）dirty 推送正常；新 note 无 baseline 时内容对账也跳过，需查 dirty 队列消费路径。**→ 已复核不复现（见 §18 遗留②）**。② 桌面生产包（旧版）云同步轮询停摆：18:03 后未再拉取云端 put（dev 版未登录云）；重启生产包 + dev 均未恢复，与本轮 thread card 无关，归入 §15/§16 既有挂起问题族。③ 桌面打开移动端卡的视觉确认随 ② 恢复后补做。
+**遗留待办（非本功能引入）**：① 移动端**新建笔记首推不生效**——note_create/note_save 记 dirty 后 pass 上传 0（LoopCardTest.md 十余分钟未上云），而编辑已有云笔记（loop-note-1）dirty 推送正常；新 note 无 baseline 时内容对账也跳过，需查 dirty 队列消费路径。**→ 已复核不复现（见 §18 遗留②）**。② 桌面生产包（旧版）云同步轮询停摆：18:03 后未再拉取云端 put（dev 版未登录云）；重启生产包 + dev 均未恢复，与本轮 thread card 无关，归入 §15/§16 既有挂起问题族。③ 桌面打开移动端卡的视觉确认随 ② 恢复后补做。**→ 已完成（2026-10-27，见 §22）**。
 - **修复验证**：新版 APK 重装后续发一轮（before 2 → after 4 条气泡，user/assistant 各一条），重复显示消除；旧对话重开加载亦干净。
 
 ## 18. 桌面云同步停摆排查与修复 + thread card 跨端双卡互认（2026-10-26）
@@ -406,3 +406,15 @@ verify-p2-image.mjs：1×1 PNG 经 attachment_save 落 Loop/attachments/ → 新
 ### 交付文件
 
 flowix-sync（v2.rs/lib.rs 导出）/ flowix-desktop cloud_bridge.rs（构造点补字段）/ flowix-mobile agent（chat.rs/commands.rs）/ 前端（ChatScreen、agent-thread-card、App、api.ts、screens.css）。
+
+## 22. 桌面打开移动端卡视觉确认 + 云端本导入（2026-10-27，§17 待办③闭环）
+
+**前置：桌面导入云端 Loop 本**。dev 桌面此前未启用任何云笔记本（enabled=[]），UI 显示的 Loop 是本地注册（id=nb_01a15278 与云端相同、path=`Documents\flowix\Loop`）。经 CDP 等价命令链导入：`cloud_link_notebook`（bootstrapRequired=true）→ `cloud_sync_now`（downloaded=99）。**插曲**：本地目录已有旧文件 → 内容对账把本地旧版当 dirty 推 5 条 → 云端 409 全部挡下并正确消解（本地旧版归档为 2 个 `Flowix conflict` 副本，**云端内容零污染**——移动端复核 loop-note-1 六卡完整、上传下载归零收敛）。正规 UI 路径为「新建笔记本 → 从云端导入」（select_directory 原生对话框 CDP 不可达，故走 invoke 等价）。
+
+**视觉确认结果（CDP DOM 断言）**：
+- loop-note-1.md 在桌面编辑器打开：**6/6 张移动端卡全部渲染**——卡框架、标题「移动端会话」、agent 徽章「Mobile」齐全 ✅。
+- 但所有卡 body 停在「使用当前笔记开始 AI 会话 / 思考中」占位态：桌面内嵌卡只连**本地 runtime 会话**，云端 thread 实体（th_m_*）未桥接到桌面卡的消息视图（cloud_bridge 的 upsert_thread_from_cloud 走 ThreadManager，与编辑器内嵌卡的会话加载路径不挂钩）——非渲染 bug，是功能边界（评估文档 §5 双端分工：runtime 留桌面，移动端会话本机续聊）。
+
+**过程中发现的新问题（待办）**：
+- **桌面索引不收录 bootstrap/apply 落盘的新文件**：loop-note-1.md（1649B）在盘但笔记列表不显示，重启也不重扫；同批 sync-e2e-probe.md 却在列表（机制差异待查——remote_apply 写盘后的索引注册路径）。**搜索入口可绕过**（全局搜索能搜到并正常打开渲染）。
+- 桌面卡桥接云端线程消息（「桌面查看移动端会话详情」）为远期增强，与评估文档 §6 委托路线同族。
