@@ -77,7 +77,20 @@ pub fn rename_file_noclobber(source: &Path, target: &Path) -> io::Result<()> {
 
     let source = CString::new(source.as_os_str().as_bytes())?;
     let target = CString::new(target.as_os_str().as_bytes())?;
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_env = "musl"))]
+    let result = unsafe {
+        // musl 的 libc crate 未绑定 renameat2 包装/RENAME_NOREPLACE，
+        // 直接走 syscall（内核 ABI 一致；RENAME_NOREPLACE = 1 << 0）
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            1,
+        )
+    };
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
     let result = unsafe {
         libc::renameat2(
             libc::AT_FDCWD,
