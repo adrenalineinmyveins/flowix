@@ -128,8 +128,19 @@ pub(crate) fn v2_account_snapshot(
             }
             let path = notebook_path_from_relative(Path::new(&config.path), &memo.relative_path)
                 .unwrap_or_else(|_| PathBuf::from(&config.path).join(&memo.filename));
-            let content = std::fs::read(&path)
-                .map_err(|error| format!("READ_NOTE_FAILED {}: {error}", path.display()))?;
+            let content = match std::fs::read(&path) {
+                Ok(content) => content,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // 索引/快照竞态：文件已删（Delete dirty 由 watcher 记录，
+                    // Delete op 无需快照内容）。跳过，避免单个缺失文件
+                    // 炸掉整趟同步（阻塞该笔记本全部后续同步）。
+                    tracing::warn!("cloud snapshot skipped missing note: {}", path.display());
+                    continue;
+                }
+                Err(error) => {
+                    return Err(format!("READ_NOTE_FAILED {}: {error}", path.display()))
+                }
+            };
             notes.push(V2LocalNote {
                 id: cloud_id,
                 notebook_id: config.id.clone(),
@@ -149,11 +160,20 @@ pub(crate) fn v2_account_snapshot(
             {
                 continue;
             }
+            let content = match std::fs::read(&path) {
+                Ok(content) => content,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // 同上：附件删除竞态，跳过不炸整趟。
+                    tracing::warn!("cloud snapshot skipped missing attachment: {}", path.display());
+                    continue;
+                }
+                Err(error) => return Err(sync_error(error)),
+            };
             notes.push(V2LocalNote {
                 id: cloud_id,
                 notebook_id: config.id.clone(),
                 filename: relative_path,
-                content: std::fs::read(&path).map_err(sync_error)?,
+                content,
                 attachments: Vec::new(),
             });
         }
