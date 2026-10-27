@@ -240,13 +240,17 @@ function AgentThreadCardComponent({ node, editor, getPos, deleteNode }: NodeView
           {messages !== null && messages.length === 0 && attrs.threadId && !streaming ? (
             <div className="atc-m-hint">会话尚未同步到本机</div>
           ) : null}
-          {messages?.map((message) => (
-            <MessageBubble
-              key={message.id}
-              message={message}
-              attachmentNotebookId={noteContext?.notebookId ?? null}
-            />
-          ))}
+          {messages?.map((message) =>
+            // 桌面同步会话只展示文字对话：纯工具消息不渲染（与 ChatScreen 一致）
+            message.origin === 'desktop' &&
+            (message.role === 'tool' || (message.toolName && message.role !== 'assistant')) ? null : (
+              <MessageBubble
+                key={message.id}
+                message={message}
+                attachmentNotebookId={noteContext?.notebookId ?? null}
+              />
+            ),
+          )}
           {liveText || liveReasoning || streaming ? (
             <div className="chat-bubble chat-bubble-assistant">
               {liveReasoning ? (

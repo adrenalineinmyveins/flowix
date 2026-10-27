@@ -184,9 +184,11 @@ export function MessageBubble({
     return <ToolCallRow message={message} />;
   }
   if (message.role === 'assistant') {
+    // 桌面同步会话只展示文字对话：思考过程与内嵌工具行不渲染（本机对话保持完整）
+    const textOnly = message.origin === 'desktop';
     return (
       <div className="chat-bubble chat-bubble-assistant" onClick={onBubbleClick}>
-        {message.reasoning ? (
+        {message.reasoning && !textOnly ? (
           <details className="chat-reasoning">
             <summary>思考过程</summary>
             <div className="chat-reasoning-body">{message.reasoning}</div>
@@ -202,7 +204,7 @@ export function MessageBubble({
             <span className="chat-cursor">▍</span>
           </div>
         )}
-        {message.toolName ? <ToolCallRow message={message} /> : null}
+        {message.toolName && !textOnly ? <ToolCallRow message={message} /> : null}
         {message.content ? (
           <div className="chat-bubble-actions">
             <span className="chat-bubble-meta">{formatMessageTime(message.createdAt)}</span>
@@ -431,13 +433,17 @@ export function ChatScreen({ threadId, onBack, onThreadCreated, attachmentNotebo
           <div className="m-empty">加载中…</div>
         ) : (
           <>
-            {messages.map((message) => (
-              <MessageBubble
-                key={message.id}
-                message={message}
-                attachmentNotebookId={attachmentNotebookId}
-              />
-            ))}
+            {messages.map((message) =>
+              // 桌面同步会话只展示文字对话：纯工具消息（tool 行）不渲染
+              message.origin === 'desktop' &&
+              (message.role === 'tool' || (message.toolName && message.role !== 'assistant')) ? null : (
+                <MessageBubble
+                  key={message.id}
+                  message={message}
+                  attachmentNotebookId={attachmentNotebookId}
+                />
+              ),
+            )}
             {liveText || liveReasoning || streaming ? (
               <div className="chat-bubble chat-bubble-assistant">
                 {liveReasoning ? (
