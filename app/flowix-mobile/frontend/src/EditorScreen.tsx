@@ -121,7 +121,8 @@ export function EditorScreen({
       TableCell,
       // 图片附件：asset://localhost 语法与桌面互认，跨设备按文件名回落
       MobileImage.configure({ notebookId: note.notebookId }),
-      // AI 对话卡片：HTML 注释存储与桌面互认；mobile 卡可对话，桌面卡只读。
+      // AI 对话卡片：HTML 注释存储与桌面互认；所有卡可对话（桌面同步
+      // 会话手机续聊，消息云端 union merge 双向同步）。
       // P1a：携带所在笔记，卡片首条消息自动注入笔记上下文；
       // P1b：卡片全屏跳转（App 的 openChat）
       AgentThreadCardMobile.configure({

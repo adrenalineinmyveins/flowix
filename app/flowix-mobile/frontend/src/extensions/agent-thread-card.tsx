@@ -136,7 +136,8 @@ function useThreadChat(
 }
 
 // ── 卡片视图 ────────────────────────────────────────────────────────────────
-// typeKey === 'mobile'（本机/云端移动端会话）：可对话；其余桌面 runtime 卡只读。
+// 所有会话卡均可对话：桌面同步会话在手机续聊，消息按 id 幂等并入线程
+// payload，经云端 union merge 双向同步（桌面端 upsert 追加）。
 
 interface ThreadCardOptions {
   /** 卡片所在笔记（P1a 上下文注入；由 EditorScreen configure 传入） */
@@ -162,7 +163,6 @@ function AgentThreadCardComponent({ node, editor, getPos, deleteNode }: NodeView
     | undefined;
   const noteContext = storage?.noteContext ?? null;
   const onOpenThread = storage?.onOpenThread ?? null;
-  const interactive = attrs.typeKey === 'mobile' || !attrs.typeKey;
   // 草稿持久化（P1b）：初始读 attrs.inputDraft（随笔记保存跨端互认）
   const [draft, setDraft] = useState(() => (node.attrs.inputDraft as string | null) ?? '');
 
@@ -213,9 +213,7 @@ function AgentThreadCardComponent({ node, editor, getPos, deleteNode }: NodeView
         >
           <ChevronDown size={16} className={attrs.collapsed ? 'atc-m-chevron-collapsed' : ''} />
         </button>
-        <div className="atc-m-title">
-          {attrs.title || (interactive ? 'AI 对话' : '桌面端 AI 会话')}
-        </div>
+        <div className="atc-m-title">{attrs.title || 'AI 对话'}</div>
         {attrs.threadId && onOpenThread ? (
           <button
             className="atc-m-icon"
@@ -235,7 +233,7 @@ function AgentThreadCardComponent({ node, editor, getPos, deleteNode }: NodeView
             <div className="atc-m-hint">加载中…</div>
           ) : null}
           {messages !== null && messages.length === 0 && !streaming && !attrs.threadId ? (
-            <div className="atc-m-hint">{interactive ? '发送第一条消息开始对话' : '会话尚未同步到本机'}</div>
+            <div className="atc-m-hint">发送第一条消息开始对话</div>
           ) : null}
           {messages !== null && messages.length === 0 && attrs.threadId && !streaming ? (
             <div className="atc-m-hint">会话尚未同步到本机</div>
@@ -272,45 +270,41 @@ function AgentThreadCardComponent({ node, editor, getPos, deleteNode }: NodeView
             </div>
           ) : null}
           {error ? <div className="atc-m-error">{error}</div> : null}
-          {interactive ? (
-            <div className="atc-m-composer">
-              <textarea
-                className="atc-m-input"
-                value={draft}
-                placeholder={streaming ? '回复生成中…' : '输入消息'}
-                disabled={streaming}
-                rows={Math.min(4, Math.max(1, draft.split('\n').length))}
-                onChange={(event) => setDraft(event.target.value)}
-                onBlur={persistDraft}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
-                    event.preventDefault();
-                    void onSend();
-                  }
-                }}
-              />
-              {streaming ? (
-                <button
-                  className="m-icon-btn atc-m-send atc-m-send-stop"
-                  aria-label="停止生成"
-                  onClick={() => attrs.threadId && void api.agentChatStop(attrs.threadId)}
-                >
-                  <Square size={14} />
-                </button>
-              ) : (
-                <button
-                  className="m-icon-btn atc-m-send"
-                  aria-label="发送"
-                  disabled={!draft.trim()}
-                  onClick={() => void onSend()}
-                >
-                  <ArrowUp size={16} />
-                </button>
-              )}
-            </div>
-          ) : (
-            <div className="atc-m-hint atc-m-readonly">桌面端会话 · 只读（在桌面端继续对话）</div>
-          )}
+          <div className="atc-m-composer">
+            <textarea
+              className="atc-m-input"
+              value={draft}
+              placeholder={streaming ? '回复生成中…' : '输入消息'}
+              disabled={streaming}
+              rows={Math.min(4, Math.max(1, draft.split('\n').length))}
+              onChange={(event) => setDraft(event.target.value)}
+              onBlur={persistDraft}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+                  event.preventDefault();
+                  void onSend();
+                }
+              }}
+            />
+            {streaming ? (
+              <button
+                className="m-icon-btn atc-m-send atc-m-send-stop"
+                aria-label="停止生成"
+                onClick={() => attrs.threadId && void api.agentChatStop(attrs.threadId)}
+              >
+                <Square size={14} />
+              </button>
+            ) : (
+              <button
+                className="m-icon-btn atc-m-send"
+                aria-label="发送"
+                disabled={!draft.trim()}
+                onClick={() => void onSend()}
+              >
+                <ArrowUp size={16} />
+              </button>
+            )}
+          </div>
         </div>
       )}
     </NodeViewWrapper>

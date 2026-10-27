@@ -332,11 +332,6 @@
   padding: 8px 0;
 }
 
-.atc-m-readonly {
-  padding: 4px 0 2px;
-  border-top: 1px dashed var(--border);
-}
-
 .atc-m-error {
   font-size: 12px;
   color: var(--destructive);
