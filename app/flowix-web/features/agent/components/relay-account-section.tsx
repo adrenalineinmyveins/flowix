@@ -264,6 +264,7 @@ function DirectorySearchBox({ relayUrl }: { relayUrl: string }) {
                 <p className="truncate text-[var(--muted-foreground)]">
                   {card.address}
                   {card.card?.minRedactionLevel ? ` · ${String(card.card.minRedactionLevel)}` : ''}
+                  {card.card?.autoAnswer === 'R3' ? ` · ${t('agent.autoGrant.autoAnswerR3')}` : ''}
                 </p>
               </div>
               <Button size="sm" variant="ghost" onClick={() => void copyAddress(card.address)}>
@@ -292,6 +293,8 @@ function PublishCardDialog({
   const [tags, setTags] = useState('');
   const [visibility, setVisibility] = useState<(typeof VISIBILITY_OPTIONS)[number]>('unlisted');
   const [minLevel, setMinLevel] = useState<(typeof LEVEL_OPTIONS)[number]>('R1');
+  // FD-12 M4：能力位随卡发布（判定以本地 auto-grant.json 为准，此位对外可见）。
+  const [autoAnswer, setAutoAnswer] = useState<'off' | 'R3'>('off');
   const [preview, setPreview] = useState<DirectoryPreviewResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -305,14 +308,14 @@ function PublishCardDialog({
     try {
       const specialtyTags = tags.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean);
       setPreview(await redaction.directoryPreview(
-        notebookPath, slug.trim(), displayName.trim(), specialtyTags, visibility, minLevel,
+        notebookPath, slug.trim(), displayName.trim(), specialtyTags, visibility, minLevel, autoAnswer,
       ));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       setBusy(false);
     }
-  }, [busy, notebookPath, slug, displayName, tags, visibility, minLevel]);
+  }, [busy, notebookPath, slug, displayName, tags, visibility, minLevel, autoAnswer]);
 
   const confirmAndPublish = useCallback(async () => {
     if (!preview || busy) return;
@@ -409,6 +412,15 @@ function PublishCardDialog({
                 {LEVEL_OPTIONS.map((option) => (
                   <option key={option} value={option}>{option}</option>
                 ))}
+              </select>
+              <select
+                value={autoAnswer}
+                onChange={(event) => setAutoAnswer(event.target.value as typeof autoAnswer)}
+                className="h-8 w-32 rounded-md border border-[var(--border)] bg-transparent px-2 text-xs"
+                title={t('agent.autoGrant.autoAnswer')}
+              >
+                <option value="off">{t('agent.autoGrant.autoAnswerOff')}</option>
+                <option value="R3">{t('agent.autoGrant.autoAnswerR3')}</option>
               </select>
             </div>
             <div className="flex justify-end gap-2 pt-1">

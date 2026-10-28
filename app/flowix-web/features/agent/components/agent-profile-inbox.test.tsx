@@ -11,6 +11,20 @@ const redactionMock = vi.hoisted(() => ({
   pushStart: vi.fn().mockResolvedValue(undefined),
   pushStop: vi.fn().mockResolvedValue(undefined),
   report: vi.fn().mockResolvedValue(true),
+  autoGrantGet: vi.fn().mockResolvedValue({
+    schemaVersion: 1,
+    enabled: false,
+    maxLevel: 'R3',
+    scopeWhitelist: [],
+    openScopes: [],
+    perSessionLimit: 3,
+    perDayLimit: 20,
+    targets: ['*'],
+    fastMode: false,
+    autoAnswer: 'off',
+    answerTargets: ['*'],
+  }),
+  autoGrantSet: vi.fn().mockResolvedValue(undefined),
 }));
 
 const agentProfileMock = vi.hoisted(() => ({

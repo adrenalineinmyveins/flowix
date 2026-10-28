@@ -16,6 +16,7 @@ import type {
   RelayUsage,
   RelayDeliverResult,
   UsageSummary,
+  AutoGrantConfig,
   SendPayload,
 } from '@/lib/types/redaction';
 
@@ -112,7 +113,7 @@ export const redaction = {
 
   accountForget: () => invoke<void>('redaction_account_forget'),
 
-  /** 目录卡发布预览（L1 过闸 → draft 留档待人审）。 */
+  /** 目录卡发布预览（L1 过闸 → draft 留档待人审）。autoAnswer 见 FD-12 M4。 */
   directoryPreview: (
     cwd: string,
     agentSlug: string,
@@ -120,9 +121,10 @@ export const redaction = {
     specialtyTags: string[],
     visibility: string,
     minRedactionLevel: string,
+    autoAnswer?: string,
   ) =>
     invoke<DirectoryPreviewResult>('redaction_directory_preview', {
-      cwd, agentSlug, displayName, specialtyTags, visibility, minRedactionLevel,
+      cwd, agentSlug, displayName, specialtyTags, visibility, minRedactionLevel, autoAnswer,
     }),
 
   directoryConfirm: (cwd: string, draftId: string, approved: boolean) =>
@@ -150,4 +152,28 @@ export const redaction = {
   /** FD-11 P2-6：近 N 天用量报表 + 套餐配额档。 */
   usageSummary: (days: number) =>
     invoke<UsageSummary>('redaction_usage_summary', { days }),
+
+  /** FD-12 M1：预授权自动发起（五维判定 → 直通/蒸馏 → 自动过门 → send）。 */
+  consultAutoSend: (params: {
+    cwd: string;
+    question: string;
+    scopePaths: string[];
+    targetLevel: string;
+    targetAgentId: string;
+    sessionId: string;
+  }) => invoke<{ receiptId: string; status: string; distillMode: string; byteLength: number }>(
+    'redaction_consult_auto_send',
+    {
+      cwd: params.cwd,
+      question: params.question,
+      scopePaths: params.scopePaths,
+      targetLevel: params.targetLevel,
+      targetAgentId: params.targetAgentId,
+      sessionId: params.sessionId,
+    },
+  ),
+
+  autoGrantGet: () => invoke<AutoGrantConfig>('redaction_auto_grant_get'),
+  autoGrantSet: (config: AutoGrantConfig) =>
+    invoke<void>('redaction_auto_grant_set', { config }),
 };

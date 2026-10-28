@@ -191,6 +191,8 @@ export interface DirectoryCardDraft {
   specialtyTags: string[];
   visibility: "public" | "unlisted" | "private";
   minRedactionLevel: string;
+  /** FD-12 M4 能力位：off（默认）| R3。 */
+  autoAnswer?: string;
   l1Hits?: RuleHit[];
   createdAt: number;
   settledAt?: number | null;
@@ -244,4 +246,21 @@ export interface UsageSummary {
     pollPerHour: number;
     directoryPerDay: number;
   };
+}
+
+/** FD-12 M1：harness 远程咨询预授权配置（auto-grant.json）。 */
+export interface AutoGrantConfig {
+  schemaVersion: number;
+  enabled: boolean;
+  maxLevel: string;
+  scopeWhitelist: string[];
+  openScopes: string[];
+  perSessionLimit: number;
+  perDayLimit: number;
+  targets: string[];
+  fastMode: boolean;
+  /** FD-12 M4：B 端能力位。off（默认）| R3（自动回答入站咨询并直发回程）。 */
+  autoAnswer: string;
+  /** 允许自动回答的来源用户白名单（* = 全部）。 */
+  answerTargets: string[];
 }

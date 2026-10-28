@@ -8,6 +8,7 @@ import type { InboundRecord, RedactionConfig } from '@/lib/types/redaction';
 import { useNoteStore } from '@features/memo/store/note-store';
 import { RedactionSendGateDialog } from '@features/agent/components/redaction-send-gate';
 import { RelayAccountSection } from '@features/agent/components/relay-account-section';
+import { AutoGrantSection } from '@features/agent/components/auto-grant-section';
 import { Button } from '@shared/ui/button';
 import { OverlayScrollbar } from '@shared/ui/overlay-scrollbar';
 import { ListSurfaceLoadingState } from '@shared/ui/list-surface';
@@ -286,6 +287,8 @@ export function AgentProfileInbox({ notebookPath }: { notebookPath: string }) {
             <div className="mx-auto w-full max-w-[680px] space-y-3 px-6 py-5">
               {/* FD-11 v2：中继账号 / 目录 / 用量（发布我的 agent 卡）。 */}
               <RelayAccountSection notebookPath={notebookPath} />
+              {/* FD-12 M1：harness 远程咨询预授权（独立 UI，与会话隔离）。 */}
+              <AutoGrantSection />
               {error && (
                 <div className="flex items-start gap-2 rounded-lg border border-[color-mix(in_oklch,var(--destructive)_24%,var(--divider))] bg-[color-mix(in_oklch,var(--destructive)_6%,transparent)] px-3 py-2 text-xs leading-5 text-[var(--destructive)]">
                   {error}
