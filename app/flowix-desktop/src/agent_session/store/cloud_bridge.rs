@@ -69,6 +69,9 @@ struct ThreadHead {
     agent_id: String,
     title: String,
     created_at: i64,
+    /// 云端用户标记镜像（D1）：桌面无编辑入口，随 apply 回写、投影回推
+    starred: bool,
+    archived: bool,
 }
 
 impl ThreadManager {
@@ -139,8 +142,8 @@ impl ThreadManager {
                 title: head.title,
                 created_at: head.created_at,
                 messages,
-                starred: false,
-                archived: false,
+                starred: head.starred,
+                archived: head.archived,
             }))
         })
         .await
@@ -259,8 +262,8 @@ impl ThreadManager {
                 title: head.title,
                 created_at: head.created_at,
                 messages: provider_messages,
-                starred: false,
-                archived: false,
+                starred: head.starred,
+                archived: head.archived,
             };
             let mut local_messages = read_thread_messages_as_v2(&conn, &local_thread_id)?;
             if local_messages.is_empty() {
@@ -314,16 +317,30 @@ impl ThreadManager {
                     )?;
                     changed = true;
                 }
+                // D1：云端用户标记镜像落列（桌面无编辑入口，云端为真源）
+                if head.starred != payload.starred || head.archived != payload.archived {
+                    tx.execute(
+                        "UPDATE threads SET starred = ?2, archived = ?3 WHERE thread_id = ?1",
+                        params![
+                            local_id,
+                            payload.starred as i64,
+                            payload.archived as i64
+                        ],
+                    )?;
+                    changed = true;
+                }
             } else {
                 tx.execute(
-                    "INSERT INTO threads (thread_id, agent_id, title, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO threads (thread_id, agent_id, title, created_at, updated_at, starred, archived)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         local_id,
                         payload.agent_id,
                         payload.title,
                         payload.created_at.max(0),
-                        now
+                        now,
+                        payload.starred as i64,
+                        payload.archived as i64
                     ],
                 )?;
                 tm.ensure_simplified_thread_index(&tx, &local_id)?;
@@ -381,13 +398,15 @@ impl ThreadManager {
 fn read_thread_head(conn: &Connection, local_thread_id: &str) -> Result<Option<ThreadHead>, ThreadError> {
     Ok(conn
         .query_row(
-            "SELECT agent_id, title, created_at FROM threads WHERE thread_id = ?1",
+            "SELECT agent_id, title, created_at, starred, archived FROM threads WHERE thread_id = ?1",
             [local_thread_id],
             |row| {
                 Ok(ThreadHead {
                     agent_id: row.get(0)?,
                     title: row.get(1)?,
                     created_at: row.get(2)?,
+                    starred: row.get::<_, i64>(3)? != 0,
+                    archived: row.get::<_, i64>(4)? != 0,
                 })
             },
         )
@@ -613,6 +632,61 @@ mod tests {
             .unwrap();
         assert_eq!(
             flowix_sync::v2_content_hash(&serde_json::to_vec(&payload).unwrap()),
+            flowix_sync::v2_content_hash(&serde_json::to_vec(&again).unwrap())
+        );
+    }
+
+    /// D1：云端用户标记（starred/archived）镜像落列、出向投影回读——
+    /// 桌面投影不再以硬编码 false 抹掉手机侧收藏/归档。
+    #[tokio::test]
+    async fn user_flags_survive_roundtrip_between_apply_and_projection() {
+        let manager = ThreadManager::for_tests();
+        let thread = manager
+            .create_thread(AgentId("default".into()), "本地".into())
+            .await
+            .unwrap();
+        let cloud_id = ThreadManager::cloud_thread_id(&thread.thread_id);
+
+        // 手机收藏（云端 payload starred=true）→ apply 落列 → 投影回读 true
+        let mut payload = V2ThreadPayload {
+            version: 1,
+            thread_id: cloud_id.clone(),
+            agent_id: "mobile".into(),
+            title: "本地".into(),
+            created_at: 1,
+            messages: vec![],
+            starred: true,
+            archived: false,
+        };
+        assert!(manager.upsert_thread_from_cloud(&payload).await.unwrap());
+        let projected = manager
+            .thread_payload_for_cloud(&thread.thread_id)
+            .await
+            .unwrap()
+            .expect("payload exists");
+        assert!(projected.starred, "apply 后投影保留收藏");
+        assert!(!projected.archived);
+
+        // 取消收藏（云端 starred=false）→ 镜像翻转
+        payload.starred = false;
+        payload.archived = true;
+        assert!(manager.upsert_thread_from_cloud(&payload).await.unwrap());
+        let projected = manager
+            .thread_payload_for_cloud(&thread.thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!projected.starred, "取消收藏后投影翻转");
+        assert!(projected.archived, "归档镜像");
+
+        // 投影哈希确定性（fingerprint 前提）
+        let again = manager
+            .thread_payload_for_cloud(&thread.thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            flowix_sync::v2_content_hash(&serde_json::to_vec(&projected).unwrap()),
             flowix_sync::v2_content_hash(&serde_json::to_vec(&again).unwrap())
         );
     }
