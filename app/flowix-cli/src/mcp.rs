@@ -9,6 +9,7 @@ use serde_json::{json, Map, Value};
 use std::io::{BufRead, Write};
 
 pub const TOOL_NAME: &str = "memo";
+pub const CONSULT_TOOL_NAME: &str = "consult_remote";
 const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
     "2024-11-05",
@@ -18,6 +19,10 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
 ];
 
 pub const TOOL_DESCRIPTION: &str = "Search and manage Flowix Markdown notes, read table and media library collection datasets by collection ID or notebook-relative path, and use declared artifacts. Delete is destructive.";
+
+/// FD-12 M2：远程咨询工具。默认抽象提问（零取材直通，毫秒级出门）；
+/// scopeHint 仅在需要引用笔记原文时携带。回执立即返回，回程异步到达。
+pub const CONSULT_TOOL_DESCRIPTION: &str = "Consult another user's published Flowix agent over the network (asynchronous). Ask in abstract terms by default: a question written from scratch leaves in milliseconds. Include scopeHint only when the answer must draw on your notes; scopes outside the pre-authorized whitelist fall back to manual review. Returns a delivery receipt (receiptId, status); the answer arrives asynchronously and will be injected into this conversation later.";
 
 /// Run the MCP line-delimited JSON-RPC loop until stdin reaches EOF.
 pub fn run_mcp<R: BufRead, W: Write>(reader: R, mut writer: W) -> Result<(), CliError> {
@@ -51,7 +56,7 @@ pub fn run_mcp<R: BufRead, W: Write>(reader: R, mut writer: W) -> Result<(), Cli
         let response = match method {
             "initialize" => rpc_result(id, initialize_result(&params)),
             "ping" => rpc_result(id, json!({})),
-            "tools/list" => rpc_result(id, json!({"tools": [tool_definition()]})),
+            "tools/list" => rpc_result(id, json!({"tools": [tool_definition(), consult_tool_definition()]})),
             "tools/call" => match call_tool(&params) {
                 Ok(result) => rpc_result(id, result),
                 Err(error) => rpc_error(id, -32602, error.to_string()),
@@ -94,6 +99,20 @@ fn tool_definition() -> Value {
     })
 }
 
+fn consult_tool_definition() -> Value {
+    let schema: Value = serde_json::from_str(include_str!(
+        "../../../dsh-flowix-memory/consult-tool-schema.json"
+    ))
+    .expect("consult tool schema must be valid JSON");
+    json!({
+        "name": CONSULT_TOOL_NAME,
+        "title": "Flowix Remote Consult",
+        "description": CONSULT_TOOL_DESCRIPTION,
+        "inputSchema": schema,
+        "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true}
+    })
+}
+
 fn call_tool(params: &Value) -> Result<Value, CliError> {
     let object = params
         .as_object()
@@ -102,6 +121,9 @@ fn call_tool(params: &Value) -> Result<Value, CliError> {
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| CliError::Usage("tools/call params.name must be a string".into()))?;
+    if name == CONSULT_TOOL_NAME {
+        return call_consult_tool(object);
+    }
     if name != TOOL_NAME {
         return Err(CliError::Usage(format!("unknown tool: `{name}`")));
     }
@@ -475,6 +497,145 @@ fn reject_stdin(stdin: Option<&str>) -> Result<(), CliError> {
     }
 }
 
+// ----------------------------------------------------------------------
+// FD-12 M2：consult_remote —— 桥接桌面进程的预授权自动发起链
+// ----------------------------------------------------------------------
+
+const BRIDGE_UNAVAILABLE: &str = "BRIDGE_UNAVAILABLE: the Flowix desktop app is not running or its consult bridge is disabled. Start the Flowix desktop app, restart this DSH profile, and retry.";
+
+/// 会话标识：CLI server 进程生命周期 ≈ 一个 DSH 会话上下文，
+/// 预授权 perSessionLimit 以此为口径（DSH 重启 = 新进程 = 新计数）。
+fn consult_session_id() -> String {
+    static SESSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SESSION
+        .get_or_init(|| {
+            format!(
+                "mcp-{}-{}",
+                std::process::id(),
+                chrono::Utc::now().timestamp_millis()
+            )
+        })
+        .clone()
+}
+
+fn consult_tool_result(data: Value, is_error: bool) -> Value {
+    let text = if is_error {
+        data.get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("consult_remote failed")
+            .to_string()
+    } else {
+        format!(
+            "Consult delivered (receipt {}, status {}, mode {})",
+            data.get("receiptId").and_then(Value::as_str).unwrap_or("?"),
+            data.get("status").and_then(Value::as_str).unwrap_or("?"),
+            data.get("distillMode").and_then(Value::as_str).unwrap_or("?"),
+        )
+    };
+    json!({
+        "content": [{"type": "text", "text": text}],
+        "structuredContent": data,
+        "isError": is_error
+    })
+}
+
+fn call_consult_tool(params: &Map<String, Value>) -> Result<Value, CliError> {
+    let arguments = params
+        .get("arguments")
+        .and_then(Value::as_object)
+        .ok_or_else(|| CliError::Usage("consult_remote arguments must be an object".into()))?;
+    let consult_string = |key: &str| -> Result<String, CliError> {
+        arguments
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| CliError::Usage(format!("consult_remote.{key} must be a non-empty string")))
+            .map(str::to_string)
+    };
+    let target = consult_string("target")?;
+    let question = consult_string("question")?;
+    let scope_hint = match arguments.get("scopeHint") {
+        None => Vec::new(),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| CliError::Usage("consult_remote.scopeHint must be an array of strings".into()))?
+            .iter()
+            .map(|item| {
+                item.as_str().map(str::to_string).ok_or_else(|| {
+                    CliError::Usage("consult_remote.scopeHint must be an array of strings".into())
+                })
+            })
+            .collect::<Result<Vec<String>, CliError>>()?,
+    };
+    let cwd = std::env::current_dir()
+        .map_err(|error| CliError::Other(format!("resolve cwd: {error}")))?;
+    let body = json!({
+        "cwd": cwd.to_string_lossy(),
+        "question": question,
+        "scopePaths": scope_hint,
+        // 一期固定 R3（FD-12 §4：maxLevel 默认 R3，等级上限由桌面判定）。
+        "targetLevel": "r3",
+        "targetAgentId": target,
+        "sessionId": consult_session_id(),
+    });
+    match bridge_roundtrip(&body) {
+        Ok(value) => {
+            let ok = value.get("ok").and_then(Value::as_bool) == Some(true);
+            Ok(consult_tool_result(value, !ok))
+        }
+        Err(error) => Ok(consult_tool_result(
+            json!({"ok": false, "error": error.to_string()}),
+            true,
+        )),
+    }
+}
+
+/// 桌面桥接单请求往返（同步 std TCP；Connection: close，读至 EOF）。
+/// 读超时 180s：覆盖桌面完整蒸馏的最长路径；直通形态毫秒级返回。
+fn bridge_roundtrip(body: &Value) -> Result<Value, CliError> {
+    use std::io::{Read, Write as _};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let port: u16 = std::env::var("FLOWIX_CONSULT_BRIDGE_PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| CliError::Other(BRIDGE_UNAVAILABLE.to_string()))?;
+    let token = std::env::var("FLOWIX_CONSULT_BRIDGE_TOKEN").unwrap_or_default();
+    let payload = serde_json::to_string(body)
+        .map_err(|error| CliError::Other(format!("serialize consult body: {error}")))?;
+    let address: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))
+        .map_err(|_| CliError::Other(BRIDGE_UNAVAILABLE.to_string()))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(180)))
+        .map_err(|error| CliError::Io(error))?;
+    let request = format!(
+        "POST /consult HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(CliError::Io)?;
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .map_err(|error| CliError::Io(error))?;
+    let text = String::from_utf8_lossy(&raw);
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| CliError::Other("BRIDGE_MALFORMED_RESPONSE".to_string()))?;
+    let status_line = head.lines().next().unwrap_or_default();
+    if !status_line.contains("200") {
+        return Err(CliError::Other(format!(
+            "BRIDGE_HTTP_ERROR: {status_line}"
+        )));
+    }
+    serde_json::from_str(body)
+        .map_err(|error| CliError::Other(format!("BRIDGE_INVALID_JSON: {error}")))
+}
+
 fn tool_result(data: Value, is_error: bool) -> Value {
     let text = if is_error {
         data.pointer("/error/message")
@@ -541,10 +702,10 @@ mod tests {
     }
 
     #[test]
-    fn lists_exactly_one_tool_with_command_rules() {
+    fn lists_memo_and_consult_tools() {
         let responses = run(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#);
         let tools = responses[0]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 1);
+        assert_eq!(tools.len(), 2);
         assert_eq!(tools[0]["name"], TOOL_NAME);
         assert!(tools[0]["inputSchema"]["properties"]["action"]["enum"]
             .as_array()
@@ -561,6 +722,44 @@ mod tests {
             tools[0]["inputSchema"]["anyOf"],
             json!([{"required":["action"]},{"required":["command"]}])
         );
+        let consult = &tools[1];
+        assert_eq!(consult["name"], CONSULT_TOOL_NAME);
+        assert_eq!(
+            consult["inputSchema"]["required"],
+            json!(["target", "question"])
+        );
+        assert!(consult["inputSchema"]["properties"]["scopeHint"].is_object());
+    }
+
+    #[test]
+    fn consult_requires_target_and_question() {
+        let responses = run(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"consult_remote","arguments":{"target":"alice/researcher@https://relay.example"}}}"#,
+        );
+        assert!(responses[0]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("question"));
+    }
+
+    #[test]
+    fn consult_without_bridge_returns_actionable_error() {
+        // 无 FLOWIX_CONSULT_BRIDGE_PORT（测试进程环境）→ isError 工具结果，
+        // 非 protocol error：LLM 能读到指引文本。
+        let saved = std::env::var("FLOWIX_CONSULT_BRIDGE_PORT").ok();
+        std::env::remove_var("FLOWIX_CONSULT_BRIDGE_PORT");
+        let responses = run(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"consult_remote","arguments":{"target":"alice/researcher@https://relay.example","question":"abstract question"}}}"#,
+        );
+        if let Some(saved) = saved {
+            std::env::set_var("FLOWIX_CONSULT_BRIDGE_PORT", saved);
+        }
+        let result = &responses[0]["result"];
+        assert_eq!(result["isError"], json!(true));
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("BRIDGE_UNAVAILABLE"));
     }
 
     #[test]

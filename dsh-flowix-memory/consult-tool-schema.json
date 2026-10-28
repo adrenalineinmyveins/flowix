@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "properties": {
+    "target": {
+      "type": "string",
+      "description": "Namespace address of the remote agent, for example alice/researcher@https://relay.example"
+    },
+    "question": {
+      "type": "string",
+      "description": "Question text. Ask in abstract terms by default; the text goes through the outbound redaction pipeline before delivery."
+    },
+    "scopeHint": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Optional tag-path scopes to draw material from (for example finance/reports). Omit it unless the answer must quote your notes; scopes outside the pre-authorized whitelist fall back to manual review."
+    }
+  },
+  "required": ["target", "question"],
+  "additionalProperties": false
+}

@@ -9,8 +9,10 @@ import { createInterface } from 'node:readline'
 
 const SERVER_NAME = 'flowix'
 const TOOL_NAME = 'memo'
+const CONSULT_TOOL_NAME = 'consult_remote'
 const INSTALL_URL = 'https://flowix-memo.com/latest.json'
 const TOOL_SCHEMA = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'memo-tool-schema.json'), 'utf8'))
+const CONSULT_TOOL_SCHEMA = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'consult-tool-schema.json'), 'utf8'))
 
 const cli = findCli()
 if (cli !== undefined) {
@@ -132,6 +134,10 @@ function runUnavailableServer() {
             name: TOOL_NAME,
             description: 'Search and edit Flowix memos. Requires the Flowix CLI.',
             inputSchema: TOOL_SCHEMA,
+          }, {
+            name: CONSULT_TOOL_NAME,
+            description: 'Consult a remote user\'s published Flowix agent. Requires the Flowix desktop app to be running.',
+            inputSchema: CONSULT_TOOL_SCHEMA,
           }],
         },
       })
@@ -141,7 +147,9 @@ function runUnavailableServer() {
       const name = message.params?.name
       const text = name === TOOL_NAME
         ? `Flowix CLI is unavailable. Install Flowix from ${INSTALL_URL} for your platform, or set FLOWIX_CLI_PATH to the absolute path of flowix-cli. After installation, restart the DSH profile and retry this tool.`
-        : `Unknown tool: ${String(name)}`
+        : name === CONSULT_TOOL_NAME
+          ? 'Remote consult is unavailable: the Flowix desktop app is not running. Start Flowix Desktop, restart the DSH profile, and retry this tool.'
+          : `Unknown tool: ${String(name)}`
       writeResponse({
         jsonrpc: '2.0',
         id: message.id,
