@@ -20,6 +20,13 @@ export interface AgentProfile {
   flowix_consultable: boolean;
   flowix_redaction_level: string | null;
   flowix_disclosure_scope: string[];
+  /** AGENT-PROFILE-REDESIGN：扩展字段（serde default，旧档可为空）。 */
+  flowix_system?: string;
+  flowix_tools?: string[];
+  flowix_skills?: string[];
+  flowix_metadata?: Record<string, string>;
+  /** 记忆库即披露授权：tag:… / note:<nb>::<path> / collection:<id>。 */
+  flowix_memory?: string[];
   flowix_created_at: number;
   flowix_updated_at: number;
 }

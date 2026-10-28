@@ -152,6 +152,16 @@ fn profile_error(error: ProfileError) -> String {
         ProfileError::InvalidRedactionLevel(value) => {
             format!("INVALID_REDACTION_LEVEL:{value}")
         }
+        ProfileError::SystemTooLong(limit) => format!("SYSTEM_TOO_LONG:{limit}"),
+        ProfileError::MetadataTooLarge(limit) => format!("METADATA_TOO_LARGE:{limit}"),
+        ProfileError::InvalidMemoryRef { index, value } => {
+            format!("INVALID_MEMORY_REF:{index}:{value}")
+        }
+        ProfileError::MemorySubtreeOverlap { index } => {
+            format!("MEMORY_SUBTREE_OVERLAP:{index}")
+        }
+        ProfileError::ToolsInvalid => "TOOLS_INVALID".to_string(),
+        ProfileError::SkillsInvalid => "SKILLS_INVALID".to_string(),
     }
 }
 
@@ -210,6 +220,11 @@ pub fn agent_profile_create(
         consultable: true,
         redaction_level: None,
         disclosure_scope: Vec::new(),
+        system: String::new(),
+        tools: Vec::new(),
+        skills: Vec::new(),
+        metadata: Default::default(),
+        memory: Vec::new(),
         created_at: now,
         updated_at: now,
     };
@@ -233,6 +248,13 @@ pub fn agent_profile_update(
     redaction_level: Option<String>,
     disclosure_scope: Option<Vec<String>>,
     model: Option<String>,
+    // AGENT-PROFILE-REDESIGN P3：扩展字段透传（UI 全权入口——memory 扩缩
+    // 均放行，UI 即人审）。None = 不修改。
+    system: Option<String>,
+    tools: Option<Vec<String>>,
+    skills: Option<Vec<String>>,
+    metadata: Option<std::collections::BTreeMap<String, String>>,
+    memory: Option<Vec<String>>,
 ) -> Result<AgentProfile, String> {
     let root = notebook_root(&cwd)?;
     let mut existing = read_profile(&root, &agent_id)?;
@@ -247,6 +269,7 @@ pub fn agent_profile_update(
         existing.redaction_level = (!level.trim().is_empty()).then(|| level.trim().to_string());
     }
     if let Some(scopes) = disclosure_scope {
+        // 旧字段入口 = 整体替换 memory（D-4：归一 tag: 前缀；旧字段不再持久化）。
         let scopes: Vec<String> = scopes
             .into_iter()
             .map(|scope| scope.trim().to_string())
@@ -257,10 +280,26 @@ pub fn agent_profile_update(
                 return Err(format!("INVALID_DISCLOSURE_SCOPE:{scope}"));
             }
         }
-        existing.disclosure_scope = scopes;
+        existing.memory = scopes.iter().map(|scope| format!("tag:{scope}")).collect();
+        existing.disclosure_scope = Vec::new();
     }
     if let Some(model) = model {
         existing.model = (!model.trim().is_empty()).then(|| model.trim().to_string());
+    }
+    if let Some(system) = system {
+        existing.system = system;
+    }
+    if let Some(tools) = tools {
+        existing.tools = tools.into_iter().map(|item| item.trim().to_string()).filter(|item| !item.is_empty()).collect();
+    }
+    if let Some(skills) = skills {
+        existing.skills = skills.into_iter().map(|item| item.trim().to_string()).filter(|item| !item.is_empty()).collect();
+    }
+    if let Some(metadata) = metadata {
+        existing.metadata = metadata;
+    }
+    if let Some(memory) = memory {
+        existing.memory = memory.into_iter().map(|item| item.trim().to_string()).filter(|item| !item.is_empty()).collect();
     }
     existing.updated_at = chrono::Utc::now().timestamp_millis();
     existing.validate().map_err(profile_error)?;
@@ -492,12 +531,17 @@ mod tests {
             Some("R2".into()),
             Some(vec!["finance/财报".into(), " ".into()]),
             Some("gpt-x".into()),
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         assert!(!updated.consultable);
         assert_eq!(updated.redaction_level.as_deref(), Some("R2"));
-        // 空白项被过滤，合法项保留。
-        assert_eq!(updated.disclosure_scope, vec!["finance/财报".to_string()]);
+        // D-4：旧披露入口归一进 memory（tag: 前缀），空白项被过滤。
+        assert_eq!(updated.memory, vec!["tag:finance/财报".to_string()]);
         assert_eq!(updated.model.as_deref(), Some("gpt-x"));
 
         // 旧调用形态（隐私参数全 None）不修改既有隐私字段。
@@ -512,11 +556,16 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         assert!(!kept.consultable);
         assert_eq!(kept.redaction_level.as_deref(), Some("R2"));
-        assert_eq!(kept.disclosure_scope, vec!["finance/财报".to_string()]);
+        assert_eq!(kept.memory, vec!["tag:finance/财报".to_string()]);
 
         // 空串清除 redaction_level / model。
         let cleared = agent_profile_update(
@@ -530,6 +579,11 @@ mod tests {
             Some(String::new()),
             None,
             Some(String::new()),
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(cleared.redaction_level, None);
@@ -557,6 +611,11 @@ mod tests {
             None,
             None,
             Some(vec!["空格 标签".into()]),
+            None,
+            None,
+            None,
+            None,
+            None,
             None,
         )
         .unwrap_err();

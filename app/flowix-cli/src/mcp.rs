@@ -11,6 +11,7 @@ use std::io::{BufRead, Write};
 pub const TOOL_NAME: &str = "memo";
 pub const CONSULT_TOOL_NAME: &str = "consult_remote";
 pub const CONSULT_TARGETS_TOOL_NAME: &str = "consult_targets";
+pub const AGENT_PROFILE_TOOL_NAME: &str = "agent_profile";
 const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
     "2024-11-05",
@@ -57,7 +58,7 @@ pub fn run_mcp<R: BufRead, W: Write>(reader: R, mut writer: W) -> Result<(), Cli
         let response = match method {
             "initialize" => rpc_result(id, initialize_result(&params)),
             "ping" => rpc_result(id, json!({})),
-            "tools/list" => rpc_result(id, json!({"tools": [tool_definition(), consult_tool_definition(), consult_targets_tool_definition()]})),
+            "tools/list" => rpc_result(id, json!({"tools": [tool_definition(), consult_tool_definition(), consult_targets_tool_definition(), agent_profile_tool_definition()]})),
             "tools/call" => match call_tool(&params) {
                 Ok(result) => rpc_result(id, result),
                 Err(error) => rpc_error(id, -32602, error.to_string()),
@@ -124,6 +125,23 @@ fn consult_targets_tool_definition() -> Value {
     })
 }
 
+/// AGENT-PROFILE-REDESIGN P2：对话内 agent 配置工具（直读写
+/// `<cwd>/.agents/<id>/profile.md`，与 memo 同权）。写权执法：内容字段
+/// 白名单 + memory 非对称闸门（缩可行、扩引导 UI——记忆库即披露授权）。
+fn agent_profile_tool_definition() -> Value {
+    let schema: Value = serde_json::from_str(include_str!(
+        "../../../dsh-flowix-memory/agent-profile-tool-schema.json"
+    ))
+    .expect("agent profile tool schema must be valid JSON");
+    json!({
+        "name": AGENT_PROFILE_TOOL_NAME,
+        "title": "Flowix Agent Profile",
+        "description": "Read and update this user's Flowix agents (name, bio, system prompt, model, tools, skills, metadata, long-term memory). memory binds both what the agent remembers and what it may disclose when consulted; removing memory sources is allowed here, adding them must be done in the app's Agent page.",
+        "inputSchema": schema,
+        "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false}
+    })
+}
+
 fn call_tool(params: &Value) -> Result<Value, CliError> {
     let object = params
         .as_object()
@@ -137,6 +155,9 @@ fn call_tool(params: &Value) -> Result<Value, CliError> {
     }
     if name == CONSULT_TARGETS_TOOL_NAME {
         return call_consult_targets_tool();
+    }
+    if name == AGENT_PROFILE_TOOL_NAME {
+        return call_agent_profile_tool(object);
     }
     if name != TOOL_NAME {
         return Err(CliError::Usage(format!("unknown tool: `{name}`")));
@@ -605,6 +626,190 @@ fn call_consult_tool(params: &Map<String, Value>) -> Result<Value, CliError> {
     }
 }
 
+// ----------------------------------------------------------------------
+// AGENT-PROFILE-REDESIGN P2：agent_profile —— 对话内配置（直读写文件）
+// ----------------------------------------------------------------------
+
+fn agents_root_dir() -> Result<std::path::PathBuf, CliError> {
+    let cwd = std::env::current_dir()
+        .map_err(|error| CliError::Other(format!("resolve cwd: {error}")))?;
+    Ok(cwd.join(".agents"))
+}
+
+fn read_agent_profile(agent_id: &str) -> Result<(flowix_core::agent::AgentProfile, String), CliError> {
+    let path = agents_root_dir()?.join(agent_id).join("profile.md");
+    let content = std::fs::read_to_string(&path)
+        .map_err(|_| CliError::Other(format!("AGENT_NOT_FOUND:{agent_id}")))?;
+    flowix_core::agent::AgentProfile::parse(&content)
+        .map_err(|error| CliError::Other(format!("PROFILE_INVALID:{error}")))
+}
+
+fn agent_profile_json(profile: &flowix_core::agent::AgentProfile) -> Value {
+    json!({
+        "agentId": profile.agent_id,
+        "displayName": profile.display_name,
+        "bio": profile.bio,
+        "expertise": profile.expertise,
+        "agentType": profile.agent_type,
+        "model": profile.model,
+        "consultable": profile.consultable,
+        "redactionLevel": profile.redaction_level,
+        "system": profile.system,
+        "tools": profile.tools,
+        "skills": profile.skills,
+        "metadata": profile.metadata,
+        "memory": profile.memory,
+        "createdAt": profile.created_at,
+        "updatedAt": profile.updated_at,
+    })
+}
+
+/// memory 非对称闸门：返回 new 相对 old 的首个新增引用（无新增 = None，
+/// 允许——缩小/等价自由）。子树扩大必然引入新字符串，字面差即完备判定。
+fn memory_expansion(old: &[String], new: &[String]) -> Option<String> {
+    new.iter().find(|item| !old.contains(item)).cloned()
+}
+
+fn call_agent_profile_tool(params: &Map<String, Value>) -> Result<Value, CliError> {
+    let arguments = params
+        .get("arguments")
+        .and_then(Value::as_object)
+        .ok_or_else(|| CliError::Usage("agent_profile arguments must be an object".into()))?;
+    let action = arguments
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Usage("agent_profile.action is required".into()))?;
+    match action {
+        "list" => {
+            let root = agents_root_dir()?;
+            let mut agents = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&root) {
+                for entry in entries.flatten() {
+                    let profile_path = entry.path().join("profile.md");
+                    let Ok(content) = std::fs::read_to_string(&profile_path) else { continue };
+                    if let Ok((profile, _)) = flowix_core::agent::AgentProfile::parse(&content) {
+                        agents.push(json!({
+                            "agentId": profile.agent_id,
+                            "displayName": profile.display_name,
+                            "model": profile.model,
+                        }));
+                    }
+                }
+            }
+            Ok(json!({
+                "content": [{"type": "text", "text": format!("{} agent(s) on this device", agents.len())}],
+                "structuredContent": {"agents": agents},
+                "isError": false
+            }))
+        }
+        "get" => {
+            let agent_id = required_agent_id(arguments)?;
+            let (profile, _) = read_agent_profile(&agent_id)?;
+            Ok(json!({
+                "content": [{"type": "text", "text": format!("Agent {} ({})", profile.display_name, profile.agent_id)}],
+                "structuredContent": agent_profile_json(&profile),
+                "isError": false
+            }))
+        }
+        "update" => {
+            let agent_id = required_agent_id(arguments)?;
+            let patch = arguments
+                .get("patch")
+                .and_then(Value::as_object)
+                .ok_or_else(|| CliError::Usage("agent_profile.update requires `patch`".into()))?;
+            let (mut profile, body) = read_agent_profile(&agent_id)?;
+            for (key, value) in patch {
+                match key.as_str() {
+                    "displayName" => profile.display_name = string_of(value, "displayName")?,
+                    "bio" => profile.bio = string_of(value, "bio")?,
+                    "system" => profile.system = string_of(value, "system")?,
+                    "model" => {
+                        let raw = string_of(value, "model")?;
+                        profile.model = if raw.trim().is_empty() { None } else { Some(raw) };
+                    }
+                    "tools" => profile.tools = string_array_of(value, "tools")?,
+                    "skills" => profile.skills = string_array_of(value, "skills")?,
+                    "metadata" => {
+                        let map = value.as_object().ok_or_else(|| {
+                            CliError::Usage("agent_profile.metadata must be an object".into())
+                        })?;
+                        let mut metadata = std::collections::BTreeMap::new();
+                        for (meta_key, meta_value) in map {
+                            metadata.insert(
+                                meta_key.clone(),
+                                meta_value.as_str().unwrap_or_default().to_string(),
+                            );
+                        }
+                        profile.metadata = metadata;
+                    }
+                    "memory" => {
+                        let new_memory = string_array_of(value, "memory")?;
+                        if let Some(added) = memory_expansion(&profile.memory, &new_memory) {
+                            return Err(CliError::Other(format!(
+                                "MEMORY_EXPANSION_REQUIRES_UI:{added}"
+                            )));
+                        }
+                        profile.memory = new_memory;
+                    }
+                    // D-6：网络纪律字段与结构字段仅 UI 可改。
+                    "agentId" | "consultable" | "redactionLevel" | "redaction_level"
+                    | "disclosureScope" | "disclosure_scope" | "createdAt" | "updatedAt" => {
+                        return Err(CliError::Other(format!("FIELD_NOT_ALLOWED:{key}")));
+                    }
+                    other => {
+                        return Err(CliError::Other(format!("FIELD_NOT_ALLOWED:{other}")));
+                    }
+                }
+            }
+            profile.updated_at = chrono::Utc::now().timestamp_millis();
+            profile
+                .validate()
+                .map_err(|error| CliError::Other(format!("PROFILE_INVALID:{error}")))?;
+            // 原子写（tmp + rename），与桌面 commands/agent_profile 同契约。
+            let path = agents_root_dir()?.join(&agent_id).join("profile.md");
+            let temporary = path.with_extension("md.flowix-tmp");
+            std::fs::write(&temporary, profile.serialize(&body)).map_err(CliError::Io)?;
+            std::fs::rename(&temporary, &path).map_err(CliError::Io)?;
+            Ok(json!({
+                "content": [{"type": "text", "text": format!("Agent {} updated", profile.display_name)}],
+                "structuredContent": agent_profile_json(&profile),
+                "isError": false
+            }))
+        }
+        other => Err(CliError::Usage(format!("unknown agent_profile action: `{other}`"))),
+    }
+}
+
+fn required_agent_id(arguments: &Map<String, Value>) -> Result<String, CliError> {
+    arguments
+        .get("agentId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| CliError::Usage("agent_profile.agentId is required".into()))
+}
+
+fn string_of(value: &Value, field: &str) -> Result<String, CliError> {
+    value
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| CliError::Usage(format!("agent_profile.{field} must be a string")))
+}
+
+fn string_array_of(value: &Value, field: &str) -> Result<Vec<String>, CliError> {
+    value
+        .as_array()
+        .ok_or_else(|| CliError::Usage(format!("agent_profile.{field} must be an array of strings")))?
+        .iter()
+        .map(|item| {
+            item.as_str().map(str::to_string).ok_or_else(|| {
+                CliError::Usage(format!("agent_profile.{field} must be an array of strings"))
+            })
+        })
+        .collect()
+}
+
 /// FD-12 M2 补：枚举本机可咨询目标（GET /targets）。无参数；桥接不可用
 /// 时与 consult_remote 同口径返回可行动错误。
 fn call_consult_targets_tool() -> Result<Value, CliError> {
@@ -801,7 +1006,7 @@ mod tests {
     fn lists_memo_and_consult_tools() {
         let responses = run(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#);
         let tools = responses[0]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 4);
         assert_eq!(tools[0]["name"], TOOL_NAME);
         assert!(tools[0]["inputSchema"]["properties"]["action"]["enum"]
             .as_array()
@@ -874,6 +1079,43 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("BRIDGE_UNAVAILABLE"));
+    }
+
+    /// P2 非对称闸门纯函数：新增即扩（含子树扩大引入的新字符串），缩小/等价放行。
+    #[test]
+    fn memory_expansion_detects_additions_and_allows_shrinks() {
+        let old = vec!["tag:finance".to_string(), "tag:blog/tech".to_string()];
+        // 新增 → 拒。
+        assert_eq!(
+            memory_expansion(&old, &["tag:finance".into(), "tag:diary".into()]),
+            Some("tag:diary".to_string())
+        );
+        // 子树扩大（新字符串）→ 拒。
+        assert_eq!(
+            memory_expansion(&old, &["tag:finance".into(), "tag:blog".into()]),
+            Some("tag:blog".to_string())
+        );
+        // 缩小 / 等价换序 → 放行。
+        assert_eq!(memory_expansion(&old, &["tag:finance".into()]), None);
+        assert_eq!(
+            memory_expansion(&old, &["tag:blog/tech".into(), "tag:finance".into()]),
+            None
+        );
+        // 空库起步：任何添加都算扩。
+        assert_eq!(
+            memory_expansion(&[], &["tag:finance".into()]),
+            Some("tag:finance".to_string())
+        );
+    }
+
+    /// P2 工具面在测试环境（无 .agents 或缺 agent）给出结构化错误。
+    #[test]
+    fn agent_profile_update_unknown_agent_is_structured_error() {
+        let responses = run(
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"agent_profile","arguments":{"action":"update","agentId":"agt_missing00","patch":{"system":"x"}}}}"#,
+        );
+        let message = responses[0]["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("AGENT_NOT_FOUND"), "{message}");
     }
 
     #[test]

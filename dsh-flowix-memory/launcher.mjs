@@ -142,6 +142,19 @@ function runUnavailableServer() {
             name: 'consult_targets',
             description: 'List agents reachable via consult_remote on this device. Requires the Flowix desktop app to be running.',
             inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+          }, {
+            name: 'agent_profile',
+            description: 'Read and update this user\'s Flowix agents (config, system prompt, long-term memory). Requires the Flowix CLI.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                action: { type: 'string', enum: ['list', 'get', 'update'] },
+                agentId: { type: 'string' },
+                patch: { type: 'object' },
+              },
+              required: ['action'],
+              additionalProperties: false,
+            },
           }],
         },
       })

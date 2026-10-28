@@ -13,6 +13,15 @@ use crate::memo_file::{
 
 const PROFILE_KIND: &str = "agent-profile";
 const MAX_BIO_CHARS: usize = 500;
+const MAX_SYSTEM_CHARS: usize = 8000;
+const MAX_METADATA_BYTES: usize = 4096;
+const MAX_TOOLS_SKILLS: usize = 32;
+const MAX_TOOL_SKILL_ITEM_CHARS: usize = 64;
+
+/// 记忆库引用三形态前缀（AGENT-PROFILE-REDESIGN D-4）。
+pub const MEMORY_PREFIX_TAG: &str = "tag:";
+pub const MEMORY_PREFIX_NOTE: &str = "note:";
+pub const MEMORY_PREFIX_COLLECTION: &str = "collection:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RedactionLevel {
@@ -54,6 +63,18 @@ pub enum ProfileError {
     InvalidExpertise { index: usize, value: String },
     #[error("flowix_redaction_level 非法: {0}")]
     InvalidRedactionLevel(String),
+    #[error("flowix_system 超过 {0} 字符")]
+    SystemTooLong(usize),
+    #[error("flowix_metadata 序列化超过 {0} 字节")]
+    MetadataTooLarge(usize),
+    #[error("flowix_memory 第 {index} 项引用非法（须 tag:/note:/collection: 前缀）: {value}")]
+    InvalidMemoryRef { index: usize, value: String },
+    #[error("flowix_memory 第 {index} 项与其前项的 tag 子树重叠")]
+    MemorySubtreeOverlap { index: usize },
+    #[error("flowix_tools 项数超限或单项超长")]
+    ToolsInvalid,
+    #[error("flowix_skills 项数超限或单项超长")]
+    SkillsInvalid,
 }
 
 /// 身份卡 frontmatter 字段集合。
@@ -77,8 +98,22 @@ pub struct AgentProfile {
     pub consultable: bool,
     #[serde(rename = "flowix_redaction_level", default)]
     pub redaction_level: Option<String>,
-    #[serde(rename = "flowix_disclosure_scope", default)]
+    /// 旧披露范围字段：**读兼容**（parse 时归一并入 memory），serialize
+    /// 不再写出（D-4：记忆库即披露授权，单一事实源为 memory）。
+    #[serde(rename = "flowix_disclosure_scope", default, skip_serializing)]
     pub disclosure_scope: Vec<String>,
+    #[serde(rename = "flowix_system", default)]
+    pub system: String,
+    #[serde(rename = "flowix_tools", default)]
+    pub tools: Vec<String>,
+    #[serde(rename = "flowix_skills", default)]
+    pub skills: Vec<String>,
+    #[serde(rename = "flowix_metadata", default)]
+    pub metadata: std::collections::BTreeMap<String, String>,
+    /// D-4 统一字段：入站记忆绑定 = 出站披露授权。
+    /// 元素三形态：`tag:<tag-path>` / `note:<nb>::<path>` / `collection:<id>`。
+    #[serde(rename = "flowix_memory", default)]
+    pub memory: Vec<String>,
     #[serde(rename = "flowix_created_at", default)]
     pub created_at: i64,
     #[serde(rename = "flowix_updated_at", default)]
@@ -90,7 +125,8 @@ fn default_true() -> bool {
 }
 
 impl AgentProfile {
-    /// 校验字段合法性。expertise 与 disclosure_scope 逐项过 normalize_tag_path。
+    /// 校验字段合法性。expertise 逐项过 normalize_tag_path；memory 三形态
+    /// 逐项校验且 tag 子树不得重叠（D-4）；system/metadata/tools/skills 限额。
     pub fn validate(&self) -> Result<(), ProfileError> {
         if self.display_name.trim().is_empty() {
             return Err(ProfileError::MissingDisplayName);
@@ -109,6 +145,59 @@ impl AgentProfile {
         if let Some(level) = &self.redaction_level {
             if RedactionLevel::parse(level).is_none() {
                 return Err(ProfileError::InvalidRedactionLevel(level.clone()));
+            }
+        }
+        if self.system.chars().count() > MAX_SYSTEM_CHARS {
+            return Err(ProfileError::SystemTooLong(MAX_SYSTEM_CHARS));
+        }
+        if serde_json::to_string(&self.metadata).map_or(true, |raw| raw.len() > MAX_METADATA_BYTES) {
+            return Err(ProfileError::MetadataTooLarge(MAX_METADATA_BYTES));
+        }
+        for (label, items) in [("tools", &self.tools), ("skills", &self.skills)] {
+            if items.len() > MAX_TOOLS_SKILLS
+                || items
+                    .iter()
+                    .any(|item| item.trim().is_empty() || item.chars().count() > MAX_TOOL_SKILL_ITEM_CHARS)
+            {
+                return Err(if label == "tools" {
+                    ProfileError::ToolsInvalid
+                } else {
+                    ProfileError::SkillsInvalid
+                });
+            }
+        }
+        self.validate_memory()?;
+        Ok(())
+    }
+
+    /// memory 校验：三形态前缀 + tag 项路径合法 + tag 子树互不包含。
+    fn validate_memory(&self) -> Result<(), ProfileError> {
+        let mut tag_paths: Vec<String> = Vec::new();
+        for (i, reference) in self.memory.iter().enumerate() {
+            if let Some(tag) = reference.strip_prefix(MEMORY_PREFIX_TAG) {
+                if normalize_tag_path(tag).is_none() {
+                    return Err(ProfileError::InvalidMemoryRef { index: i, value: reference.clone() });
+                }
+                if tag_paths
+                    .iter()
+                    .any(|existing| {
+                        existing == tag
+                            || tag.starts_with(&format!("{existing}/"))
+                            || existing.starts_with(&format!("{tag}/"))
+                    })
+                {
+                    return Err(ProfileError::MemorySubtreeOverlap { index: i });
+                }
+                tag_paths.push(tag.to_string());
+            } else if reference.starts_with(MEMORY_PREFIX_NOTE)
+                || reference.starts_with(MEMORY_PREFIX_COLLECTION)
+            {
+                let body = reference.split_once(':').map(|(_, rest)| rest).unwrap_or("");
+                if body.trim().is_empty() {
+                    return Err(ProfileError::InvalidMemoryRef { index: i, value: reference.clone() });
+                }
+            } else {
+                return Err(ProfileError::InvalidMemoryRef { index: i, value: reference.clone() });
             }
         }
         Ok(())
@@ -132,6 +221,24 @@ impl AgentProfile {
         let mut profile: AgentProfile = serde_json::from_value(props.clone())
             .map_err(|_| ProfileError::MissingDisplayName)?;
         profile.agent_id = agent_id;
+        // D-4 读归一：旧 disclosure_scope 并入 memory（加 tag: 前缀）。
+        if profile.memory.is_empty() && !profile.disclosure_scope.is_empty() {
+            profile.memory = profile
+                .disclosure_scope
+                .iter()
+                .filter_map(|scope| {
+                    let scope = scope.trim();
+                    if scope.starts_with(MEMORY_PREFIX_TAG)
+                        || scope.starts_with(MEMORY_PREFIX_NOTE)
+                        || scope.starts_with(MEMORY_PREFIX_COLLECTION)
+                    {
+                        Some(scope.to_string())
+                    } else {
+                        Some(format!("{MEMORY_PREFIX_TAG}{scope}"))
+                    }
+                })
+                .collect();
+        }
         profile.validate()?;
         let body = extract_body_content(content).to_string();
         Ok((profile, body))
@@ -169,10 +276,22 @@ impl AgentProfile {
         if let Some(level) = &self.redaction_level {
             lines.push(format!("flowix_redaction_level: {level}"));
         }
-        lines.push(format!(
-            "flowix_disclosure_scope: {}",
-            yaml_string_array(&self.disclosure_scope)
-        ));
+        // D-4：disclosure_scope 写废弃——memory 是唯一披露事实源。
+        if !self.system.is_empty() {
+            lines.push(format!("flowix_system: {}", yaml_quote(&self.system)));
+        }
+        if !self.tools.is_empty() {
+            lines.push(format!("flowix_tools: {}", yaml_string_array(&self.tools)));
+        }
+        if !self.skills.is_empty() {
+            lines.push(format!("flowix_skills: {}", yaml_string_array(&self.skills)));
+        }
+        if !self.metadata.is_empty() {
+            lines.push(format!("flowix_metadata: {}", yaml_string_map(&self.metadata)));
+        }
+        if !self.memory.is_empty() {
+            lines.push(format!("flowix_memory: {}", yaml_string_array(&self.memory)));
+        }
         lines.push(format!("flowix_created_at: {}", self.created_at));
         lines.push(format!("flowix_updated_at: {}", self.updated_at));
         lines.push("---".into());
@@ -260,6 +379,15 @@ fn yaml_quote(s: &str) -> String {
 fn yaml_string_array(items: &[String]) -> String {
     let inner: Vec<String> = items.iter().map(|s| yaml_quote(s)).collect();
     format!("[{}]", inner.join(", "))
+}
+
+/// metadata 的 YAML flow map 序列化：`{"k": "v", …}`。
+fn yaml_string_map(map: &std::collections::BTreeMap<String, String>) -> String {
+    let inner: Vec<String> = map
+        .iter()
+        .map(|(key, value)| format!("{}: {}", yaml_quote(key), yaml_quote(value)))
+        .collect();
+    format!("{{{}}}", inner.join(", "))
 }
 
 #[cfg(test)]
@@ -402,8 +530,102 @@ mod tests {
             consultable: true,
             redaction_level: Some("R2".into()),
             disclosure_scope: vec![],
+            system: String::new(),
+            tools: vec![],
+            skills: vec![],
+            metadata: Default::default(),
+            memory: vec![],
             created_at: now(),
             updated_at: now(),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // AGENT-PROFILE-REDESIGN P1：扩展字段 + memory 统一字段
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parses_new_fields_and_omits_disclosure_on_serialize() {
+        let mut profile = base_profile();
+        profile.system = "你是严谨的财报分析助手".into();
+        profile.tools = vec!["memo".into(), "consult_remote".into()];
+        profile.skills = vec!["mindmap".into()];
+        profile.metadata.insert("team".into(), "research".into());
+        profile.memory = vec!["tag:finance/财报".into(), "note:work::Q3.md".into()];
+        let serialized = profile.serialize("# 人设\n");
+        // 写侧不再输出旧披露字段。
+        assert!(!serialized.contains("flowix_disclosure_scope"));
+        let (parsed, _) = AgentProfile::parse(&serialized).unwrap();
+        assert_eq!(parsed, profile);
+        assert!(serialized.contains("flowix_memory: [\"tag:finance/财报\", \"note:work::Q3.md\"]"));
+        assert!(serialized.contains("flowix_metadata: {\"team\": \"research\"}"));
+    }
+
+    #[test]
+    fn legacy_disclosure_scope_normalizes_into_memory() {
+        let content = "---\nflowix_kind: agent-profile\nflowix_agent_id: agt_test1234\nflowix_display_name: \"x\"\nflowix_disclosure_scope: [\"finance/财报\"]\nflowix_created_at: 1\nflowix_updated_at: 1\n---\nbody\n";
+        let (profile, _) = AgentProfile::parse(content).unwrap();
+        assert_eq!(profile.memory, vec!["tag:finance/财报".to_string()]);
+    }
+
+    #[test]
+    fn rejects_system_over_limit() {
+        let mut profile = base_profile();
+        profile.system = "a".repeat(8001);
+        assert!(matches!(profile.validate(), Err(ProfileError::SystemTooLong(_))));
+    }
+
+    #[test]
+    fn rejects_metadata_over_limit() {
+        let mut profile = base_profile();
+        profile.metadata.insert("blob".into(), "x".repeat(5000));
+        assert!(matches!(profile.validate(), Err(ProfileError::MetadataTooLarge(_))));
+    }
+
+    #[test]
+    fn rejects_memory_without_prefix() {
+        let mut profile = base_profile();
+        profile.memory = vec!["finance/财报".into()];
+        assert!(matches!(
+            profile.validate(),
+            Err(ProfileError::InvalidMemoryRef { index: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_memory_tag_subtree_overlap() {
+        let mut profile = base_profile();
+        profile.memory = vec!["tag:finance".into(), "tag:finance/财报".into()];
+        assert!(matches!(
+            profile.validate(),
+            Err(ProfileError::MemorySubtreeOverlap { index: 1 })
+        ));
+        // 顺序无关：子树在前同样拒绝。
+        profile.memory = vec!["tag:finance/财报".into(), "tag:finance".into()];
+        assert!(matches!(
+            profile.validate(),
+            Err(ProfileError::MemorySubtreeOverlap { index: 1 })
+        ));
+    }
+
+    #[test]
+    fn accepts_memory_three_forms() {
+        let mut profile = base_profile();
+        profile.memory = vec![
+            "tag:finance/财报".into(),
+            "note:work::Q3复盘.md".into(),
+            "collection:docs".into(),
+        ];
+        assert!(profile.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_tools_and_skills_violations() {
+        let mut profile = base_profile();
+        profile.tools = vec!["".into()];
+        assert!(matches!(profile.validate(), Err(ProfileError::ToolsInvalid)));
+        profile.tools = vec![];
+        profile.skills = vec!["s".repeat(65)];
+        assert!(matches!(profile.validate(), Err(ProfileError::SkillsInvalid)));
     }
 }

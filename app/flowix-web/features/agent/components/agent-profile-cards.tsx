@@ -43,6 +43,12 @@ interface ProfileForm {
   consultable: boolean;
   redactionLevel: string;
   disclosureScope: string;
+  /** AGENT-PROFILE-REDESIGN P3：扩展字段。 */
+  system: string;
+  tools: string;
+  skills: string;
+  metadata: string;
+  memory: string;
 }
 
 function formFromProfile(profile: AgentProfile): ProfileForm {
@@ -55,7 +61,26 @@ function formFromProfile(profile: AgentProfile): ProfileForm {
     consultable: profile.flowix_consultable,
     redactionLevel: profile.flowix_redaction_level ?? '',
     disclosureScope: profile.flowix_disclosure_scope.join('\n'),
+    system: profile.flowix_system ?? '',
+    tools: (profile.flowix_tools ?? []).join('\n'),
+    skills: (profile.flowix_skills ?? []).join('\n'),
+    metadata: Object.entries(profile.flowix_metadata ?? {})
+      .map(([key, value]) => `${key}=${value}`)
+      .join('\n'),
+    memory: (profile.flowix_memory ?? []).join('\n'),
   };
+}
+
+/** metadata 行编辑：`key=value` 每行一对。
+ * 值含 `=` 时以首个为界；缺 `=` 的行丢弃。 */
+function parseMetadata(raw: string): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (const line of parseLines(raw)) {
+    const eq = line.indexOf('=');
+    if (eq <= 0) continue;
+    map[line.slice(0, eq).trim()] = line.slice(eq + 1);
+  }
+  return map;
 }
 
 function parseLines(raw: string): string[] {
@@ -357,6 +382,12 @@ export function AgentProfileEditor({ notebookPath }: { notebookPath: string }) {
         consultable: form.consultable,
         redactionLevel: form.redactionLevel,
         disclosureScope: parseLines(form.disclosureScope),
+        // P3 扩展字段：UI 全权（memory 扩缩均放行——UI 即人审）。
+        system: form.system,
+        tools: parseLines(form.tools),
+        skills: parseLines(form.skills),
+        metadata: parseMetadata(form.metadata),
+        memory: parseLines(form.memory),
       });
       if (disposedRef.current) return;
       setProfile(updated);
@@ -555,6 +586,56 @@ export function AgentProfileEditor({ notebookPath }: { notebookPath: string }) {
                 <p className="text-xs leading-5 text-[var(--muted-foreground)]">
                   {t('agent.profile.privacyHint')}
                 </p>
+              </section>
+
+              {/* AGENT-PROFILE-REDESIGN P3：对话系统提示 + 记忆库（即披露授权）。 */}
+              <section className="space-y-3">
+                <h2 className="text-sm font-semibold text-[var(--foreground)]">{t('agent.profile.advanced')}</h2>
+                <Field label={t('agent.profile.system')} hint={t('agent.profile.systemHint')}>
+                  <textarea
+                    className={textareaClass}
+                    value={form.system}
+                    onChange={(event) => patchForm({ system: event.target.value })}
+                    placeholder={t('agent.profile.systemPlaceholder')}
+                  />
+                </Field>
+                <Field label={t('agent.profile.memory')} hint={t('agent.profile.memoryHint')}>
+                  <textarea
+                    className={cn(textareaClass, 'min-h-16 font-mono text-xs leading-5')}
+                    value={form.memory}
+                    onChange={(event) => patchForm({ memory: event.target.value })}
+                    placeholder={t('agent.profile.memoryPlaceholder')}
+                  />
+                </Field>
+                <p className="text-xs leading-5 text-[var(--muted-foreground)]">
+                  {t('agent.profile.memoryDisclosureNote')}
+                </p>
+                <div className="grid grid-cols-2 gap-3">
+                  <Field label={t('agent.profile.tools')} hint={t('agent.profile.toolsHint')}>
+                    <textarea
+                      className={cn(textareaClass, 'min-h-14 font-mono text-xs leading-5')}
+                      value={form.tools}
+                      onChange={(event) => patchForm({ tools: event.target.value })}
+                      placeholder={t('agent.profile.listPlaceholder')}
+                    />
+                  </Field>
+                  <Field label={t('agent.profile.skills')} hint={t('agent.profile.skillsHint')}>
+                    <textarea
+                      className={cn(textareaClass, 'min-h-14 font-mono text-xs leading-5')}
+                      value={form.skills}
+                      onChange={(event) => patchForm({ skills: event.target.value })}
+                      placeholder={t('agent.profile.listPlaceholder')}
+                    />
+                  </Field>
+                </div>
+                <Field label={t('agent.profile.metadata')} hint={t('agent.profile.metadataHint')}>
+                  <textarea
+                    className={cn(textareaClass, 'min-h-14 font-mono text-xs leading-5')}
+                    value={form.metadata}
+                    onChange={(event) => patchForm({ metadata: event.target.value })}
+                    placeholder={t('agent.profile.metadataPlaceholder')}
+                  />
+                </Field>
               </section>
 
               <section className="space-y-2">

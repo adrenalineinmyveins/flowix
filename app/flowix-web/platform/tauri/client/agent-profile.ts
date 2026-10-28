@@ -14,6 +14,12 @@ export interface AgentProfileUpdatePatch {
   redactionLevel?: string;
   disclosureScope?: string[];
   model?: string;
+  /** AGENT-PROFILE-REDESIGN P3：扩展字段（UI 全权入口，memory 扩缩均放行）。 */
+  system?: string;
+  tools?: string[];
+  skills?: string[];
+  metadata?: Record<string, string>;
+  memory?: string[];
 }
 
 export const agentProfile = {
@@ -46,6 +52,11 @@ export const agentProfile = {
       redactionLevel: patch.redactionLevel,
       disclosureScope: patch.disclosureScope,
       model: patch.model,
+      system: patch.system,
+      tools: patch.tools,
+      skills: patch.skills,
+      metadata: patch.metadata,
+      memory: patch.memory,
     }),
 
   delete: (cwd: string, agentId: string) =>

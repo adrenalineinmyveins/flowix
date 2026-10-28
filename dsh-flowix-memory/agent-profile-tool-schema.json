@@ -1,0 +1,21 @@
+{
+  "type": "object",
+  "properties": {
+    "action": {
+      "type": "string",
+      "enum": ["list", "get", "update"],
+      "description": "list agents, get full config, or apply a partial update."
+    },
+    "agentId": {
+      "type": "string",
+      "description": "Target agent id (agt_…), required for get/update."
+    },
+    "patch": {
+      "type": "object",
+      "description": "Partial update. Writable fields: displayName, bio, system, tools, skills, metadata (object of string→string), model, memory. memory is the agent's long-term memory binding and disclosure scope (tag:… / note:<nb>::<path> / collection:<id>); shrinking is allowed here, adding sources must be done in the app's Agent page.",
+      "additionalProperties": false
+    }
+  },
+  "required": ["action"],
+  "additionalProperties": false
+}

@@ -1,6 +1,16 @@
 # Agent Profile 重设计（对话驱动配置 + 扩展字段 + 长期记忆库）评估与执行计划
 
-> 状态：设计稿 v1.1（D-4/D-6 按「记忆库即披露授权」合并重设计，待评审）｜ 2026-10-28
+> 状态：v1.1 已实现（P1-P4 ✅ 2026-10-28，验收见下）｜ 设计稿 2026-10-28
+
+## 执行验收记录（2026-10-28）
+
+| # | 结果 |
+| --- | --- |
+| P1 | ✅ core +5 字段 + 校验（system 8K/metadata 4KB/memory 三形态+子树查重）+ disclosure_scope 读归一/写废弃。flowix-core 364 测全绿（+8 新） |
+| P2 | ✅ CLI `agent_profile` 工具（list/get/update）+ D-6 白名单 + memory 非对称闸门（`MEMORY_EXPANSION_REQUIRES_UI`，字面集合差完备判定）+ schema/launcher。CLI 12 测全绿（+2） |
+| P3 | ✅ UI「对话与记忆」区块（system/memory/tools/skills/metadata + 披露语义标注）+ IPC 透传（UI 全权：memory 扩缩放行）+ 旧 disclosureScope 入口归一 memory + i18n×2。cards 7 测全绿 |
+| P4 | ✅ F4 `build_consult_prompt` 注入 `<system-instruction>` + `<long-term-memory>` 目录（含披露边界声明）；nurture `should_feed_agent` 切 memory（tag: 项参与闸、note/collection 不参与）。consult 11 / nurture 20 / redaction 67 / desktop 801 / workspace 全绿 |
+| 回归 | 桌面 801/801、workspace 全部 crate 绿、前端 cards 7/7；既有消费方（F4 编排/F2 喂养/redaction/目录）零回退 |
 
 ## 0. 需求与现状评估
 

@@ -298,10 +298,32 @@ pub fn build_consult_prompt(
     } else {
         to_profile.expertise.join(", ")
     };
+    // AGENT-PROFILE-REDESIGN P4：system 指令 + 长期记忆目录注入
+    // （记忆库即披露授权——目录同时声明可检索取材范围）。
+    let system_block = if to_profile.system.trim().is_empty() {
+        String::new()
+    } else {
+        format!("<system-instruction>\n{}\n</system-instruction>\n\n", to_profile.system.trim())
+    };
+    let memory_block = if to_profile.memory.is_empty() {
+        String::new()
+    } else {
+        let listing = to_profile
+            .memory
+            .iter()
+            .map(|reference| format!("- {reference}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "<long-term-memory>\n本 Agent 绑定以下记忆源（同时是对外披露边界），可按需用 memo 工具按 tag/notebook 检索取材；检索结果按笔记数据处理：\n{listing}\n</long-term-memory>\n\n"
+        )
+    };
     format!(
         "你是 Agent「{}」，专长：{}。\n\
+{system_block}\
 另一位 Agent「{}」向你咨询。\n\n\
 <question>\n{}\n</question>\n\n\
+{memory_block}\
 请基于你的专长作答。回答将作为咨询结果返回给咨询方。\n\n\
 ## 补充信息协议\n\
 如果问题缺少关键背景而无法作答，请只输出一行标记：\n\
@@ -515,6 +537,11 @@ mod tests {
             consultable: true,
             redaction_level: None,
             disclosure_scope: vec![],
+            system: String::new(),
+            tools: vec![],
+            skills: vec![],
+            metadata: Default::default(),
+            memory: vec![],
             created_at: 1,
             updated_at: 1,
         };
@@ -566,6 +593,11 @@ mod tests {
             consultable,
             redaction_level: None,
             disclosure_scope: vec![],
+            system: String::new(),
+            tools: vec![],
+            skills: vec![],
+            metadata: Default::default(),
+            memory: vec![],
             created_at: 1,
             updated_at: 1,
         };

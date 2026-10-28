@@ -89,18 +89,24 @@ pub fn start_trigger(app: tauri::AppHandle) -> tauri::async_runtime::JoinHandle<
     })
 }
 
-/// per-agent 闸：profile 声明了 `flowix_disclosure_scope` 时，事件标签须
-/// 命中其中之一（或其子树）；为空表示不限（跟随全局授权）。
-/// 与 F6 联动一致：喂养输入范围 = 对外披露范围。
+/// per-agent 闸（AGENT-PROFILE-REDESIGN D-4）：profile 声明 `flowix_memory`
+/// 时，事件标签须命中其中 tag 项（或其子树）；note:/collection: 项不适用
+/// 于 tag 事件闸；为空表示不限（跟随全局授权）。与 F6 联动一致：
+/// 喂养输入范围 = 记忆库 = 对外披露范围。
 pub fn should_feed_agent(profile: &flowix_core::agent::AgentProfile, tags: &[String]) -> bool {
-    if profile.disclosure_scope.is_empty() {
+    if profile.memory.is_empty() {
         return true;
     }
-    profile.disclosure_scope.iter().any(|scope| {
-        tags.iter().any(|tag| {
-            tag == scope || tag.strip_prefix(scope).is_some_and(|rest| rest.starts_with('/'))
+    profile
+        .memory
+        .iter()
+        .filter_map(|reference| reference.strip_prefix("tag:"))
+        .any(|scope| {
+            tags.iter().any(|tag| {
+                tag == scope
+                    || tag.strip_prefix(scope).is_some_and(|rest| rest.starts_with('/'))
+            })
         })
-    })
 }
 
 /// 列出某 notebook 的全部 (agent_id, profile)。坏 profile 跳过。
@@ -638,17 +644,20 @@ mod tests {
     #[test]
     fn per_agent_gate_follows_disclosure_scope() {
         let mut profile = test_profile("agt_x");
-        // 空 scope：跟随全局，任何标签都喂。
+        // 空记忆库：跟随全局，任何标签都喂。
         assert!(should_feed_agent(&profile, &["任意".into()]));
-        // 声明 scope：命中自身或子树才喂。
-        profile.disclosure_scope = vec!["finance/财报".into()];
+        // 声明 tag 记忆源：命中自身或子树才喂（D-4：memory 即披露范围）。
+        profile.memory = vec!["tag:finance/财报".into()];
         assert!(should_feed_agent(&profile, &["finance/财报".into()]));
         assert!(should_feed_agent(&profile, &["finance/财报/q3".into()]));
         assert!(!should_feed_agent(&profile, &["finance".into()]));
         assert!(!should_feed_agent(&profile, &["industry/电商".into()]));
         assert!(!should_feed_agent(&profile, &[]));
-        // 多 scope 任一命中。
-        profile.disclosure_scope = vec!["a".into(), "b/c".into()];
+        // 非 tag 记忆源（note/collection）不参与 tag 事件闸。
+        profile.memory = vec!["note:work::a.md".into()];
+        assert!(!should_feed_agent(&profile, &["finance".into()]));
+        // 多记忆源任一 tag 命中。
+        profile.memory = vec!["tag:a".into(), "tag:b/c".into()];
         assert!(should_feed_agent(&profile, &["b/c/d".into()]));
     }
 
@@ -682,6 +691,11 @@ mod tests {
             consultable: true,
             redaction_level: None,
             disclosure_scope: vec![],
+            system: String::new(),
+            tools: vec![],
+            skills: vec![],
+            metadata: Default::default(),
+            memory: vec![],
             created_at: 1,
             updated_at: 1,
         }
