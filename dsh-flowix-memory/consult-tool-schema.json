@@ -3,7 +3,7 @@
   "properties": {
     "target": {
       "type": "string",
-      "description": "Namespace address of the remote agent, for example alice/researcher@https://relay.example"
+      "description": "Target agent: full address (alice/researcher@https://relay.example), or a short form (researcher, alice/researcher) completed locally. Call consult_targets first to list reachable agents."
     },
     "question": {
       "type": "string",

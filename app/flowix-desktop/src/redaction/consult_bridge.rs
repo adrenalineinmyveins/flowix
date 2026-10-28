@@ -215,11 +215,7 @@ async fn handle_connection(mut stream: TcpStream, app: &tauri::AppHandle, token:
             Err(_) => return, // 读超时，静默断开。
         }
     };
-    if parsed.method != "POST" {
-        let _ = write_response(&mut stream, 405, "{\"ok\":false,\"error\":\"METHOD_NOT_ALLOWED\"}").await;
-        return;
-    }
-    if parsed.path != "/consult" {
+    if parsed.path != "/consult" && parsed.path != "/targets" {
         let _ = write_response(&mut stream, 404, "{\"ok\":false,\"error\":\"NOT_FOUND\"}").await;
         return;
     }
@@ -229,6 +225,16 @@ async fn handle_connection(mut stream: TcpStream, app: &tauri::AppHandle, token:
         .is_some_and(|value| value == format!("Bearer {token}"));
     if !authorized {
         let _ = write_response(&mut stream, 403, "{\"ok\":false,\"error\":\"UNAUTHORIZED\"}").await;
+        return;
+    }
+    // FD-12 M2 补：目标枚举（LLM 先列后选——会话内无法得知本机 agent 地址）。
+    if parsed.method == "GET" && parsed.path == "/targets" {
+        let body = serde_json::to_string(&targets_snapshot()).unwrap_or_default();
+        let _ = write_response(&mut stream, 200, &body).await;
+        return;
+    }
+    if parsed.method != "POST" {
+        let _ = write_response(&mut stream, 405, "{\"ok\":false,\"error\":\"METHOD_NOT_ALLOWED\"}").await;
         return;
     }
     let request: ConsultBridgeRequest = match serde_json::from_slice(&parsed.body) {
@@ -246,15 +252,16 @@ async fn handle_connection(mut stream: TcpStream, app: &tauri::AppHandle, token:
             return;
         }
     };
-    // 语义结果（含 AUTO_GATE_REJECTED:*）一律 200 + ok:false——CLI 侧只区分
-    // 传输失败与业务结果，业务错误文本原样带给 LLM。
+    // FD-12 M2 补：短地址补全（LLM 常只知道 slug——`expert` / `bob/expert`
+    // 自动补本地用户名与中继；完整地址原样通过）。
+    let resolved_target = resolve_target(&request.target_agent_id);
     let response = match consult_auto_send_core(
         app,
         &request.cwd,
         &request.question,
         &request.scope_paths,
         &request.target_level,
-        &request.target_agent_id,
+        &resolved_target,
         &request.session_id,
     )
     .await
@@ -267,7 +274,7 @@ async fn handle_connection(mut stream: TcpStream, app: &tauri::AppHandle, token:
                 receipt_id: result.receipt_id.clone(),
                 thread_id,
                 cwd: request.cwd.clone(),
-                target_agent_id: request.target_agent_id.clone(),
+                target_agent_id: resolved_target.clone(),
                 at: chrono::Utc::now().timestamp(),
                 settled: false,
             });
@@ -296,6 +303,73 @@ fn success_response(result: &AutoSendResult) -> ConsultBridgeResponse {
         byte_length: Some(result.byte_length),
         error: None,
     }
+}
+
+/// 本机可寻址目标快照（`consult_targets` 工具数据源）：
+/// registered_agents 补全账号用户名与中继 → 完整命名空间地址。
+fn targets_snapshot() -> serde_json::Value {
+    let config = crate::commands::redaction::redaction_config_for_pipeline();
+    let account = crate::redaction::account::read_account();
+    let relay = if config.relay_url.trim().is_empty() {
+        account.as_ref().map(|item| item.relay_url.clone())
+    } else {
+        Some(config.relay_url.clone())
+    };
+    let username = account.as_ref().map(|item| item.username.clone());
+    let targets: Vec<serde_json::Value> = config
+        .registered_agents
+        .iter()
+        .map(|agent| {
+            let namespaced = if agent.contains('/') {
+                agent.clone()
+            } else {
+                username
+                    .as_ref()
+                    .map(|user| format!("{user}/{agent}"))
+                    .unwrap_or_else(|| agent.clone())
+            };
+            serde_json::json!({
+                "agentId": namespaced,
+                "address": relay
+                    .as_ref()
+                    .map(|url| format!("{namespaced}@{url}"))
+                    .unwrap_or_else(|| namespaced.clone()),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "ok": true,
+        "targets": targets,
+        "hint": "use the `address` field as consult_remote's target; short forms (slug or user/slug) are also accepted and completed locally",
+    })
+}
+
+/// 短地址补全：`slug` → `user/slug@relay`；`user/slug` → 补 `@relay`；
+/// 完整地址原样。缺账号/中继时尽力返回（后续核心链给出明确错误）。
+fn resolve_target(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.contains('@') {
+        return trimmed.to_string();
+    }
+    let config = crate::commands::redaction::redaction_config_for_pipeline();
+    let account = crate::redaction::account::read_account();
+    let relay = if config.relay_url.trim().is_empty() {
+        account.as_ref().map(|item| item.relay_url.clone())
+    } else {
+        Some(config.relay_url.clone())
+    };
+    let Some(relay) = relay.filter(|url| !url.trim().is_empty()) else {
+        return trimmed.to_string();
+    };
+    let namespaced = if trimmed.contains('/') {
+        trimmed.to_string()
+    } else {
+        match account.as_ref() {
+            Some(item) => format!("{}/{}", item.username, trimmed),
+            None => return trimmed.to_string(),
+        }
+    };
+    format!("{namespaced}@{relay}")
 }
 
 async fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {

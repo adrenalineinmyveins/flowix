@@ -138,6 +138,10 @@ function runUnavailableServer() {
             name: CONSULT_TOOL_NAME,
             description: 'Consult a remote user\'s published Flowix agent. Requires the Flowix desktop app to be running.',
             inputSchema: CONSULT_TOOL_SCHEMA,
+          }, {
+            name: 'consult_targets',
+            description: 'List agents reachable via consult_remote on this device. Requires the Flowix desktop app to be running.',
+            inputSchema: { type: 'object', properties: {}, additionalProperties: false },
           }],
         },
       })
@@ -149,7 +153,9 @@ function runUnavailableServer() {
         ? `Flowix CLI is unavailable. Install Flowix from ${INSTALL_URL} for your platform, or set FLOWIX_CLI_PATH to the absolute path of flowix-cli. After installation, restart the DSH profile and retry this tool.`
         : name === CONSULT_TOOL_NAME
           ? 'Remote consult is unavailable: the Flowix desktop app is not running. Start Flowix Desktop, restart the DSH profile, and retry this tool.'
-          : `Unknown tool: ${String(name)}`
+          : name === 'consult_targets'
+            ? 'Target listing is unavailable: the Flowix desktop app is not running. Start Flowix Desktop, restart the DSH profile, and retry this tool.'
+            : `Unknown tool: ${String(name)}`
       writeResponse({
         jsonrpc: '2.0',
         id: message.id,

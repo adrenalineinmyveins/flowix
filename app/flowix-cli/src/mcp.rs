@@ -10,6 +10,7 @@ use std::io::{BufRead, Write};
 
 pub const TOOL_NAME: &str = "memo";
 pub const CONSULT_TOOL_NAME: &str = "consult_remote";
+pub const CONSULT_TARGETS_TOOL_NAME: &str = "consult_targets";
 const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
     "2024-11-05",
@@ -22,7 +23,7 @@ pub const TOOL_DESCRIPTION: &str = "Search and manage Flowix Markdown notes, rea
 
 /// FD-12 M2：远程咨询工具。默认抽象提问（零取材直通，毫秒级出门）；
 /// scopeHint 仅在需要引用笔记原文时携带。回执立即返回，回程异步到达。
-pub const CONSULT_TOOL_DESCRIPTION: &str = "Consult another user's published Flowix agent over the network (asynchronous). Ask in abstract terms by default: a question written from scratch leaves in milliseconds. Include scopeHint only when the answer must draw on your notes; scopes outside the pre-authorized whitelist fall back to manual review. Returns a delivery receipt (receiptId, status); the answer arrives asynchronously and will be injected into this conversation later.";
+pub const CONSULT_TOOL_DESCRIPTION: &str = "Consult another user's published Flowix agent over the network (asynchronous). Ask in abstract terms by default: a question written from scratch leaves in milliseconds. Include scopeHint only when the answer must draw on your notes; scopes outside the pre-authorized whitelist fall back to manual review. Returns a delivery receipt (receiptId, status); the answer arrives asynchronously and will be injected into this conversation later. Target accepts a full address (user/agent@relay), or a short form (agent slug, user/agent) which is completed locally; call consult_targets to list reachable agents.";
 
 /// Run the MCP line-delimited JSON-RPC loop until stdin reaches EOF.
 pub fn run_mcp<R: BufRead, W: Write>(reader: R, mut writer: W) -> Result<(), CliError> {
@@ -56,7 +57,7 @@ pub fn run_mcp<R: BufRead, W: Write>(reader: R, mut writer: W) -> Result<(), Cli
         let response = match method {
             "initialize" => rpc_result(id, initialize_result(&params)),
             "ping" => rpc_result(id, json!({})),
-            "tools/list" => rpc_result(id, json!({"tools": [tool_definition(), consult_tool_definition()]})),
+            "tools/list" => rpc_result(id, json!({"tools": [tool_definition(), consult_tool_definition(), consult_targets_tool_definition()]})),
             "tools/call" => match call_tool(&params) {
                 Ok(result) => rpc_result(id, result),
                 Err(error) => rpc_error(id, -32602, error.to_string()),
@@ -113,6 +114,16 @@ fn consult_tool_definition() -> Value {
     })
 }
 
+fn consult_targets_tool_definition() -> Value {
+    json!({
+        "name": CONSULT_TARGETS_TOOL_NAME,
+        "title": "Flowix Consult Targets",
+        "description": "List agents reachable via consult_remote on this device (local registered agents completed to full user/agent@relay addresses). Call this first when you do not know the target address.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+        "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
+    })
+}
+
 fn call_tool(params: &Value) -> Result<Value, CliError> {
     let object = params
         .as_object()
@@ -123,6 +134,9 @@ fn call_tool(params: &Value) -> Result<Value, CliError> {
         .ok_or_else(|| CliError::Usage("tools/call params.name must be a string".into()))?;
     if name == CONSULT_TOOL_NAME {
         return call_consult_tool(object);
+    }
+    if name == CONSULT_TARGETS_TOOL_NAME {
+        return call_consult_targets_tool();
     }
     if name != TOOL_NAME {
         return Err(CliError::Usage(format!("unknown tool: `{name}`")));
@@ -591,6 +605,88 @@ fn call_consult_tool(params: &Map<String, Value>) -> Result<Value, CliError> {
     }
 }
 
+/// FD-12 M2 补：枚举本机可咨询目标（GET /targets）。无参数；桥接不可用
+/// 时与 consult_remote 同口径返回可行动错误。
+fn call_consult_targets_tool() -> Result<Value, CliError> {
+    let result = bridge_get("/targets");
+    let (data, is_error) = match result {
+        Ok(value) => {
+            let ok = value.get("ok").and_then(Value::as_bool) == Some(true);
+            (value, !ok)
+        }
+        Err(error) => (json!({"ok": false, "error": error.to_string()}), true),
+    };
+    let text = if is_error {
+        data.get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("consult_targets failed")
+            .to_string()
+    } else {
+        let list = data
+            .get("targets")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("address").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        if list.is_empty() {
+            "No registered consult targets on this device.".to_string()
+        } else {
+            format!("Reachable consult targets: {list}")
+        }
+    };
+    Ok(json!({
+        "content": [{"type": "text", "text": text}],
+        "structuredContent": data,
+        "isError": is_error
+    }))
+}
+
+/// 桌面桥接 GET 单请求往返（Connection: close，读至 EOF）。
+fn bridge_get(path: &str) -> Result<Value, CliError> {
+    use std::io::{Read, Write as _};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let port: u16 = std::env::var("FLOWIX_CONSULT_BRIDGE_PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| CliError::Other(BRIDGE_UNAVAILABLE.to_string()))?;
+    let token = std::env::var("FLOWIX_CONSULT_BRIDGE_TOKEN").unwrap_or_default();
+    let address: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))
+        .map_err(|_| CliError::Other(BRIDGE_UNAVAILABLE.to_string()))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .map_err(CliError::Io)?;
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(CliError::Io)?;
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .map_err(CliError::Io)?;
+    let text = String::from_utf8_lossy(&raw);
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| CliError::Other("BRIDGE_MALFORMED_RESPONSE".to_string()))?;
+    let status_line = head.lines().next().unwrap_or_default();
+    if !status_line.contains("200") {
+        return Err(CliError::Other(format!(
+            "BRIDGE_HTTP_ERROR: {status_line}"
+        )));
+    }
+    serde_json::from_str(body)
+        .map_err(|error| CliError::Other(format!("BRIDGE_INVALID_JSON: {error}")))
+}
+
 /// 桌面桥接单请求往返（同步 std TCP；Connection: close，读至 EOF）。
 /// 读超时 180s：覆盖桌面完整蒸馏的最长路径；直通形态毫秒级返回。
 fn bridge_roundtrip(body: &Value) -> Result<Value, CliError> {
@@ -705,7 +801,7 @@ mod tests {
     fn lists_memo_and_consult_tools() {
         let responses = run(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#);
         let tools = responses[0]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 2);
+        assert_eq!(tools.len(), 3);
         assert_eq!(tools[0]["name"], TOOL_NAME);
         assert!(tools[0]["inputSchema"]["properties"]["action"]["enum"]
             .as_array()
@@ -750,6 +846,24 @@ mod tests {
         std::env::remove_var("FLOWIX_CONSULT_BRIDGE_PORT");
         let responses = run(
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"consult_remote","arguments":{"target":"alice/researcher@https://relay.example","question":"abstract question"}}}"#,
+        );
+        if let Some(saved) = saved {
+            std::env::set_var("FLOWIX_CONSULT_BRIDGE_PORT", saved);
+        }
+        let result = &responses[0]["result"];
+        assert_eq!(result["isError"], json!(true));
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("BRIDGE_UNAVAILABLE"));
+    }
+
+    #[test]
+    fn consult_targets_without_bridge_returns_actionable_error() {
+        let saved = std::env::var("FLOWIX_CONSULT_BRIDGE_PORT").ok();
+        std::env::remove_var("FLOWIX_CONSULT_BRIDGE_PORT");
+        let responses = run(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"consult_targets","arguments":{}}}"#,
         );
         if let Some(saved) = saved {
             std::env::set_var("FLOWIX_CONSULT_BRIDGE_PORT", saved);
