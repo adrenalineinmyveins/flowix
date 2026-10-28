@@ -49,19 +49,23 @@ starred=1 → 投影 clean 收敛（云端保持 true）→ 手机视图正常�
 手机在 harness/codex/opencode 会话续聊：消息进云端与桌面 `thread_messages`（桌面 UI 能显示），但 **runtime session（DSH 等）不含这些消息**——桌面端继续对话时，runtime 以自己的 session 历史为上下文，**看不到手机说过什么**，出现语义断层。
 **修复方向**（两选一）：a) 桌面发送前把云端新增消息（origin≠desktop）注入 runtime 上下文（prompt 拼接）；b) 手机端对 provider runtime 会话标记「轻跟进」并禁续聊输入（保守）。涉及桌面 runtime 桥，建议单独立项评估。
 
-### D3【性能·P1】长会话全量拉取渲染
-`agent_thread_messages`（Rust）一次返回全部消息，ChatScreen/卡片全量渲染。provider runtime 长会话上云后已成真实场景（实测 108 条；桌面侧无上限）。
-**修复方向**：Rust 命令加 `before/limit` 分页 + 前端顶部历史加载（桌面 `thread_get_page` 同款游标语义）。
+### D3【性能·P1】长会话全量拉取渲染 —— ✅ 已修复
+新增 `agent_thread_messages_page`（(createdAt,id) 双键游标分页，旧全量命令保留兼容）；
+ChatScreen 首屏 40 条 + 顶部「加载更早消息」（prepend 去重 + 滚动位置保持），卡片首屏 20 条同款。
+实测 110 条会话：首屏 21 气泡 → 加载更早 → 41，翻页零重叠。
 
-### D4【体验·P1】超长消息无折叠预算
-单条超长回复（工具结果/markdown 长文）全高渲染，长会话滚动成本高。桌面有折叠预算 + 展开全文机制，移动端未做（parity-eval P1 遗留）。
+### D4【体验·P1】超长消息无折叠预算 —— ✅ 已修复
+MessageBubble（会话页/卡片共用）超 800 字正文默认折叠（渐隐底边）+「展开全文（N 字）」。
+实测长会话中出现折叠气泡，展开生效。
 
 ### D5【数据面·P2】journal runtime 与 pi 会话不可见
 claude / hermes（消息在 `agent_external_events`）与 pi 的会话未纳入同步（provider runtime 泛化时明确排除）。手机端看不到这类桌面会话。
 **修复方向**：journal 投影路径（events → messages → payload），与 provider runtime 桥同构，待有真实使用需求再做。
 
-### D6【体验·P1】Provider 未配置的错误引导弱
-未配 AI 时发送返回 `AGENT_PROVIDER_NOT_CONFIGURED`，界面直接显示错误码字符串；空列表虽有「在设置中配置 AI 服务」提示，但错误路径无**跳转设置**动作。本次排查实测触发过（模拟器重建后配置丢失）。
+### D6【体验·P1】Provider 未配置的错误引导弱 —— ✅ 已修复
+`friendlyAgentError` 映射（AI 服务未配置/会话未同步等），会话页错误条对未配置场景
+出现「去设置」跳转按钮（App 传入 onOpenSettings）。实测：清配置发送 → 中文引导 +
+去设置按钮，配置恢复正常。
 
 ### D7【体验·P2】会话列表无搜索、runtime 标识生硬
 - 列表无搜索框（桌面全局搜索有会话维度）

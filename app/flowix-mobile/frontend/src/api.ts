@@ -114,6 +114,32 @@ export interface ThreadMessage {
   attachments?: ChatAttachment[];
 }
 
+/** D3 历史分页页（(createdAt,id) 双键游标） */
+export interface ThreadMessagesPage {
+  messages: ThreadMessage[];
+  hasMore: boolean;
+  oldestCreatedAt?: number | null;
+  oldestId?: string | null;
+}
+
+/** D6：面向用户的错误文案映射；未命中返回原文 */
+export function friendlyAgentError(raw: string): string {
+  const text = String(raw);
+  if (text.includes('AGENT_PROVIDER_NOT_CONFIGURED')) {
+    return 'AI 服务未配置：请在 设置 → AI 服务 中填写 API 地址、密钥与模型';
+  }
+  if (text.includes('AGENT_THREAD_NOT_SYNCED')) {
+    return '会话尚未同步到本机，稍等同步完成后重试';
+  }
+  return text;
+}
+
+export function isProviderUnconfigured(raw: string): boolean {
+  const text = String(raw);
+  // 兼容原始错误码与 friendlyAgentError 转换后的中文文案
+  return text.includes('AGENT_PROVIDER_NOT_CONFIGURED') || text.includes('AI 服务未配置');
+}
+
 export type AgentChunk =
   | { kind: 'stream_start'; thread_id: string }
   | { kind: 'text'; thread_id: string; delta: string }
@@ -163,6 +189,17 @@ export const api = {
   agentThreadList: () => invoke<ThreadSummary[]>('agent_thread_list'),
   agentThreadMessages: (threadId: string) =>
     invoke<ThreadMessage[]>('agent_thread_messages', { threadId }),
+  agentThreadMessagesPage: (
+    threadId: string,
+    limit: number,
+    before?: { createdAt: number; id: string } | null,
+  ) =>
+    invoke<ThreadMessagesPage>('agent_thread_messages_page', {
+      threadId,
+      limit,
+      beforeCreatedAt: before?.createdAt ?? undefined,
+      beforeId: before?.id ?? undefined,
+    }),
   agentThreadDelete: (threadId: string) =>
     invoke<boolean>('agent_thread_delete', { threadId }),
   agentThreadUpdate: (

@@ -1,6 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ArrowUp, Check, ChevronDown, Copy, ImagePlus, Square, Terminal, X } from 'lucide-react';
-import { api, listenEvent, AgentChunk, ChatAttachment, ThreadMessage } from './api';
+import { ArrowUp, Check, ChevronDown, Copy, ImagePlus, Settings, Square, Terminal, X } from 'lucide-react';
+import {
+  api,
+  listenEvent,
+  AgentChunk,
+  ChatAttachment,
+  ThreadMessage,
+  friendlyAgentError,
+  isProviderUnconfigured,
+} from './api';
 import { renderChatMarkdown, toolCallSummary } from './chat-render';
 import { markThreadRead } from './thread-read';
 
@@ -10,7 +18,15 @@ interface Props {
   onThreadCreated: (threadId: string) => void;
   /** 附件锚定笔记本（P2a）：图片存该笔记本 attachments/ 随云同步 */
   attachmentNotebookId?: string | null;
+  /** D6：AI 服务未配置时的跳设置入口 */
+  onOpenSettings?: (() => void) | null;
 }
+
+/** D3：单页消息数（长会话首屏只拉最新一页，向上翻加载更早） */
+const MESSAGE_PAGE_SIZE = 40;
+
+/** D4：超长消息折叠预算（字符）；超出默认折叠，展开按钮显示全量 */
+const MESSAGE_COLLAPSE_CHARS = 800;
 
 export function formatMessageTime(timestamp: number): string {
   const date = new Date(timestamp);
@@ -148,7 +164,8 @@ function AttachmentThumbs({
 }
 
 /** 单条消息富渲染：markdown（assistant/system）、工具行、复制、时间戳。
- * 与桌面 thread card 消息渲染对齐（P0），卡片与全屏对话共用。 */
+ * 与桌面 thread card 消息渲染对齐（P0），卡片与全屏对话共用。
+ * D4：超长正文默认折叠（预算 MESSAGE_COLLAPSE_CHARS），展开按钮看全量。 */
 export function MessageBubble({
   message,
   attachmentNotebookId,
@@ -156,6 +173,7 @@ export function MessageBubble({
   message: ThreadMessage;
   attachmentNotebookId?: string | null;
 }) {
+  const [expanded, setExpanded] = useState(false);
   // 代码块「复制」角标的事件委托：CSS ::after 角标不可单独绑定
   const onBubbleClick = (event: React.MouseEvent<HTMLDivElement>) => {
     const target = event.target as HTMLElement;
@@ -169,6 +187,14 @@ export function MessageBubble({
     const code = pre.querySelector('code')?.textContent ?? '';
     navigator.clipboard.writeText(code).catch(() => {});
   };
+  // D4 折叠：仅 assistant/system 的 markdown 正文参与预算（用户消息通常短）
+  const collapsible =
+    expanded === false &&
+    (message.role === 'assistant' || message.role === 'system') &&
+    message.content.length > MESSAGE_COLLAPSE_CHARS;
+  const visibleContent = collapsible
+    ? message.content.slice(0, MESSAGE_COLLAPSE_CHARS)
+    : message.content;
   if (message.role === 'user') {
     return (
       <div className="chat-bubble chat-bubble-user">
@@ -194,11 +220,22 @@ export function MessageBubble({
             <div className="chat-reasoning-body">{message.reasoning}</div>
           </details>
         ) : null}
-        {message.content ? (
-          <div
-            className="chat-bubble-text chat-md"
-            dangerouslySetInnerHTML={{ __html: renderChatMarkdown(message.content) }}
-          />
+        {visibleContent ? (
+          <>
+            <div
+              className={`chat-bubble-text chat-md${collapsible ? ' chat-md-collapsed' : ''}`}
+              dangerouslySetInnerHTML={{ __html: renderChatMarkdown(visibleContent) }}
+            />
+            {collapsible ? (
+              <button
+                className="chat-collapse-toggle"
+                onClick={() => setExpanded(true)}
+              >
+                <ChevronDown size={13} />
+                展开全文（{message.content.length} 字）
+              </button>
+            ) : null}
+          </>
         ) : (
           <div className="chat-bubble-text">
             <span className="chat-cursor">▍</span>
@@ -215,18 +252,28 @@ export function MessageBubble({
     );
   }
   return (
-    <div className="chat-bubble chat-bubble-system">
+    <div className="chat-bubble chat-bubble-system" onClick={onBubbleClick}>
       <div
-        className="chat-bubble-text chat-md"
-        dangerouslySetInnerHTML={{ __html: renderChatMarkdown(message.content) }}
+        className={`chat-bubble-text chat-md${collapsible ? ' chat-md-collapsed' : ''}`}
+        dangerouslySetInnerHTML={{ __html: renderChatMarkdown(visibleContent) }}
       />
+      {collapsible ? (
+        <button className="chat-collapse-toggle" onClick={() => setExpanded(true)}>
+          <ChevronDown size={13} />
+          展开全文（{message.content.length} 字）
+        </button>
+      ) : null}
     </div>
   );
 }
 
 /** 聊天屏：流式渲染走 `agent-chunk` 事件（不信 IPC await）。 */
-export function ChatScreen({ threadId, onBack, onThreadCreated, attachmentNotebookId }: Props) {
+export function ChatScreen({ threadId, onBack, onThreadCreated, attachmentNotebookId, onOpenSettings }: Props) {
   const [messages, setMessages] = useState<ThreadMessage[] | null>(null);
+  // D3 分页：更早历史按需加载（双键游标）
+  const [hasMore, setHasMore] = useState(false);
+  const [oldest, setOldest] = useState<{ createdAt: number; id: string } | null>(null);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const [draft, setDraft] = useState(() => loadDraft(threadId));
   const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState('');
@@ -243,21 +290,63 @@ export function ChatScreen({ threadId, onBack, onThreadCreated, attachmentNotebo
   const pinnedRef = useRef(true);
   const activeThreadRef = useRef(threadId);
   activeThreadRef.current = threadId;
+  // D3：reload 保持已加载条数（翻页后流结束/远端刷新不丢已展开的历史）
+  const loadedCountRef = useRef(MESSAGE_PAGE_SIZE);
 
   const reload = useCallback(async () => {
     try {
-      setMessages(await api.agentThreadMessages(threadId));
+      // limit 取「页大小与已加载数的较大者」：首轮 40 条，翻页后刷新不截断视图
+      const limit = Math.max(MESSAGE_PAGE_SIZE, loadedCountRef.current);
+      const page = await api.agentThreadMessagesPage(threadId, limit);
+      setMessages(page.messages);
+      setHasMore(page.hasMore);
+      setOldest(
+        page.oldestCreatedAt != null && page.oldestId
+          ? { createdAt: page.oldestCreatedAt, id: page.oldestId }
+          : null,
+      );
       if (threadId) markThreadRead(threadId);
     } catch (err) {
-      setError(String(err));
+      setError(friendlyAgentError(err));
     }
   }, [threadId]);
+
+  // D3：加载更早一页（prepend，按 id 去重；保持滚动位置不跳）
+  const loadOlder = useCallback(async () => {
+    if (!oldest || loadingOlder) return;
+    setLoadingOlder(true);
+    try {
+      const page = await api.agentThreadMessagesPage(threadId, MESSAGE_PAGE_SIZE, oldest);
+      const existing = new Set((messages ?? []).map((message) => message.id));
+      const older = page.messages.filter((message) => !existing.has(message.id));
+      const el = scrollRef.current;
+      const prevHeight = el?.scrollHeight ?? 0;
+      setMessages((current) => [...older, ...(current ?? [])]);
+      setHasMore(page.hasMore);
+      setOldest(
+        page.oldestCreatedAt != null && page.oldestId
+          ? { createdAt: page.oldestCreatedAt, id: page.oldestId }
+          : null,
+      );
+      loadedCountRef.current += older.length;
+      // prepend 后把滚动位置补回到原视觉位置
+      requestAnimationFrame(() => {
+        const el2 = scrollRef.current;
+        if (el2) el2.scrollTop += el2.scrollHeight - prevHeight;
+      });
+    } catch (err) {
+      setError(friendlyAgentError(err));
+    } finally {
+      setLoadingOlder(false);
+    }
+  }, [threadId, oldest, loadingOlder, messages]);
 
   useEffect(() => {
     setMessages(null);
     setLiveText('');
     setLiveReasoning('');
     setDraft(loadDraft(threadId));
+    loadedCountRef.current = MESSAGE_PAGE_SIZE;
     void reload();
   }, [reload]);
 
@@ -299,7 +388,7 @@ export function ChatScreen({ threadId, onBack, onThreadCreated, attachmentNotebo
           setLiveReasoning((current) => current + chunk.delta);
           break;
         case 'error':
-          setError(chunk.message);
+          setError(friendlyAgentError(chunk.message));
           break;
         case 'stream_end':
           setStreaming(false);
@@ -406,7 +495,7 @@ export function ChatScreen({ threadId, onBack, onThreadCreated, attachmentNotebo
         },
       ]);
     } catch (err) {
-      setError(String(err));
+      setError(friendlyAgentError(err));
       setDraft(content);
       saveDraft(threadId, content);
       setPending((current) =>
@@ -433,6 +522,11 @@ export function ChatScreen({ threadId, onBack, onThreadCreated, attachmentNotebo
           <div className="m-empty">加载中…</div>
         ) : (
           <>
+            {hasMore && messages.length > 0 ? (
+              <button className="chat-load-older" disabled={loadingOlder} onClick={() => void loadOlder()}>
+                {loadingOlder ? '加载中…' : '加载更早消息'}
+              </button>
+            ) : null}
             {messages.map((message) =>
               // 桌面同步会话只展示文字对话：纯工具消息（tool 行）不渲染
               message.origin === 'desktop' &&
@@ -468,7 +562,17 @@ export function ChatScreen({ threadId, onBack, onThreadCreated, attachmentNotebo
         <div ref={bottomRef} />
       </div>
 
-      {error ? <div className="chat-error">{error}</div> : null}
+      {error ? (
+        <div className="chat-error">
+          <span>{error}</span>
+          {isProviderUnconfigured(error) && onOpenSettings ? (
+            <button className="chat-error-action" onClick={onOpenSettings}>
+              <Settings size={13} />
+              去设置
+            </button>
+          ) : null}
+        </div>
+      ) : null}
 
       <footer className="chat-input-bar">
         {pending.length > 0 ? (

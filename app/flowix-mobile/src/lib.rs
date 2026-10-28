@@ -60,6 +60,7 @@ pub fn run() {
             agent::commands::agent_provider_set,
             agent::commands::agent_thread_list,
             agent::commands::agent_thread_messages,
+            agent::commands::agent_thread_messages_page,
             agent::commands::agent_thread_delete,
             agent::commands::agent_thread_update,
             agent::commands::agent_chat_send,

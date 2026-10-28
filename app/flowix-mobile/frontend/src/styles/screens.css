@@ -587,7 +587,59 @@
 .chat-cursor { animation: m-blink 1s step-end infinite; }
 @keyframes m-blink { 50% { opacity: 0; } }
 
-.chat-error { margin: 0 14px 6px; font-size: 12px; color: var(--destructive); }
+.chat-error {
+  margin: 0 14px 6px;
+  font-size: 12px;
+  color: var(--destructive);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.chat-error-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--foreground);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* D3：加载更早消息（会话页/卡片共用） */
+.chat-load-older {
+  display: block;
+  margin: 8px auto;
+  padding: 5px 16px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--muted-fg);
+  font-size: 12px;
+}
+.chat-load-older:disabled { opacity: 0.6; }
+
+/* D4：折叠正文的渐隐底边 + 展开按钮 */
+.chat-md-collapsed {
+  position: relative;
+  max-height: 340px;
+  overflow: hidden;
+  mask-image: linear-gradient(to bottom, #000 82%, transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, #000 82%, transparent 100%);
+}
+.chat-collapse-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 2px;
+  padding: 2px 8px;
+  border: none;
+  background: none;
+  color: var(--muted-fg);
+  font-size: 12px;
+}
 
 .chat-input-bar { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px calc(10px + var(--kb-offset, 0px)); border-top: 1px solid var(--border); background: var(--background); }
 .chat-input-row { display: flex; align-items: flex-end; gap: 8px; }

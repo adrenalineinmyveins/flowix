@@ -40,6 +40,68 @@ pub fn agent_thread_messages(
         .unwrap_or_default())
 }
 
+/// D3 历史分页：按 (createdAt, id) 双键游标取最新 limit 条（升序返回）。
+/// 双键避免同毫秒消息被分页边界丢掉。缺省/旧调用走 `agent_thread_messages` 全量。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadMessagesPage {
+    pub messages: Vec<V2ThreadMessage>,
+    pub has_more: bool,
+    pub oldest_created_at: Option<i64>,
+    pub oldest_id: Option<String>,
+}
+
+#[tauri::command]
+pub fn agent_thread_messages_page(
+    agent: State<'_, Arc<AgentState>>,
+    thread_id: String,
+    limit: Option<i64>,
+    before_created_at: Option<i64>,
+    before_id: Option<String>,
+) -> Result<ThreadMessagesPage, String> {
+    let Some((_, payload)) = agent.thread_payload_normalized(&thread_id)? else {
+        return Ok(ThreadMessagesPage {
+            messages: Vec::new(),
+            has_more: false,
+            oldest_created_at: None,
+            oldest_id: None,
+        });
+    };
+    let mut messages = payload.messages;
+    messages.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+    let cursor = match (before_created_at, before_id) {
+        (Some(created_at), Some(id)) => Some((created_at, id)),
+        _ => None,
+    };
+    let eligible: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| {
+            cursor
+                .as_ref()
+                .is_none_or(|(ts, id)| (&message.created_at, &message.id) < (ts, id))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let limit = limit.unwrap_or(50).clamp(1, 200) as usize;
+    let take = eligible.len().min(limit);
+    let has_more = eligible.len() > take;
+    let page: Vec<V2ThreadMessage> = eligible[eligible.len() - take..]
+        .iter()
+        .map(|&index| messages[index].clone())
+        .collect();
+    let oldest = page.first().map(|message| (message.created_at, message.id.clone()));
+    let (oldest_created_at, oldest_id) = oldest
+        .map(|(created_at, id)| (Some(created_at), Some(id)))
+        .unwrap_or((None, None));
+    Ok(ThreadMessagesPage {
+        messages: page,
+        has_more,
+        oldest_created_at,
+        oldest_id,
+    })
+}
+
 #[tauri::command]
 pub async fn agent_thread_delete(
     app: AppHandle,

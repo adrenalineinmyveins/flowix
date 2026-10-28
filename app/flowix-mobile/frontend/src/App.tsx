@@ -208,6 +208,7 @@ export function App() {
           onBack={() => back('chats')}
           onThreadCreated={(resolved) => setThreadId(resolved)}
           attachmentNotebookId={chatNotebookId ?? notebooks[0]?.id ?? null}
+          onOpenSettings={() => go('settings')}
         />
       </div>
     );

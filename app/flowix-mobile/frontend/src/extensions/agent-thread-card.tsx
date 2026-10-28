@@ -3,7 +3,7 @@ import { Node, mergeAttributes, type MarkdownToken, type NodeViewProps } from '@
 import { TextSelection } from '@tiptap/pm/state';
 import { NodeViewWrapper, ReactNodeViewRenderer } from '@tiptap/react';
 import { ArrowUp, ChevronDown, Maximize2, Square, Trash2 } from 'lucide-react';
-import { api, listenEvent, type AgentChunk, type ThreadMessage } from '../api';
+import { api, listenEvent, friendlyAgentError, type AgentChunk, type ThreadMessage } from '../api';
 import { MessageBubble } from '../ChatScreen';
 import { renderChatMarkdown } from '../chat-render';
 
@@ -25,6 +25,9 @@ function useThreadChat(
   noteContext?: { notebookId: string; relativePath: string } | null,
 ) {
   const [messages, setMessages] = useState<ThreadMessage[] | null>(null);
+  // D3 分页：卡片首屏最新 20 条，按需加载更早（双键游标）
+  const [hasMore, setHasMore] = useState(false);
+  const [oldest, setOldest] = useState<{ createdAt: number; id: string } | null>(null);
   const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState('');
   const [liveText, setLiveText] = useState('');
@@ -46,11 +49,37 @@ function useThreadChat(
     const id = activeThreadRef.current;
     if (!id) return;
     try {
-      setMessages(await api.agentThreadMessages(id));
+      const page = await api.agentThreadMessagesPage(id, 20);
+      setMessages(page.messages);
+      setHasMore(page.hasMore);
+      setOldest(
+        page.oldestCreatedAt != null && page.oldestId
+          ? { createdAt: page.oldestCreatedAt, id: page.oldestId }
+          : null,
+      );
     } catch {
       // 桌面端 runtime 卡的线程可能未同步到本机，静默保留占位提示
     }
   }, []);
+
+  const loadOlder = useCallback(async () => {
+    const id = activeThreadRef.current;
+    if (!id || !oldest) return;
+    try {
+      const page = await api.agentThreadMessagesPage(id, 20, oldest);
+      const existing = new Set((messages ?? []).map((message) => message.id));
+      const older = page.messages.filter((message) => !existing.has(message.id));
+      setMessages((current) => [...older, ...(current ?? [])]);
+      setHasMore(page.hasMore);
+      setOldest(
+        page.oldestCreatedAt != null && page.oldestId
+          ? { createdAt: page.oldestCreatedAt, id: page.oldestId }
+          : null,
+      );
+    } catch {
+      // 忽略：再点一次即可重试
+    }
+  }, [oldest, messages]);
 
   useEffect(() => {
     activeThreadRef.current = threadId;
@@ -125,14 +154,14 @@ function useThreadChat(
         return true;
       } catch (e) {
         inflightRef.current = false;
-        setError(String(e));
+        setError(friendlyAgentError(e));
         return false;
       }
     },
     [streaming, adoptThreadId],
   );
 
-  return { messages, liveText, liveReasoning, streaming, error, send, reload };
+  return { messages, hasMore, loadOlder, liveText, liveReasoning, streaming, error, send, reload };
 }
 
 // ── 卡片视图 ────────────────────────────────────────────────────────────────
@@ -186,7 +215,7 @@ function AgentThreadCardComponent({ node, editor, getPos, deleteNode }: NodeView
     [updateAttrs],
   );
 
-  const { messages, liveText, liveReasoning, streaming, error, send } = useThreadChat(
+  const { messages, hasMore, loadOlder, liveText, liveReasoning, streaming, error, send } = useThreadChat(
     attrs.threadId,
     handleThreadResolved,
     noteContext,
@@ -237,6 +266,11 @@ function AgentThreadCardComponent({ node, editor, getPos, deleteNode }: NodeView
           ) : null}
           {messages !== null && messages.length === 0 && attrs.threadId && !streaming ? (
             <div className="atc-m-hint">会话尚未同步到本机</div>
+          ) : null}
+          {hasMore && messages && messages.length > 0 ? (
+            <button className="chat-load-older" onClick={() => void loadOlder()}>
+              加载更早消息
+            </button>
           ) : null}
           {messages?.map((message) =>
             // 桌面同步会话只展示文字对话：纯工具消息不渲染（与 ChatScreen 一致）
