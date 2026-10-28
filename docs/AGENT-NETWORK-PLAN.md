@@ -134,6 +134,7 @@ flowchart TB
 | FD-5 | Profile 即笔记（frontmatter schema） | 可同步（v2 同步键即路径）、可 Git、零新存储 |
 | FD-6 | 出站留档不进笔记本、不参与云同步 | 留档属设备级审计数据，进笔记本会被同步带出设备 |
 | FD-11 | 跨用户网络 v2：命名空间 `user/agentSlug`（如 `alice/researcher`）；允许无签名匿名投递（配额降至签名档 1/10）；维持 FD-2 不加密仅脱敏（明文脱敏稿过 TLS 中继） | 详见 [F5-CROSS-USER-NETWORK.md](F5-CROSS-USER-NETWORK.md)（2026-10-19 M1 确认） |
+| FD-12 | Harness 远程咨询工具化：`consult_remote` 工具 + 预授权自动过门（一期限 R3）+ 回程 follow-up 注入；二期 B 端目录卡 `autoAnswer` 能力位闭环。出门必过管线/人审默认态等纪律不变量全部保持 | 详见 [FD-12-HARNESS-REMOTE-CONSULT.md](FD-12-HARNESS-REMOTE-CONSULT.md)（2026-10-21 立项；**M1-M4 全部 ✅ 2026-10-28**：M1 预授权模型 / M2 consult_remote 工具面（CLI mcp+回环桥接）/ M3 回程注入（关联+SSE+steer）/ M4 B 端 auto-answer（autoAnswer 能力位+目录卡+F4 编排自动回答直发）；relay 云端重部署与双端真机联调待办） |
 
 待定决策（不阻塞阶段一开工）：
 
