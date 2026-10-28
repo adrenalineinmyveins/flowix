@@ -572,6 +572,9 @@ pub struct PublishCardRequest {
     pub public_key: String,
     /// `public` | `unlisted` | `private`。
     pub visibility: String,
+    /// FD-12 M4 能力位：`off`（默认）| `R3`（自动回答入站咨询并直发回程）。
+    #[serde(default)]
+    pub auto_answer: String,
 }
 
 #[derive(Serialize)]
@@ -637,6 +640,18 @@ pub async fn put_directory_card(
     if !matches!(body.min_redaction_level.as_str(), "R1" | "R2" | "R3") {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, Json(RejectResponse { code: "CARD_INVALID" })));
     }
+    // FD-12 M4 能力位枚举（缺省/`off` 均归一为小写；`R3` 大写）。
+    let auto_answer = {
+        let raw = body.auto_answer.trim();
+        if raw.is_empty() || raw.eq_ignore_ascii_case("off") {
+            "off".to_string()
+        } else {
+            raw.to_uppercase()
+        }
+    };
+    if !matches!(auto_answer.as_str(), "off" | "R3") {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, Json(RejectResponse { code: "CARD_INVALID" })));
+    }
     let public_key = BASE64
         .decode(body.public_key.trim())
         .map_err(|_| (StatusCode::UNPROCESSABLE_ENTITY, Json(RejectResponse { code: "PUBLIC_KEY_INVALID" })))?;
@@ -657,6 +672,7 @@ pub async fn put_directory_card(
         "specialtyTags": body.specialty_tags,
         "minRedactionLevel": body.min_redaction_level,
         "publicKey": body.public_key.trim(),
+        "autoAnswer": auto_answer,
     }))
     .expect("card serializable");
     state.store.upsert_directory_card(

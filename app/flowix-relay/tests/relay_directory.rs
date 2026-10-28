@@ -140,6 +140,63 @@ async fn publish_search_detail_roundtrip() {
     assert_eq!(body["displayName"].as_str().unwrap(), "财报验证助手");
 }
 
+/// FD-12 M4：能力位 autoAnswer 随卡发布（缺省 off 兼容旧客户端；枚举校验）。
+#[tokio::test]
+async fn auto_answer_capability_bit_roundtrip() {
+    let base = spawn_relay(Arc::new(AppState::new(Store::in_memory()))).await;
+    let client = reqwest::Client::new();
+    let (token, _) = setup_alice_with_agent(&client, &base, "researcher").await;
+
+    // 旧客户端不带 autoAnswer：缺省 off。
+    let status = publish_card(&client, &base, &token, "researcher", "public", "助手", &[]).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let body: serde_json::Value = client
+        .get(format!("{base}/v2/directory/alice/researcher"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["card"]["autoAnswer"].as_str().unwrap(), "off");
+
+    // 显式 R3：卡面透出（A 端可见的能力位）。
+    let response = client
+        .put(format!("{base}/v2/directory/alice/researcher"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "displayName": "助手",
+            "specialtyTags": [],
+            "minRedactionLevel": "R1",
+            "publicKey": BASE64.encode([7u8; 32]),
+            "visibility": "public",
+            "autoAnswer": "R3",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["card"]["autoAnswer"].as_str().unwrap(), "R3");
+
+    // 无效枚举被拒。
+    let response = client
+        .put(format!("{base}/v2/directory/alice/researcher"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "displayName": "助手",
+            "specialtyTags": [],
+            "minRedactionLevel": "R1",
+            "publicKey": BASE64.encode([7u8; 32]),
+            "visibility": "public",
+            "autoAnswer": "R1",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+}
+
 #[tokio::test]
 async fn visibility_tiers_search_detail_and_delivery() {
     let base = spawn_relay(Arc::new(AppState::new(Store::in_memory()))).await;
