@@ -10,7 +10,7 @@ use rusqlite::{params, Connection};
 
 use super::error::ThreadError;
 
-pub(super) const THREAD_DB_SCHEMA_VERSION: i64 = 14;
+pub(super) const THREAD_DB_SCHEMA_VERSION: i64 = 15;
 pub(super) const WAL_AUTOCHECKPOINT_PAGES: i64 = 4000;
 pub(super) const WAL_JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
 
@@ -142,6 +142,7 @@ impl super::store::ThreadManager {
         Self::ensure_agent_conversation_notebook_id_column(conn)?;
         Self::ensure_agent_conversation_schema(conn)?;
         Self::ensure_thread_user_flags_columns(conn)?;
+        Self::ensure_thread_mobile_ctx_column(conn)?;
         Self::migrate_agent_external_events_table(conn)?;
         Self::ensure_agent_external_event_key_column(conn)?;
         Self::ensure_agent_external_event_metadata_columns(conn)?;
@@ -436,6 +437,28 @@ impl super::store::ThreadManager {
         if !columns.iter().any(|column| column == "archived") {
             conn.execute(
                 "ALTER TABLE threads ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// D2 手机上下文注入水位：threads 表记录最近一次注入进 provider
+    /// runtime 的手机消息时间戳（毫秒）。桌面续聊时只注入水位之后的
+    /// 新消息；runtime 接受 run 后推进。列值仅桌面本地使用，不上云。
+    fn ensure_thread_mobile_ctx_column(conn: &Connection) -> Result<(), ThreadError> {
+        let mut stmt = conn.prepare("PRAGMA table_info(threads)")?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        if !columns
+            .iter()
+            .any(|column| column == "mobile_ctx_injected_at")
+        {
+            conn.execute(
+                "ALTER TABLE threads ADD COLUMN mobile_ctx_injected_at INTEGER NOT NULL DEFAULT 0",
                 [],
             )?;
         }

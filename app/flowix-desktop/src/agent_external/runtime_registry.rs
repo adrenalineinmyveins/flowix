@@ -22,7 +22,7 @@ use super::mobile::{MobileChatManager, AGENT_TYPE as MOBILE_AGENT_TYPE};
 use super::opencode::{OpenCodeAcpManager, AGENT_TYPE as OPENCODE_AGENT_TYPE};
 use super::pi::{PiRpcManager, AGENT_TYPE as PI_AGENT_TYPE};
 use crate::agent_wire::{AgentUserMessage, RunInfo};
-use tauri::Listener;
+use tauri::{Listener, Manager};
 
 const HERMES_AGENT_TYPE: &str = "hermes";
 
@@ -232,6 +232,33 @@ impl Drop for ThreadProtection {
     }
 }
 
+/// D2：把手机端水位之后的新消息（云同步 apply 落 thread_messages）以
+/// marker 块拼进 `llm_content`（用户消息在前、块在后）；`content`
+/// 展示字段不动。无待注入消息返回 `None`；有则返回应推进到的新水位。
+async fn inject_mobile_context(
+    app_handle: &tauri::AppHandle,
+    thread_id: &str,
+    message: &mut AgentUserMessage,
+) -> Result<Option<i64>, String> {
+    let state = app_handle
+        .try_state::<crate::app::state::AppState>()
+        .ok_or_else(|| "app state unavailable".to_string())?;
+    let (entries, new_watermark) = state
+        .thread_manager
+        .provider_runtime_pending_mobile_context(thread_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some(block) = crate::agent_wire::build_mobile_context_block(&entries) else {
+        return Ok(None);
+    };
+    let user_text = message
+        .llm_content
+        .clone()
+        .unwrap_or_else(|| message.content.clone());
+    message.llm_content = Some(format!("{user_text}\n\n{block}"));
+    Ok(Some(new_watermark))
+}
+
 impl ExternalRuntimeRegistry {
     /// Accept one ordinary run before calling a provider. The watch sender is
     /// owned by a supervisor task, so losing the IPC waiter cannot start the
@@ -245,6 +272,25 @@ impl ExternalRuntimeRegistry {
     ) -> Result<String, String> {
         let run_id = super::shared::resolve_run_id(thread_id, message.run_id.as_deref());
         message.run_id = Some(run_id.clone());
+        // D2：provider runtime（DSH/codex/opencode）续聊前注入手机端
+        // 消息。runtime 的权威历史不含云同步 apply 落下的手机消息
+        // （thread_bridge 过滤），不注入则模型缺失跨端上下文。失败仅
+        // 告警不阻塞发送；注入内容计入下方 fingerprint（幂等键完整）。
+        let mut injected_watermark: Option<i64> = None;
+        if matches!(
+            runtime,
+            ExternalRuntimeKind::Codex
+                | ExternalRuntimeKind::DeepSeekHarness
+                | ExternalRuntimeKind::OpenCode
+        ) {
+            match inject_mobile_context(app_handle, thread_id, &mut message).await {
+                Ok(Some(watermark)) => injected_watermark = Some(watermark),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(thread_id, "mobile context injection skipped: {error}")
+                }
+            }
+        }
         let encoded = serde_json::to_vec(&message).map_err(|error| error.to_string())?;
         let fingerprint: [u8; 32] = Sha256::digest(encoded).into();
         let thread_key = thread_id.to_string();
@@ -431,7 +477,25 @@ impl ExternalRuntimeRegistry {
                     request.result.send_replace(Some(result));
                 }
             });
-            return wait_for_accepted_result(receiver).await;
+            let result = wait_for_accepted_result(receiver).await;
+            // D2：runtime 已接受本次 run（注入内容随 turn 进入 runtime 存储），
+            // 推进水位。推进失败仅告警——下次发送会重复注入同一批消息，
+            // 模型侧可容忍（内容重复但语义一致），不阻断会话。
+            if let (true, Some(watermark)) = (result.is_ok(), injected_watermark) {
+                if let Some(state) = app_handle.try_state::<crate::app::state::AppState>() {
+                    if let Err(error) = state
+                        .thread_manager
+                        .advance_mobile_ctx_injected_at(thread_id, watermark)
+                        .await
+                    {
+                        tracing::warn!(
+                            thread_id,
+                            "mobile context watermark advance failed: {error}"
+                        );
+                    }
+                }
+            }
+            return result;
         }
     }
 

@@ -1346,8 +1346,16 @@ impl DeepSeekHarnessManager {
             serde_json::from_value(value)
                 .map_err(|error| format!("invalid DSH session history response: {error}"))
         })?;
+        let mut messages = page.messages;
+        // D2：runtime 存储的 userMessage 含注入的手机上下文块，投影出口
+        // 统一剥离，只保留用户原文（与实时回显一致）。
+        for message in &mut messages {
+            if message.role == "user" {
+                message.content = crate::agent_wire::strip_mobile_context(&message.content);
+            }
+        }
         Ok(ThreadMessagesPage {
-            messages: page.messages,
+            messages,
             oldest_sequence: page.oldest_sequence,
             has_more: page.has_more,
             snapshot_sequence: Some(page.snapshot_sequence),

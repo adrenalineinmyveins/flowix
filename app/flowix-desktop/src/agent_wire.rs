@@ -471,3 +471,80 @@ impl AgentChunk {
         }
     }
 }
+
+/// D2 手机上下文注入 marker：provider runtime（DSH/codex/opencode）的
+/// 会话权威历史在 runtime 自有存储，云同步 apply 落到桌面
+/// `thread_messages` 的只有其他端（手机）消息。桌面续聊时 runtime 并
+/// 不知道这些消息，发送前把「水位之后」的手机消息以该 marker 块拼进
+/// `llm_content`（用户消息在前、块在后）。runtime 会把完整输入存进
+/// 自己的历史并回显/投影，所有展示与上云出口必须用
+/// [`strip_mobile_context`] 剥掉尾部块，只保留用户原文。
+pub const MOBILE_CONTEXT_MARKER: &str = "<flowix-mobile-context>";
+
+/// 剥离尾部手机上下文块（从 marker 首次出现处截断）。无 marker 时原样
+/// 返回。与 codex/opencode 既有 `visible_user_text` 的截断语义一致。
+pub fn strip_mobile_context(text: &str) -> String {
+    match text.find(MOBILE_CONTEXT_MARKER) {
+        Some(pos) => text[..pos].trim_end().to_string(),
+        None => text.to_string(),
+    }
+}
+
+/// 把水位之后的手机消息（(role, content) 对，按时间升序）格式化为注入
+/// 块。空输入返回 `None`（调用方跳过注入，不动 `llm_content`）。
+pub fn build_mobile_context_block(entries: &[(String, String)]) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+    let mut block = String::from(MOBILE_CONTEXT_MARKER);
+    block.push_str(
+        "\n以下是用户通过 Flowix 手机端在本会话的续聊记录。你的会话存储中没有这段历史，\
+         作为上下文补充，按时间先后排列：\n",
+    );
+    for (role, content) in entries {
+        let label = if role == "assistant" { "助手" } else { "用户" };
+        for line in content.lines() {
+            block.push_str(&format!("[{label}] {line}\n"));
+        }
+    }
+    block.push_str("</flowix-mobile-context>");
+    Some(block)
+}
+
+#[cfg(test)]
+mod mobile_context_tests {
+    use super::*;
+
+    #[test]
+    fn strip_removes_trailing_block() {
+        let text = "继续上面的任务\n\n<flowix-mobile-context>\n[用户] 手机消息\n</flowix-mobile-context>";
+        assert_eq!(strip_mobile_context(text), "继续上面的任务");
+    }
+
+    #[test]
+    fn strip_keeps_text_without_marker() {
+        assert_eq!(strip_mobile_context("普通消息"), "普通消息");
+        // marker 出现在消息正文中（用户手输）也按截断处理，与 workspace
+        // context marker 的既有语义一致。
+        let mixed = "a<flowix-mobile-context>b";
+        assert_eq!(strip_mobile_context(mixed), "a");
+    }
+
+    #[test]
+    fn build_block_formats_roles() {
+        let block = build_mobile_context_block(&[
+            ("user".into(), "手机问".into()),
+            ("assistant".into(), "手机答".into()),
+        ])
+        .unwrap();
+        assert!(block.starts_with(MOBILE_CONTEXT_MARKER));
+        assert!(block.ends_with("</flowix-mobile-context>"));
+        assert!(block.contains("[用户] 手机问"));
+        assert!(block.contains("[助手] 手机答"));
+    }
+
+    #[test]
+    fn build_block_skips_empty_entries() {
+        assert!(build_mobile_context_block(&[]).is_none());
+    }
+}

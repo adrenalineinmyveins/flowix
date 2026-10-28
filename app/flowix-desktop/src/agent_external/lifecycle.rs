@@ -165,9 +165,12 @@ fn user_message_chunk(thread_id: &str, message: &AgentUserMessage, run_id: &str)
     AgentChunk::UserMessage {
         thread_id: thread_id.to_string(),
         id: format!("user-{run_id}"),
+        // D2：llm_content 可能含注入的手机上下文块（用户消息在前），
+        // 展示层剥离 marker，只保留用户原文。
         text: message
             .llm_content
-            .clone()
+            .as_deref()
+            .map(crate::agent_wire::strip_mobile_context)
             .unwrap_or_else(|| message.content.clone()),
         timestamp: chrono::Utc::now().timestamp_millis(),
         attachments: message.message_attachments(),

@@ -506,6 +506,9 @@ pub fn adapt_event(message: &Value, delivery_thread_id: &str) -> AdaptedEvent {
                 if method == "item/completed" && item_type == "userMessage" {
                     let text =
                         app_server_content_text(item.get("content").or_else(|| item.get("text")));
+                    // D2：剥离注入的手机上下文块，回显只保留用户原文
+                    //（手机消息已由云同步 apply 落库显示，防重复）。
+                    let text = crate::agent_wire::strip_mobile_context(&text);
                     let message_type = item.get("messageType").and_then(Value::as_str).and_then(
                         |value| match value {
                             "goal-round" => Some("goal-round"),

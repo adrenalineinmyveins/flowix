@@ -492,7 +492,12 @@ pub(super) fn codex_message_type(item: &Value) -> Option<&'static str> {
 }
 
 pub(super) fn visible_user_text(content: &str) -> String {
-    const MARKERS: [&str; 2] = ["<## context prompt ##>", "[flowix workspace context]"];
+    const MARKERS: [&str; 3] = [
+        "<## context prompt ##>",
+        "[flowix workspace context]",
+        // D2 手机上下文注入块（用户消息在前、块在后，截断语义一致）
+        crate::agent_wire::MOBILE_CONTEXT_MARKER,
+    ];
     let normalized = content.to_ascii_lowercase();
     let end = MARKERS
         .iter()

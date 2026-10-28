@@ -26,6 +26,11 @@ use std::sync::Arc;
 const CLOUD_TOOL_DATA_LIMIT_BYTES: usize = 64 * 1024;
 const CLOUD_TOOL_DATA_TRUNCATED_SUFFIX: &str = "\n[truncated for cloud sync]";
 
+/// D2 手机上下文注入预算：单次注入最多携带的消息条数与总字符数
+/// （超限从最旧截断；水位仍推进到全部待注入消息的最大值）。
+const MOBILE_CONTEXT_MAX_MESSAGES: usize = 50;
+const MOBILE_CONTEXT_MAX_CHARS: usize = 24_000;
+
 /// 消息 timestamp（TEXT，前端多为 ISO/RFC3339，历史数据可能为毫秒数字
 /// 字符串）→ 毫秒。解析失败回退 0（排序退化为 id 序，不炸同步）。
 pub(crate) fn message_timestamp_to_millis(timestamp: &str) -> i64 {
@@ -393,6 +398,86 @@ impl ThreadManager {
         })
         .await
     }
+
+    /// D2：读取 provider runtime 线程待注入的手机消息。该类线程的
+    /// thread_messages 行全部来自云同步 apply（其他端续聊；runtime 历史
+    /// 在 apply 侧被过滤不落本表，见 thread_bridge）。返回
+    /// `mobile_ctx_injected_at` 水位之后的消息（sequence 升序，超预算
+    /// 从最旧截断）与应推进到的新水位（全部待注入消息的最大
+    /// created_at 毫秒；无待注入时为 0）。
+    pub(crate) async fn provider_runtime_pending_mobile_context(
+        self: &Arc<Self>,
+        local_thread_id: &str,
+    ) -> Result<(Vec<(String, String)>, i64), ThreadError> {
+        let local_thread_id = local_thread_id.to_string();
+        self.run_blocking(move |tm| {
+            let conn = tm.lock_conn();
+            let watermark: i64 = conn
+                .query_row(
+                    "SELECT mobile_ctx_injected_at FROM threads WHERE thread_id = ?1",
+                    [&local_thread_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            let mut stmt = conn.prepare(
+                "SELECT role, content, timestamp FROM thread_messages
+                 WHERE thread_id = ?1 ORDER BY sequence",
+            )?;
+            let rows = stmt
+                .query_map([&local_thread_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(stmt);
+            let mut pending: Vec<(String, String)> = Vec::new();
+            let mut new_watermark = 0_i64;
+            for (role, content, timestamp) in rows {
+                let millis = message_timestamp_to_millis(&timestamp);
+                if millis <= watermark {
+                    continue;
+                }
+                new_watermark = new_watermark.max(millis);
+                pending.push((role, content));
+            }
+            // 预算截断只影响注入内容（旧消息放弃），水位仍推进到最大值
+            while pending.len() > MOBILE_CONTEXT_MAX_MESSAGES {
+                pending.remove(0);
+            }
+            while pending.len() > 1 {
+                let total: usize = pending.iter().map(|(_, content)| content.len()).sum();
+                if total <= MOBILE_CONTEXT_MAX_CHARS {
+                    break;
+                }
+                pending.remove(0);
+            }
+            Ok((pending, new_watermark))
+        })
+        .await
+    }
+
+    /// D2：runtime 接受 run 后推进注入水位。仅取 max（不回退），避免
+    /// 并发 apply 的旧值覆盖。
+    pub(crate) async fn advance_mobile_ctx_injected_at(
+        self: &Arc<Self>,
+        local_thread_id: &str,
+        watermark_ms: i64,
+    ) -> Result<(), ThreadError> {
+        let local_thread_id = local_thread_id.to_string();
+        self.run_blocking(move |tm| {
+            let conn = tm.lock_conn();
+            conn.execute(
+                "UPDATE threads SET mobile_ctx_injected_at = MAX(mobile_ctx_injected_at, ?2)
+                 WHERE thread_id = ?1",
+                params![local_thread_id, watermark_ms],
+            )?;
+            Ok(())
+        })
+        .await
+    }
 }
 
 fn read_thread_head(conn: &Connection, local_thread_id: &str) -> Result<Option<ThreadHead>, ThreadError> {
@@ -443,11 +528,13 @@ fn read_thread_messages_as_v2(
 
 /// DSH 原生历史 ChatMessage → 云消息。id 用 DSH 稳定消息 id
 /// （`message-*` / `call_*`，S1 实测重读稳定），是 union merge 幂等键。
+/// content 剥离 D2 手机上下文 marker 块（runtime 历史出口已剥，此处
+/// 兜底存量与直读路径），防止手机端收到拼接块。
 fn chat_message_to_v2(message: &ChatMessage) -> V2ThreadMessage {
     V2ThreadMessage {
         id: message.id.clone(),
         role: message.role.clone(),
-        content: message.content.clone(),
+        content: crate::agent_wire::strip_mobile_context(&message.content),
         reasoning: message.reasoning.clone(),
         tool_name: message.tool_name.clone(),
         tool_input: message.tool_input.as_ref().map(|value| value.to_string()),
@@ -791,6 +878,99 @@ mod tests {
         assert_eq!(projected.title, "移动端会话");
         assert_eq!(projected.messages.len(), 1);
         assert_eq!(projected.agent_id, "builtin.chat");
+    }
+
+    /// D2：provider runtime 线程的手机消息按注入水位增量读取，runtime
+    /// 接受 run 后推进水位，之后的查询不再返回旧消息（不重复注入）。
+    #[tokio::test]
+    async fn mobile_context_watermark_gates_pending_messages() {
+        let manager = ThreadManager::for_tests();
+        let payload = V2ThreadPayload {
+            version: 1,
+            thread_id: "th_thread_dsh_sync".into(),
+            agent_id: "deepseek-harness".into(),
+            title: "跨端会话".into(),
+            created_at: 1,
+            messages: vec![
+                V2ThreadMessage {
+                    id: "mob_1".into(),
+                    role: "user".into(),
+                    content: "手机问".into(),
+                    reasoning: None,
+                    tool_name: None,
+                    tool_input: None,
+                    tool_data: None,
+                    created_at: 100,
+                    origin: Some("mobile".into()),
+                    attachments: Vec::new(),
+                },
+                V2ThreadMessage {
+                    id: "mob_2".into(),
+                    role: "assistant".into(),
+                    content: "手机答".into(),
+                    reasoning: None,
+                    tool_name: None,
+                    tool_input: None,
+                    tool_data: None,
+                    created_at: 200,
+                    origin: Some("mobile".into()),
+                    attachments: Vec::new(),
+                },
+            ],
+            starred: false,
+            archived: false,
+        };
+        manager.upsert_thread_from_cloud(&payload).await.unwrap();
+
+        // 初始水位 0：两条全部待注入，新水位 = 最大 created_at
+        let (pending, watermark) = manager
+            .provider_runtime_pending_mobile_context("thread_dsh_sync")
+            .await
+            .unwrap();
+        assert_eq!(
+            pending,
+            vec![
+                ("user".to_string(), "手机问".to_string()),
+                ("assistant".to_string(), "手机答".to_string()),
+            ]
+        );
+        assert_eq!(watermark, 200);
+
+        // runtime 接受 run 后推进 → 之后无待注入
+        manager
+            .advance_mobile_ctx_injected_at("thread_dsh_sync", watermark)
+            .await
+            .unwrap();
+        let (pending, watermark) = manager
+            .provider_runtime_pending_mobile_context("thread_dsh_sync")
+            .await
+            .unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(watermark, 0);
+
+        // 水位只进不退（并发 apply 旧值不覆盖）
+        manager
+            .advance_mobile_ctx_injected_at("thread_dsh_sync", 100)
+            .await
+            .unwrap();
+        let (pending, _) = manager
+            .provider_runtime_pending_mobile_context("thread_dsh_sync")
+            .await
+            .unwrap();
+        assert!(pending.is_empty());
+    }
+
+    /// D2：投影上云出口剥离注入 marker 块（防手机端收到拼接块）。
+    #[test]
+    fn chat_message_to_v2_strips_mobile_context_marker() {
+        let injected = message(
+            "m1",
+            "user",
+            "桌面继续\n\n<flowix-mobile-context>\n[用户] 手机问\n</flowix-mobile-context>",
+            "2026-10-27T00:00:00Z",
+        );
+        let projected = chat_message_to_v2(&injected);
+        assert_eq!(projected.content, "桌面继续");
     }
 
     #[test]

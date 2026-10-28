@@ -265,6 +265,8 @@ pub fn chunks_from_message(
         .map(str::to_string);
     match update.get("sessionUpdate").and_then(Value::as_str) {
         Some("user_message_chunk") => content_text(update)
+            // D2：剥离注入的手机上下文块，回显只保留用户原文。
+            .map(|text| crate::agent_wire::strip_mobile_context(&text))
             .map(|text| AgentChunk::UserMessage {
                 thread_id: thread_id.to_string(),
                 id: provider_message_id

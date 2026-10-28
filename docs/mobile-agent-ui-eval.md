@@ -45,9 +45,15 @@
 （migrations v14），apply 落列（云端真源）、投影读列回推。实测：手机收藏 → 桌面落列
 starred=1 → 投影 clean 收敛（云端保持 true）→ 手机视图正常。
 
-### D2【产品断层·P1】手机续聊不进桌面 runtime 上下文
+### D2【产品断层·P1】手机续聊不进桌面 runtime 上下文 —— ✅ 已修复（方案 a：发送前注入）
 手机在 harness/codex/opencode 会话续聊：消息进云端与桌面 `thread_messages`（桌面 UI 能显示），但 **runtime session（DSH 等）不含这些消息**——桌面端继续对话时，runtime 以自己的 session 历史为上下文，**看不到手机说过什么**，出现语义断层。
-**修复方向**（两选一）：a) 桌面发送前把云端新增消息（origin≠desktop）注入 runtime 上下文（prompt 拼接）；b) 手机端对 provider runtime 会话标记「轻跟进」并禁续聊输入（保守）。涉及桌面 runtime 桥，建议单独立项评估。
+
+修复（方案 a，桌面侧单端实现，手机零改动）：
+- **注入**：`dispatch_chat` 对 provider runtime（DSH/codex/opencode）在发送前查 `thread_messages` 水位之后的手机消息，格式化为 `<flowix-mobile-context>` marker 块拼进 `llm_content`（用户消息在前、块在后；`content` 展示字段不动）。三 runtime 的 LLM 输入均优先 `llm_content`，无需各自改动。
+- **水位**：threads 表加 `mobile_ctx_injected_at`（migrations v15）；runtime 接受 run 后推进到已注入消息最大 created_at（MAX 不回退）。预算：单次 ≤50 条 / ≤24k 字符（超限从最旧截断，水位仍推进）。
+- **剥离**（防 UI/云端重复）：7 处出口统一 `strip_mobile_context`——DSH 实时回显（protocol）、DSH 历史投影（session_history_page 出口）、codex `visible_user_text` MARKERS、opencode 历史 `visible_user_text` MARKERS、opencode 实时回显、乐观 emit（`user_message_chunk`）、云投影（`chat_message_to_v2`）。
+
+实测（DSH 会话，桌面问「我刚才在手机上连发了哪条消息」）：DSH session 事件 `agent/inbox/spliced` 含完整 marker 块（4 条手机消息）；模型回复精确引用手机消息原文「继续预测下午去情况」；水位推进至手机最后消息 created_at。单测 6 项（拼接/剥离/水位/幂等）+ 回归 300+ 全过。
 
 ### D3【性能·P1】长会话全量拉取渲染 —— ✅ 已修复
 新增 `agent_thread_messages_page`（(createdAt,id) 双键游标分页，旧全量命令保留兼容）；
@@ -78,6 +84,7 @@ claude / hermes（消息在 `agent_external_events`）与 pi 的会话未纳入�
 - 幽灵分叉死锁无自愈（磁盘≠基线且无 dirty 时 apply 永远报错；本次事故即其变体：**有 dirty + 无基线 + bootstrap 纯拉取**组合死锁）
 - 桌面 dev 依赖 `FLOWIX_CLOUD_API_BASE` 环境变量，漏设静默回退官方云（本次事故根因之一，建议默认值或显式警告）
 - 首页 merge 时序局限：桌面在手机消息之后产生更新消息时，手机消息显示位置略偏（仅显示层，已注释说明）
+- **DSH session/history wire 读空**（D2 验证时发现）：桌面 dev 重启后 wire `session/history` 对已有 session 返回空 messages（`oldestSequence=1` 反证 host 侧 pageRange `end=0`）；磁盘 session 文件（`session.v4.jsonl.zstd`，63 行事件）完好。伴随线索：会话曾于续聊时被静默重建（threads_dsh 映射指向新 session、`titleInput.first` 重新 seed），疑似 host 侧 session 桶按 cwd 编码（`Loop--` vs `Loop---`）读写漂移。影响：DSH 会话历史 UI 读页与云投影（read_all 同源）拿不到 runtime 历史。D2 注入/回复不受影响（走 turn 输入路径）。待按 host 源码（`session-query-service.js` / `SessionRepository`）专项排查。
 
 ## 4. 优先级建议
 

@@ -485,7 +485,12 @@ fn tool_message(id: String, part: &Value, timestamp: i64) -> ChatMessage {
 }
 
 fn visible_user_text(content: &str) -> String {
-    const MARKERS: [&str; 2] = ["\n<## CONTEXT PROMPT ##>", "\n\n[Flowix workspace context]"];
+    const MARKERS: [&str; 3] = [
+        "\n<## CONTEXT PROMPT ##>",
+        "\n\n[Flowix workspace context]",
+        // D2 手机上下文注入块（用户消息在前、块在后，截断语义一致）
+        crate::agent_wire::MOBILE_CONTEXT_MARKER,
+    ];
     let end = MARKERS
         .iter()
         .filter_map(|marker| content.find(marker))
