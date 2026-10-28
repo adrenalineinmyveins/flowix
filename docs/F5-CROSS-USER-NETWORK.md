@@ -130,7 +130,14 @@ receiptId 去重）。
 | M4 | 客户端 v2 契约：命名空间寻址 + Ed25519 签名/验签 + usage UI | ✅ 2026-10-19（wire 加可选 signature 字段（旧端忽略）；确认门通过时出站签名随档固化（byte-equal）；中继经目录信任锚验签（篡改 422 SIGNATURE_INVALID、无锚放行）；入站验签结论随留档；inbox_register 账号命名空间归一；usage 面板；v1 全链零回退（roundtrip 2 测 + relay 29 测） |
 | M5 | 跨用户真机往返：两账号 × 两设备 × 云端中继 | ✅ 本机模拟验收 2026-10-19（`tests/cross_user_m5.rs`：双账号 + 命名空间 agent + 互为信任锚目录卡 → 签名咨询投递 → 收件 verified → 回程 hops 递减 verified → 匿名配额 429 留档可重试 → usage 端点；byte-equal 含签名块断言）。**✅ 云端真中继复跑 2026-10-20**（见 §8.1 部署记录） |
 
-### 8.1 云端部署记录（2026-10-20，8.160.162.251）
+### 8.1 云端部署记录（2026-10-20，8.160.162.251；**重部署 2026-10-28**）
+
+> **2026-10-28 重部署**：同步 FD-11 P2（reports/usage_daily/get_events SSE/联邦一跳）
+> 与 FD-12 M4（目录卡 `autoAnswer` 能力位，旧客户端缺省 off 兼容）。精简源码包
+> 65KB（flowix-relay + 精简 workspace Cargo.toml + 全量 Cargo.lock + 阿里云镜像
+> config）scp 上传 → `/root/relay-build` 冷编（新 target，约 13 分钟）→
+> `install -Dm755` 覆盖 `/opt/flowix-relay/flowix-relay` → `systemctl restart`。
+> `/v2/events` 无 token 401 确认 P2 SSE 端点在线；cross_user_m5 云端复跑验收。
 
 - 服务器：阿里云 ECS（Alibaba Cloud Linux 3，2C/3.5G，与 flowix-cloud 8787 同机）
 - 构建：服务器原生构建（精简 workspace 源码包 53KB scp 上传，`cargo build --release` 3m17s）。
