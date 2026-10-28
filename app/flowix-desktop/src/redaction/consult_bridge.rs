@@ -82,11 +82,10 @@ pub fn ensure_started(app: tauri::AppHandle) {
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
-                    let app = app.clone();
-                    let token = token.clone();
-                    tauri::async_runtime::spawn(async move {
-                        handle_connection(stream, &app, &token).await;
-                    });
+                    // 一期内联处理（低频：每次工具调用一个连接）；嵌套
+                    // spawn（tokio/tauri::async_runtime 均试）在本环境
+                    // 不执行，待查后再放开并发。
+                    handle_connection(stream, &app, &token).await;
                 }
                 Err(error) => {
                     tracing::warn!("consult bridge accept failed: {error}");
