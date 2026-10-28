@@ -7,7 +7,9 @@
 > - apply 回放时 dsh 线程**过滤 origin=desktop 消息**不落 thread_messages
 >   （权威在 DSH host；否则堆积历史副本、UI merge 重复显示）
 > - S4 读路径 merge 采用「首页追加本地尾巴 + 按 id 去重」，分页游标不动
-> 范围：仅 deepseek-harness；codex / opencode 架构同构，验证后再复制
+> 范围：deepseek-harness 已实施验证；codex / opencode 已按同构泛化覆盖
+> （provider_runtime_* 参数化路径，本机暂无实测会话，待真实使用时自然验证）；
+> journal 模式 runtime（claude / hermes）与 pi 不在范围
 > 前置：手机端线程 id 归一已落地（b47b8eb5），手机侧无需再改动
 
 ## 1. 背景

@@ -3,14 +3,16 @@
 //! - 出向：`thread_payload_for_cloud` 把 threads + thread_messages 投影成
 //!   整线程 JSON（消息按 (createdAt,id) 排序保证序列化确定性，使内容
 //!   哈希可作同步 fingerprint；tool_data 超限截断，R7 隐私/体积防线）。
-//!   harness（deepseek-harness）线程消息在 DSH 原生存储，出向走
-//!   `dsh_payload_for_cloud`（DSH 全量历史 ⋈ 本地表并集）。
+//!   provider 原生 runtime（deepseek-harness / codex / opencode）消息在
+//!   各自 runtime 存储，出向走 `provider_runtime_payload_for_cloud`
+//!   （runtime 全量历史 ⋈ 本地表并集）。
 //! - 入向：`upsert_thread_from_cloud` 幂等落库（消息按 id INSERT OR
 //!   IGNORE，新消息按序分配 sequence），与引擎 409 消解的两段式约定
-//!   （"桥接层 upsert 后 re-dirty"）配套。harness 线程 apply 时过滤
-//!   origin=desktop 历史不落本表（权威在 DSH host）。
+//!   （"桥接层 upsert 后 re-dirty"）配套。provider runtime 线程 apply
+//!   时过滤 origin=desktop 历史不落本表（权威在 runtime 侧）。
 //!
-//! codex / opencode / pi 等其余外部 runtime 尚不在同步范围。
+//! journal 模式 runtime（claude / hermes，消息在 agent_external_events）
+//! 与 pi 尚不在同步范围。
 
 use super::ThreadManager;
 use crate::agent_session::error::ThreadError;
@@ -144,64 +146,98 @@ impl ThreadManager {
         .await
     }
 
-    /// harness 线程增量扫描：`threads_dsh ⋈ threads`（`updated_at` 为准，
-    /// DSH 会话活动时同步推进；消息本体在 DSH 原生存储，不在
-    /// thread_messages，故不能用 `thread_ids_with_messages_since`）。
-    pub(crate) async fn dsh_thread_ids_since(
+    /// provider 原生 runtime 线程增量扫描（`threads_dsh/codex/opencode ⋈
+    /// threads`，`updated_at` 为准——这些 runtime 的消息本体在各自原生存储，
+    /// 不在 thread_messages，故不能用 `thread_ids_with_messages_since`）。
+    /// 返回 (thread_id, updated_at, runtime key)。
+    pub(crate) async fn provider_runtime_thread_ids_since(
         self: &Arc<Self>,
         cutoff_ms: i64,
-    ) -> Result<Vec<(String, i64)>, ThreadError> {
+    ) -> Result<Vec<(String, i64, String)>, ThreadError> {
         self.run_blocking(move |tm| {
             let conn = tm.lock_conn();
             let mut stmt = conn.prepare(
-                "SELECT t.thread_id, t.updated_at FROM threads_dsh d
-                 JOIN threads t ON t.thread_id = d.thread_id
+                "SELECT t.thread_id, t.updated_at, m.runtime FROM threads t
+                 JOIN (
+                     SELECT thread_id, 'deepseek-harness' AS runtime FROM threads_dsh
+                     UNION ALL
+                     SELECT thread_id, 'codex' FROM threads_codex
+                     UNION ALL
+                     SELECT thread_id, 'opencode' FROM threads_opencode
+                 ) m ON m.thread_id = t.thread_id
                  WHERE t.updated_at > ?1
                  ORDER BY t.updated_at",
             )?;
-            let rows = stmt
-                .query_map([cutoff_ms], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            let rows = stmt.query_map([cutoff_ms], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .await
     }
 
-    /// 全部 harness 线程 id（删除对账基准 + reconcile 分流依据）。
-    pub(crate) async fn all_dsh_thread_ids(self: &Arc<Self>) -> Result<Vec<String>, ThreadError> {
+    /// 全部 provider 原生 runtime 线程 id（删除对账基准 + reconcile 分流依据）。
+    pub(crate) async fn all_provider_runtime_thread_ids(
+        self: &Arc<Self>,
+    ) -> Result<Vec<String>, ThreadError> {
         self.run_blocking(move |tm| {
             let conn = tm.lock_conn();
-            let mut stmt = conn.prepare("SELECT thread_id FROM threads_dsh")?;
+            let mut stmt = conn.prepare(
+                "SELECT thread_id FROM threads_dsh
+                 UNION SELECT thread_id FROM threads_codex
+                 UNION SELECT thread_id FROM threads_opencode",
+            )?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .await
     }
 
-    pub(crate) async fn is_dsh_thread(
+    /// 线程所属 provider 原生 runtime（未命中返回 None）。
+    pub(crate) async fn provider_runtime_of(
         self: &Arc<Self>,
         local_thread_id: &str,
-    ) -> Result<bool, ThreadError> {
+    ) -> Result<Option<String>, ThreadError> {
         let local_thread_id = local_thread_id.to_string();
         self.run_blocking(move |tm| {
             let conn = tm.lock_conn();
-            let found: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM threads_dsh WHERE thread_id = ?1)",
-                [&local_thread_id],
-                |row| row.get(0),
-            )?;
-            Ok(found)
+            let runtime = conn
+                .query_row(
+                    "SELECT runtime FROM (
+                         SELECT thread_id, 'deepseek-harness' AS runtime FROM threads_dsh
+                         UNION ALL
+                         SELECT thread_id, 'codex' FROM threads_codex
+                         UNION ALL
+                         SELECT thread_id, 'opencode' FROM threads_opencode
+                     ) WHERE thread_id = ?1 LIMIT 1",
+                    [&local_thread_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(runtime)
         })
         .await
     }
 
-    /// harness 出向投影：DSH 全量历史 ⋈ 本地 thread_messages（按 id 并集）。
-    /// 云端线程实体是整包 last-writer-wins：桌面必须推并集，否则手机
-    /// 续聊消息会被桌面投影从云端抹掉（push 震荡）。本地行只有其他端
-    /// 消息（DSH 历史在 apply 侧过滤不落本表），与 DSH 历史 id 无交集。
-    pub(crate) async fn dsh_payload_for_cloud(
+    pub(crate) async fn is_provider_runtime_thread(
         self: &Arc<Self>,
         local_thread_id: &str,
-        dsh_messages: Vec<ChatMessage>,
+    ) -> Result<bool, ThreadError> {
+        Ok(self
+            .provider_runtime_of(local_thread_id)
+            .await?
+            .is_some())
+    }
+
+    /// provider 原生 runtime 出向投影：runtime 全量历史 ⋈ 本地
+    /// thread_messages（按 id 并集）。云端线程实体是整包
+    /// last-writer-wins：桌面必须推并集，否则手机续聊消息会被桌面
+    /// 投影从云端抹掉（push 震荡）。本地行只有其他端消息（runtime
+    /// 历史在 apply 侧过滤不落本表），与 runtime 历史 id 无交集。
+    pub(crate) async fn provider_runtime_payload_for_cloud(
+        self: &Arc<Self>,
+        local_thread_id: &str,
+        provider_messages: Vec<ChatMessage>,
     ) -> Result<Option<V2ThreadPayload>, ThreadError> {
         let local_thread_id = local_thread_id.to_string();
         self.run_blocking(move |tm| {
@@ -209,9 +245,11 @@ impl ThreadManager {
             let Some(head) = read_thread_head(&conn, &local_thread_id)? else {
                 return Ok(None);
             };
-            let mut dsh_messages: Vec<V2ThreadMessage> =
-                dsh_messages.iter().map(chat_message_to_v2).collect();
-            dsh_messages.sort_by(|left, right| {
+            let mut provider_messages: Vec<V2ThreadMessage> = provider_messages
+                .iter()
+                .map(chat_message_to_v2)
+                .collect();
+            provider_messages.sort_by(|left, right| {
                 (left.created_at, &left.id).cmp(&(right.created_at, &right.id))
             });
             let payload = V2ThreadPayload {
@@ -220,7 +258,7 @@ impl ThreadManager {
                 agent_id: head.agent_id,
                 title: head.title,
                 created_at: head.created_at,
-                messages: dsh_messages,
+                messages: provider_messages,
                 starred: false,
                 archived: false,
             };
@@ -491,18 +529,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dsh_scan_and_projection_unions_local_rows() {
+    async fn provider_runtime_scan_and_projection_unions_local_rows() {
         let manager = ThreadManager::for_tests();
         let thread = manager
             .create_thread(AgentId("deepseek-harness".into()), "税务".into())
             .await
             .unwrap();
-        // 登记 harness 映射（threads_dsh）
+        let codex_thread = manager
+            .create_thread(AgentId("codex".into()), "codex 会话".into())
+            .await
+            .unwrap();
+        // 登记 runtime 映射（dsh + codex 两张表）
         {
             let conn = manager.lock_conn();
             conn.execute(
                 "INSERT INTO threads_dsh (thread_id, external_id) VALUES (?1, ?2)",
                 params![thread.thread_id, "session-test"],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO threads_codex (thread_id, external_id) VALUES (?1, ?2)",
+                params![codex_thread.thread_id, "codex-rollout-1"],
             )
             .unwrap();
         }
@@ -515,25 +562,38 @@ mod tests {
             .await
             .unwrap();
 
-        let ids = manager.dsh_thread_ids_since(0).await.unwrap();
-        assert!(
-            ids.iter().any(|(id, _)| id == &thread.thread_id),
-            "dsh 增量扫描命中"
-        );
-        assert!(manager.is_dsh_thread(&thread.thread_id).await.unwrap());
-        assert!(manager
-            .all_dsh_thread_ids()
-            .await
-            .unwrap()
-            .contains(&thread.thread_id));
+        let ids = manager.provider_runtime_thread_ids_since(0).await.unwrap();
+        let dsh_hit = ids
+            .iter()
+            .find(|(id, _, runtime)| id == &thread.thread_id && runtime == "deepseek-harness")
+            .expect("dsh 增量扫描命中并携带 runtime");
+        assert_eq!(dsh_hit.0, thread.thread_id);
+        let codex_hit = ids
+            .iter()
+            .find(|(id, _, runtime)| id == &codex_thread.thread_id && runtime == "codex")
+            .expect("codex 增量扫描命中并携带 runtime");
+        assert_eq!(codex_hit.0, codex_thread.thread_id);
 
-        // DSH 历史两条 → 投影为 3 条并集（云端整包语义：推并集防抹掉手机消息）
-        let dsh = vec![
+        assert_eq!(
+            manager.provider_runtime_of(&thread.thread_id).await.unwrap(),
+            Some("deepseek-harness".to_string())
+        );
+        assert_eq!(
+            manager.provider_runtime_of(&codex_thread.thread_id).await.unwrap(),
+            Some("codex".to_string())
+        );
+        assert!(manager.is_provider_runtime_thread(&thread.thread_id).await.unwrap());
+        let all_ids = manager.all_provider_runtime_thread_ids().await.unwrap();
+        assert!(all_ids.contains(&thread.thread_id));
+        assert!(all_ids.contains(&codex_thread.thread_id));
+
+        // runtime 历史 + 本地行 → 投影为并集（云端整包语义：推并集防抹掉手机消息）
+        let provider = vec![
             message("message-a", "user", "桌面问", "2026-10-26T16:00:00+08:00"),
             message("call-x", "tool", "", "2026-10-26T16:00:01+08:00"),
         ];
         let payload = manager
-            .dsh_payload_for_cloud(&thread.thread_id, dsh.clone())
+            .provider_runtime_payload_for_cloud(&thread.thread_id, provider.clone())
             .await
             .unwrap()
             .expect("payload exists");
@@ -547,7 +607,7 @@ mod tests {
 
         // 确定性：重复投影哈希一致（fingerprint 语义前提）
         let again = manager
-            .dsh_payload_for_cloud(&thread.thread_id, dsh)
+            .provider_runtime_payload_for_cloud(&thread.thread_id, provider)
             .await
             .unwrap()
             .unwrap();

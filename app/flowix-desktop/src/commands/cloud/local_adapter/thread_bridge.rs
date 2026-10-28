@@ -7,10 +7,11 @@
 //!    比对——相同则 clean（apply 回写天然防回环），不同则
 //!    `record_v2_thread_change(Put)`（fingerprint 幂等，同 hash 不涨 generation）；
 //! 3. 云端有基线而本地无消息的线程 → 本地已删 → `Delete` 入队。
-//! 4. harness（deepseek-harness）线程消息在 DSH 原生存储：走
-//!    `dsh_thread_ids_since` 扫描 + `dsh_payload_for_cloud` 投影
-//!    （DSH 历史 ⋈ 本地表并集）；且必须绕开 thread_messages-only
-//!    投影，否则会以缺 DSH 历史的整包覆盖云端。
+//! 4. provider 原生 runtime（deepseek-harness / codex / opencode）线程
+//!    消息在各自 runtime 存储：走 `provider_runtime_thread_ids_since`
+//!    扫描 + `provider_runtime_payload_for_cloud` 投影（runtime 历史 ⋈
+//!    本地表并集）；且必须绕开 thread_messages-only 投影，否则会以
+//!    缺 runtime 历史的整包覆盖云端。
 //!
 //! 兜底调度：30s 账户 Poll 与笔记本活动触发的 pass 都会跑对账，消息
 //! 最迟 30s 上云（与 A4 验收窗口一致）。
@@ -44,11 +45,12 @@ pub(crate) async fn reconcile_thread_dirty_state(state: &AppState) -> Result<(),
             .map_err(|_| "thread bridge watermark poisoned".to_string())?;
         seen.values().copied().min().unwrap_or(0)
     };
-    // harness 分流依据：threads_dsh 线程统一走 DSH 投影，绕开
-    // thread_messages-only 路径（缺 DSH 历史的整包会覆盖云端）。
-    let dsh_ids: HashSet<String> = state
+    // provider runtime 分流依据：threads_dsh/codex/opencode 线程统一走
+    // runtime 投影，绕开 thread_messages-only 路径（缺 runtime 历史的
+    // 整包会覆盖云端）。
+    let provider_runtime_ids: HashSet<String> = state
         .thread_manager
-        .all_dsh_thread_ids()
+        .all_provider_runtime_thread_ids()
         .await
         .map_err(|e| e.to_string())?
         .into_iter()
@@ -60,8 +62,8 @@ pub(crate) async fn reconcile_thread_dirty_state(state: &AppState) -> Result<(),
         .map_err(|e| e.to_string())?;
     let mut refreshed = Vec::with_capacity(active.len());
     for (local_thread_id, updated_at) in active {
-        if dsh_ids.contains(&local_thread_id) {
-            // harness 线程在下方 dsh 对账统一处理（水位一并推进）
+        if provider_runtime_ids.contains(&local_thread_id) {
+            // provider runtime 线程在下方 runtime 对账统一处理（水位一并推进）
             continue;
         }
         let cloud_id = crate::agent_session::ThreadManager::cloud_thread_id(&local_thread_id);
@@ -91,32 +93,40 @@ pub(crate) async fn reconcile_thread_dirty_state(state: &AppState) -> Result<(),
         }
         refreshed.push((local_thread_id, updated_at));
     }
-    // harness 对账：投影 = DSH 全量历史 ⋈ 本地表并集。DSH host 读取
-    // 失败（如无法拉起）时跳过本轮，不阻断其余同步。
-    for (local_thread_id, updated_at) in state
+    // provider runtime 对账：投影 = runtime 全量历史 ⋈ 本地表并集。
+    // runtime host 读取失败（如无法拉起）时跳过本轮，不阻断其余同步。
+    for (local_thread_id, updated_at, runtime) in state
         .thread_manager
-        .dsh_thread_ids_since(watermark)
+        .provider_runtime_thread_ids_since(watermark)
         .await
         .map_err(|e| e.to_string())?
     {
-        let messages = match state
-            .agent_history
-            .read_all(ExternalRuntimeKind::DeepSeekHarness, &local_thread_id)
-            .await
-        {
+        let kind = match ExternalRuntimeKind::parse(&runtime) {
+            Ok(kind) => kind,
+            Err(error) => {
+                tracing::warn!(
+                    thread_id = %local_thread_id,
+                    runtime = %runtime,
+                    error = %error,
+                    "[thread-bridge] unknown provider runtime; skip this round"
+                );
+                continue;
+            }
+        };
+        let messages = match state.agent_history.read_all(kind, &local_thread_id).await {
             Ok(messages) => messages,
             Err(error) => {
                 tracing::warn!(
                     thread_id = %local_thread_id,
                     error = %error,
-                    "[thread-bridge] dsh history read failed; skip this round"
+                    "[thread-bridge] provider runtime history read failed; skip this round"
                 );
                 continue;
             }
         };
         let Some(payload) = state
             .thread_manager
-            .dsh_payload_for_cloud(&local_thread_id, messages)
+            .provider_runtime_payload_for_cloud(&local_thread_id, messages)
             .await
             .map_err(|e| e.to_string())?
         else {
@@ -147,7 +157,7 @@ pub(crate) async fn reconcile_thread_dirty_state(state: &AppState) -> Result<(),
     }
 
     // 删除对账：云端基线存在（未删）而本地已无消息 → 本地删除传播上云。
-    // 基准集包含 harness 线程（消息在 DSH，不在 thread_messages）。
+    // 基准集包含 provider runtime 线程（消息在 runtime，不在 thread_messages）。
     let mut local_ids: HashSet<String> = state
         .thread_manager
         .all_thread_ids_with_messages()
@@ -158,7 +168,7 @@ pub(crate) async fn reconcile_thread_dirty_state(state: &AppState) -> Result<(),
     local_ids.extend(
         state
             .thread_manager
-            .all_dsh_thread_ids()
+            .all_provider_runtime_thread_ids()
             .await
             .map_err(|e| e.to_string())?,
     );
@@ -197,31 +207,29 @@ pub(crate) async fn v2_thread_snapshot(state: &AppState) -> Result<Vec<V2LocalTh
         else {
             continue;
         };
-        // harness 线程：投影 = DSH 历史 ⋈ 本地表并集（与 reconcile 同源）
-        if state
+        // provider runtime 线程：投影 = runtime 历史 ⋈ 本地表并集
+        //（与 reconcile 同源；runtime 未知/读取失败跳过，删除对账下轮转 Delete）
+        if let Some(runtime) = state
             .thread_manager
-            .is_dsh_thread(local_id)
+            .provider_runtime_of(local_id)
             .await
             .map_err(|e| e.to_string())?
+            .and_then(|runtime| ExternalRuntimeKind::parse(&runtime).ok())
         {
-            let messages = match state
-                .agent_history
-                .read_all(ExternalRuntimeKind::DeepSeekHarness, local_id)
-                .await
-            {
+            let messages = match state.agent_history.read_all(runtime, local_id).await {
                 Ok(messages) => messages,
                 Err(error) => {
                     tracing::warn!(
                         thread_id = %local_id,
                         error = %error,
-                        "[thread-bridge] dsh history read failed; skip snapshot"
+                        "[thread-bridge] provider runtime history read failed; skip snapshot"
                     );
                     continue;
                 }
             };
             let Some(payload) = state
                 .thread_manager
-                .dsh_payload_for_cloud(local_id, messages)
+                .provider_runtime_payload_for_cloud(local_id, messages)
                 .await
                 .map_err(|e| e.to_string())?
             else {
@@ -250,13 +258,13 @@ pub(crate) async fn v2_thread_snapshot(state: &AppState) -> Result<Vec<V2LocalTh
     Ok(threads)
 }
 
-/// harness 线程的 apply 过滤：DSH 历史消息（origin=desktop）不落
-/// thread_messages——权威在 DSH host，读路径经 history adapter 合并；
-/// 仅物化其他端消息（手机续聊）。否则回放会堆积 DSH 历史副本，
-/// adapter 首页 merge 时重复显示。
-fn filter_dsh_apply_payload(payload: &V2ThreadPayload) -> V2ThreadPayload {
+/// provider runtime 线程的 apply 过滤：runtime 历史消息（origin=desktop）
+/// 不落 thread_messages——权威在 runtime 侧，读路径经 history adapter
+/// 合并；仅物化其他端消息（手机续聊）。否则回放会堆积 runtime 历史
+/// 副本，adapter 首页 merge 时重复显示。
+fn filter_provider_runtime_apply_payload(payload: &V2ThreadPayload) -> V2ThreadPayload {
     let mut filtered = payload.clone();
-    // origin 缺失的旧格式消息按 desktop 处理（保守剔除，防 DSH 历史堆积）
+    // origin 缺失的旧格式消息按 desktop 处理（保守剔除，防历史堆积）
     filtered.messages = payload
         .messages
         .iter()
@@ -291,16 +299,16 @@ pub(crate) async fn apply_remote_thread(
     };
     let payload: V2ThreadPayload =
         serde_json::from_slice(bytes).map_err(|e| format!("parse cloud thread payload: {e}"))?;
-    // harness 线程：过滤 DSH 历史（权威在 DSH host），仅落其他端消息
+    // provider runtime 线程：过滤 runtime 历史（权威在 runtime 侧），仅落其他端消息
     let payload = match crate::agent_session::ThreadManager::local_thread_id(thread_id) {
         Some(local_id)
             if state
                 .thread_manager
-                .is_dsh_thread(local_id)
+                .is_provider_runtime_thread(local_id)
                 .await
                 .map_err(|e| e.to_string())? =>
         {
-            filter_dsh_apply_payload(&payload)
+            filter_provider_runtime_apply_payload(&payload)
         }
         _ => payload,
     };
@@ -339,11 +347,11 @@ mod tests {
         }
     }
 
-    /// harness apply 过滤：origin=desktop（DSH 历史）剔除，仅物化其他端
-    /// 消息；origin 缺失的旧消息视为 desktop 同样剔除（保守）。
+    /// provider runtime apply 过滤：origin=desktop（runtime 历史）剔除，
+    /// 仅物化其他端消息；origin 缺失的旧消息视为 desktop 同样剔除（保守）。
     #[test]
-    fn filter_dsh_apply_payload_drops_desktop_history() {
-        let mut payload = cloud_message("dsh_msg", Some("desktop"));
+    fn filter_provider_runtime_apply_payload_drops_desktop_history() {
+        let mut payload = cloud_message("runtime_msg", Some("desktop"));
         payload.messages.push(
             cloud_message("mob_msg", Some("mobile"))
                 .messages
@@ -352,7 +360,7 @@ mod tests {
         );
         payload.messages.push(cloud_message("legacy", None).messages.pop().unwrap());
 
-        let filtered = filter_dsh_apply_payload(&payload);
+        let filtered = filter_provider_runtime_apply_payload(&payload);
         let ids: Vec<&str> = filtered.messages.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["mob_msg"]);
         assert_eq!(filtered.title, payload.title, "线程头字段保留");

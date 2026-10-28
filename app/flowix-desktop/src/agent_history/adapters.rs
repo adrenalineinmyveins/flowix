@@ -33,7 +33,10 @@ pub(super) fn builtin_adapters(
             client: dsh,
             threads: threads.clone(),
         }),
-        Arc::new(OpenCodeHistoryAdapter { client: opencode }),
+        Arc::new(OpenCodeHistoryAdapter {
+            threads: threads.clone(),
+            client: opencode,
+        }),
         Arc::new(ClaudeHistoryAdapter {
             threads: threads.clone(),
         }),
@@ -67,14 +70,25 @@ impl HistoryAdapter for CodexHistoryAdapter {
             .await
             .map_err(|error| error.to_string())?
             .unwrap_or_else(|| request.thread_id.to_string());
-        self.client
+        let mut page = self
+            .client
             .get_thread_messages_page(
                 &session_id,
                 request.before_sequence,
                 request.snapshot_sequence,
                 request.limit,
             )
-            .await
+            .await?;
+        // 首页 merge 本地尾巴（其他端续聊消息，同 Dsh adapter）
+        if request.before_sequence.is_none() {
+            let local = self
+                .threads
+                .get_thread_messages_page(request.thread_id, None, 1000)
+                .await
+                .map_err(|error| error.to_string())?;
+            page = merge_local_message_tail(page, local.messages);
+        }
+        Ok(page)
     }
 }
 
@@ -146,6 +160,7 @@ fn merge_local_message_tail(
 }
 
 struct OpenCodeHistoryAdapter {
+    threads: Arc<ThreadManager>,
     client: Arc<OpenCodeAcpManager>,
 }
 
@@ -164,9 +179,20 @@ impl HistoryAdapter for OpenCodeHistoryAdapter {
         &self,
         request: HistoryPageRequest<'_>,
     ) -> Result<ThreadMessagesPage, String> {
-        self.client
+        let mut page = self
+            .client
             .get_thread_messages_page(request.thread_id, request.before_sequence, request.limit)
-            .await
+            .await?;
+        // 首页 merge 本地尾巴（其他端续聊消息，同 Dsh adapter）
+        if request.before_sequence.is_none() {
+            let local = self
+                .threads
+                .get_thread_messages_page(request.thread_id, None, 1000)
+                .await
+                .map_err(|error| error.to_string())?;
+            page = merge_local_message_tail(page, local.messages);
+        }
+        Ok(page)
     }
 }
 
