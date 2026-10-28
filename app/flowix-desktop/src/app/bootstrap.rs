@@ -346,6 +346,9 @@ pub fn run() {
                 crate::nurture::spawn_worker(nurture_app);
             }
             external_runtimes.listen_for_terminal_events(app.handle());
+            // FD-12 M2：consult_remote 桥接端点（回环 + 随机 token），
+            // 必须先于任何 DSH 会话 spawn，port/token 经 env 注入子进程链。
+            crate::redaction::consult_bridge::ensure_started(app.handle().clone());
             if let Some(window) = app.get_webview_window("main") {
                 // �?��即�?齐主题背�?��, 消除冷启动白�?(尤其深色主�?)�?
                 let theme = app.state::<AppState>().user_config.get_preference().theme;
@@ -511,6 +514,9 @@ pub fn run() {
             commands::redaction::redaction_push_start,
             commands::redaction::redaction_push_stop,
             commands::redaction::redaction_usage_summary,
+            commands::redaction::redaction_consult_auto_send,
+            commands::redaction::redaction_auto_grant_get,
+            commands::redaction::redaction_auto_grant_set,
             commands::artifact::artifact_resolve,
             commands::settings::get_preference,
             commands::settings::patch_preference,

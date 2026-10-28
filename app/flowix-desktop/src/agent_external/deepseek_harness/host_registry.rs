@@ -87,6 +87,10 @@ impl DshClientFactory for ProcessDshClientFactory {
             "FLOWIX_DSH_PLUGIN_SETTINGS_PATH".into(),
             spec.plugin_settings_path.to_string_lossy().into_owned(),
         );
+        // FD-12 M2：consult_remote 桥接端点凭据（launcher → flowix-cli 透传）。
+        for (key, value) in crate::redaction::consult_bridge::bridge_env_vars() {
+            env.insert(key.to_string(), value);
+        }
         let client = AppServerClient::spawn(&command, &args, &env).await?;
         let initialize =
             protocol::app_initialize_request(client.next_request_id(), env!("CARGO_PKG_VERSION"));

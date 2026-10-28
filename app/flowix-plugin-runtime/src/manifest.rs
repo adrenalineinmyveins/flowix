@@ -44,7 +44,8 @@ pub struct PluginManifest {
 }
 
 /// P4 工具授权声明。`tool` 白名单：flowix.memo / flowix.notebook / shell /
-/// artifact；`access` ∈ read | write | confirm（confirm 走 DSH approval）。
+/// artifact / flowix.consult（FD-12 远程咨询，read=预授权内直发）；
+/// `access` ∈ read | write | confirm（confirm 走 DSH approval）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginToolGrant {

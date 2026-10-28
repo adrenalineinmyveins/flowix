@@ -36,6 +36,7 @@ fn report(text: &str) -> RedactionPreviewReport {
         truncated: false,
         target_level: "r2".into(),
         rule_set_version: "l1-v1".into(),
+        distill_mode: "full".into(),
     }
 }
 

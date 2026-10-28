@@ -163,6 +163,12 @@ pub fn store_rejected(
     Ok(true)
 }
 
+/// 读单条留档（M3 注入链用；不存在返回 None）。
+pub fn read_inbound(dir: &Path, receipt_id: &str) -> Option<InboundRecord> {
+    let bytes = std::fs::read(record_path(dir, receipt_id)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
 pub fn list_inbound(dir: &Path) -> Vec<InboundRecord> {
     let mut records: Vec<InboundRecord> = std::fs::read_dir(dir)
         .into_iter()
@@ -200,6 +206,8 @@ pub struct PollSummary {
     pub duplicates: usize,
     /// 入站校验拒绝并留档的数量。
     pub rejected: usize,
+    /// 本次新落档的信封 receiptId（M3 注入链消费；重复/拒绝不含在内）。
+    pub stored_receipt_ids: Vec<String>,
 }
 
 /// 拉取并留档一个 agent 的收件队列（HTTP 层薄封装，联调走真机 M4）。
@@ -259,7 +267,12 @@ pub async fn poll_agent_inbox(
         });
         match validate_inbound(&item.envelope, agent_id) {
             Ok(()) => match store_inbound(&dir, &item.queue_id, &item.envelope, signature_status, blind) {
-                Ok(true) => summary.stored += 1,
+                Ok(true) => {
+                    summary.stored += 1;
+                    summary
+                        .stored_receipt_ids
+                        .push(item.envelope.provenance.receipt_id.clone());
+                }
                 Ok(false) => summary.duplicates += 1,
                 Err(e) => return Err(format!("INBOUND_STORE_FAILED:{e}")),
             },

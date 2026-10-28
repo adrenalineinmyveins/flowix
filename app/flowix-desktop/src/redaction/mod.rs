@@ -24,6 +24,9 @@ use crate::config::access::{AgentAccessEntry, AgentAccessKind};
 use crate::nurture::should_accept_event_in_notebook;
 
 pub mod account;
+pub mod auto_grant;
+pub mod consult_bridge;
+pub mod consult_registry;
 pub mod directory;
 pub mod e2e;
 pub mod inbound;
@@ -289,6 +292,26 @@ impl DistillCheckError {
             }
         }
     }
+}
+
+/// FD-12 M1：直通形态防御性复扫——重跑 L3 校验但豁免 PlaceholderMissing
+/// （r3_fallback 截断丢占位符 = 删信息，非泄露；RuleHit 与 PlaceholderUnknown
+/// 仍拦截：改写回来 / 拼凑占位符）。直通稿源自 L1 输出，正常必过；此为防御层。
+fn enforce_fast_path(
+    text: &str,
+    placeholder_map: &BTreeMap<String, String>,
+    options: &RedactionOptions,
+    words: &[CustomWord],
+) -> Result<(), RedactionPipelineError> {
+    let problems: Vec<DistillCheckError> = validate_distilled(text, placeholder_map, options, words)
+        .into_iter()
+        .filter(|problem| !matches!(problem, DistillCheckError::PlaceholderMissing(_)))
+        .collect();
+    if problems.is_empty() {
+        return Ok(());
+    }
+    let listing = problems.iter().map(DistillCheckError::describe).collect::<Vec<_>>().join("；");
+    Err(RedactionPipelineError::DistillFailed(format!("FAST_PATH_RULE_HIT:{listing}")))
 }
 
 /// L3 复扫：对蒸馏稿重跑 L1 全部规则（豁免合法占位符）+ 占位符完整性双向对账。
@@ -579,6 +602,8 @@ pub struct RedactionPreviewReport {
     pub truncated: bool,
     pub target_level: String,
     pub rule_set_version: String,
+    /// FD-12 M1：出站形态（`zero-material` | `open-scope` | `fallback` | `full`）。
+    pub distill_mode: String,
 }
 
 /// 完整 preview 管线：scope 解析 → L0 → L1 → L2（DSH 蒸馏 + L3 复扫回炉）。
@@ -609,6 +634,27 @@ pub async fn preview_full_inner(
     parties: Option<(outbox::AgentParty, outbox::AgentParty)>,
     reply: Option<(String, u32)>,
     blind_relay: bool,
+) -> Result<RedactionPreviewReport, RedactionPipelineError> {
+    preview_full_mode(
+        app, notebook_path, question, scope_entry_ids, target_level, parties, reply,
+        blind_relay, auto_grant::DistillMode::FullDistill,
+    )
+    .await
+}
+
+/// FD-12 M1：带出站形态的 preview。直通形态（ZeroMaterial/OpenScope/Fallback）
+/// 跳过 L2 蒸馏——L0 取材、L1 规则、L3 复扫、留档恒走（§3.3 纪律）。
+#[allow(clippy::too_many_arguments)]
+pub async fn preview_full_mode(
+    app: &tauri::AppHandle,
+    notebook_path: &str,
+    question: &str,
+    scope_entry_ids: &[String],
+    target_level: &str,
+    parties: Option<(outbox::AgentParty, outbox::AgentParty)>,
+    reply: Option<(String, u32)>,
+    blind_relay: bool,
+    mode: auto_grant::DistillMode,
 ) -> Result<RedactionPreviewReport, RedactionPipelineError> {
     use tauri::Manager;
 
@@ -696,26 +742,43 @@ pub async fn preview_full_inner(
         }
     };
 
-    let outcome = match distill_with_recheck(
-        &l1_report.text,
-        target_level,
-        &l1_report.placeholder_map,
-        &options,
-        &words,
-        distill,
-    )
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(RedactionPipelineError::DistillFailed(reason)) if target_level == "r3" => {
-            DistillOutcome {
-                text: r3_fallback(&l1_report.text),
-                attempts: 0,
-                used_fallback: true,
-            }
-            .tap_debug(&reason)
+    // FD-12 M1 §3.3：出站形态分支。直通形态（零取材/开放库）以 L1 稿为
+    // 终稿、fastMode 用 r3_fallback——均跳过 L2 蒸馏，但防御性复扫仍跑
+    // （豁免 PlaceholderMissing：截断丢占位符 = 删信息，非泄露）。
+    let outcome = match mode {
+        auto_grant::DistillMode::ZeroMaterial | auto_grant::DistillMode::OpenScope => {
+            let text = l1_report.text.clone();
+            enforce_fast_path(&text, &l1_report.placeholder_map, &options, &words)?;
+            DistillOutcome { text, attempts: 0, used_fallback: false }
         }
-        Err(error) => return Err(error),
+        auto_grant::DistillMode::Fallback => {
+            let text = r3_fallback(&l1_report.text);
+            enforce_fast_path(&text, &l1_report.placeholder_map, &options, &words)?;
+            DistillOutcome { text, attempts: 0, used_fallback: true }
+        }
+        auto_grant::DistillMode::FullDistill => {
+            match distill_with_recheck(
+                &l1_report.text,
+                target_level,
+                &l1_report.placeholder_map,
+                &options,
+                &words,
+                distill,
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(RedactionPipelineError::DistillFailed(reason)) if target_level == "r3" => {
+                    DistillOutcome {
+                        text: r3_fallback(&l1_report.text),
+                        attempts: 0,
+                        used_fallback: true,
+                    }
+                    .tap_debug(&reason)
+                }
+                Err(error) => return Err(error),
+            }
+        }
     };
 
     let mut report = RedactionPreviewReport {
@@ -730,6 +793,12 @@ pub async fn preview_full_inner(
         truncated: payload.truncated,
         target_level: target_level.to_string(),
         rule_set_version: l1::RULE_CATALOG_VERSION.to_string(),
+        distill_mode: match mode {
+            auto_grant::DistillMode::ZeroMaterial => "zero-material".to_string(),
+            auto_grant::DistillMode::OpenScope => "open-scope".to_string(),
+            auto_grant::DistillMode::Fallback => "fallback".to_string(),
+            auto_grant::DistillMode::FullDistill => "full".to_string(),
+        },
     };
     let mut record = draft_from_preview(
         question,
@@ -1373,6 +1442,7 @@ mod tests {
             truncated: false,
             target_level: "r2".into(),
             rule_set_version: "l1-v1".into(),
+            distill_mode: "full".into(),
         };
         let record = draft_from_preview("q", &["e1".into(), "e2".into()], &report, 42);
         write_record(root, &record).unwrap();
@@ -1463,6 +1533,7 @@ mod tests {
                 truncated: false,
                 target_level: "r1".into(),
                 rule_set_version: "l1-v1".into(),
+                distill_mode: "full".into(),
             };
             let record = draft_from_preview("q", &[], &report, i as i64);
             write_record(root.path(), &record).unwrap();

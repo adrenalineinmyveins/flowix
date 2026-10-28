@@ -591,11 +591,16 @@ pub fn approved_categories_of(plugin_id: &str) -> std::collections::HashSet<Stri
         .collect()
 }
 
-/// 把运行时工具名归类到 toolGrants 的四个类别之一；无法识别返回 None。
+/// 把运行时工具名归类到 toolGrants 类别之一；无法识别返回 None。
+/// `consult`（FD-12 M2，mcp__flowix__consult_remote）：网络出境工具，
+/// access 三档语义——read=预授权内直发 / confirm=挂门 / deny。
 fn classify_tool(tool_name: &str) -> Option<&'static str> {
     let name = tool_name.trim().to_lowercase();
     if name.is_empty() {
         return None;
+    }
+    if name.contains("consult_remote") || name.contains("consult") {
+        return Some("flowix.consult");
     }
     if name.starts_with("memo") {
         return Some("flowix.memo");
@@ -1616,6 +1621,8 @@ mod tests {
         assert_eq!(policy.verdict("run_bash_command"), ToolVerdict::Deny);
         assert_eq!(policy.verdict("write_artifact"), ToolVerdict::Deny);
         assert_eq!(policy.verdict("notebook_read_all"), ToolVerdict::Deny);
+        // FD-12 M2：consult_remote 归 flowix.consult；未授权 → Deny。
+        assert_eq!(policy.verdict("mcp__flowix__consult_remote"), ToolVerdict::Deny);
         // 授权类别放行。
         assert_eq!(policy.verdict("memo_search"), ToolVerdict::Allow);
         assert_eq!(policy.verdict("memo_write_note"), ToolVerdict::Allow);
@@ -1623,6 +1630,29 @@ mod tests {
         assert_eq!(policy.verdict("think"), ToolVerdict::Allow);
         assert_eq!(policy.verdict("update_plan"), ToolVerdict::Allow);
         assert_eq!(policy.verdict(""), ToolVerdict::Allow);
+    }
+
+    /// FD-12 M2：flowix.consult 三档——read=预授权内直发（Allow），
+    /// confirm=挂门，deny/未声明=Deny。
+    #[test]
+    fn tool_policy_consult_category_gates() {
+        use super::ToolVerdict;
+        let empty = std::collections::HashSet::new();
+        let read = super::ToolPolicy::from_grants(&[grant("flowix.consult", "read")], &empty)
+            .unwrap();
+        assert_eq!(
+            read.verdict("mcp__flowix__consult_remote"),
+            ToolVerdict::Allow
+        );
+        let confirm = super::ToolPolicy::from_grants(
+            &[grant("flowix.consult", "confirm")],
+            &empty,
+        )
+        .unwrap();
+        assert_eq!(
+            confirm.verdict("mcp__flowix__consult_remote"),
+            ToolVerdict::Confirm { category: "flowix.consult".to_string() },
+        );
     }
 
     #[test]

@@ -34,6 +34,9 @@ pub struct DirectoryCardDraft {
     pub visibility: String,
     /// `R1|R2|R3`。
     pub min_redaction_level: String,
+    /// FD-12 M4 能力位：`off`（默认）| `R3`（自动回答入站咨询并直发回程）。
+    #[serde(default)]
+    pub auto_answer: String,
     #[serde(default)]
     pub l1_hits: Vec<flowix_redaction::RuleHit>,
     pub created_at: i64,
@@ -110,6 +113,7 @@ pub fn publish_preview(
     specialty_tags: &[String],
     visibility: &str,
     min_redaction_level: &str,
+    auto_answer: &str,
 ) -> Result<(DirectoryCardDraft, String), String> {
     let slug = agent_slug.trim().to_lowercase();
     if slug.is_empty()
@@ -124,6 +128,18 @@ pub fn publish_preview(
     }
     if !matches!(min_redaction_level, "R1" | "R2" | "R3") {
         return Err("MIN_LEVEL_INVALID".to_string());
+    }
+    // FD-12 M4 能力位（空串/`off` 均归一为小写 off；`R3` 大写）。
+    let auto_answer = {
+        let raw = auto_answer.trim();
+        if raw.is_empty() || raw.eq_ignore_ascii_case("off") {
+            "off".to_string()
+        } else {
+            raw.to_uppercase()
+        }
+    };
+    if !matches!(auto_answer.as_str(), "off" | "R3") {
+        return Err("AUTO_ANSWER_INVALID".to_string());
     }
     if specialty_tags.len() > 8
         || specialty_tags.iter().any(|tag| tag.trim().is_empty() || tag.len() > 32)
@@ -170,6 +186,7 @@ pub fn publish_preview(
         specialty_tags: redacted_tags,
         visibility: visibility.to_string(),
         min_redaction_level: min_redaction_level.to_string(),
+        auto_answer,
         l1_hits: report.hits,
         created_at: now_unix(),
         settled_at: None,
@@ -230,6 +247,7 @@ pub async fn publish_confirmed(notebook_root: &Path, id: &str) -> Result<Directo
             "minRedactionLevel": draft.min_redaction_level,
             "publicKey": account.public_key,
             "visibility": draft.visibility,
+            "autoAnswer": if draft.auto_answer.is_empty() { "off" } else { draft.auto_answer.as_str() },
         }))
         .send()
         .await
@@ -405,10 +423,12 @@ mod tests {
             &["finance".to_string()],
             "unlisted",
             "R1",
+            "R3",
         )
         .unwrap();
         assert_eq!(draft.status, CardStatus::Draft);
         assert_eq!(draft.agent_slug, "researcher");
+        assert_eq!(draft.auto_answer, "R3");
         assert!(original.contains("13800138000"));
         // L1 命中手机号 → 出设备名占位化。
         assert!(!draft.display_name.contains("13800138000"), "{}", draft.display_name);
@@ -426,16 +446,23 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         assert_eq!(
-            publish_preview(root, "Bad Slug", "n", &[], "public", "R1").unwrap_err(),
+            publish_preview(root, "Bad Slug", "n", &[], "public", "R1", "off").unwrap_err(),
             "AGENT_SLUG_INVALID"
         );
         assert_eq!(
-            publish_preview(root, "ok", "n", &[], "hidden", "R1").unwrap_err(),
+            publish_preview(root, "ok", "n", &[], "hidden", "R1", "off").unwrap_err(),
             "VISIBILITY_INVALID"
         );
         assert_eq!(
-            publish_preview(root, "ok", "n", &[], "public", "R9").unwrap_err(),
+            publish_preview(root, "ok", "n", &[], "public", "R9", "off").unwrap_err(),
             "MIN_LEVEL_INVALID"
         );
+        // FD-12 M4：能力位枚举校验；空串兼容为 off。
+        assert_eq!(
+            publish_preview(root, "ok", "n", &[], "public", "R1", "R2").unwrap_err(),
+            "AUTO_ANSWER_INVALID"
+        );
+        let (draft, _) = publish_preview(root, "ok2", "n", &[], "public", "R1", "").unwrap();
+        assert_eq!(draft.auto_answer, "off");
     }
 }

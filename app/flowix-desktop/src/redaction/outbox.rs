@@ -98,9 +98,16 @@ pub struct RedactionOutboxRecord {
     pub blind_relay: bool,
     #[serde(default)]
     pub recipient_public_key: Option<String>,
-    /// 盲转密文（NaCl box，base64；确认时固化，byte-equal 随档）。
+    /// FD-11 P2-9 盲转密文（NaCl box，base64；确认时固化，byte-equal 随档）。
     #[serde(default)]
     pub cipher_text: Option<String>,
+    /// FD-12 M1 自动过门审计：判定快照（五维结论 + 直通形态 + 当时用量）。
+    /// 仅元数据，不进信封（envelope() 不读取），byte-equal 不受影响。
+    #[serde(default)]
+    pub used_auto_gate: Option<serde_json::Value>,
+    /// FD-12 M1 出站形态：`zero-material` | `open-scope` | `fallback` | `full`。
+    #[serde(default)]
+    pub distill_mode: Option<String>,
 }
 
 impl RedactionOutboxRecord {
@@ -234,6 +241,8 @@ pub fn draft_from_preview(
         blind_relay: false,
         recipient_public_key: None,
         cipher_text: None,
+        used_auto_gate: None,
+        distill_mode: Some(report.distill_mode.clone()),
     }
 }
 
@@ -388,6 +397,7 @@ mod tests {
             truncated: false,
             target_level: "r2".to_string(),
             rule_set_version: "l1-v1".to_string(),
+            distill_mode: "full".to_string(),
         }
     }
 

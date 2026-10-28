@@ -95,6 +95,7 @@ mod tests {
             truncated: false,
             target_level: "r2".into(),
             rule_set_version: "test".into(),
+            distill_mode: "full".into(),
         }
     }
 
