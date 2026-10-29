@@ -513,6 +513,11 @@
   font-weight: 500;
 }
 
+/* AGENT-MARKET M4：@ 菜单里的订阅 agent 行 ── 用主色弱化底色区别于笔记。 */
+.mention-note-dropdown .mention-note-title--agent {
+  color: var(--primary);
+}
+
 /* Middle-column navigation submenus (tags / filter / sort / view) use the
  * shared mention label class, but their item text should remain regular. */
 .memo-navigation-submenu-item .mention-note-title {

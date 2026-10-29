@@ -26,6 +26,7 @@ import {
   ComposerDraftController,
   ComposerImageController,
   ComposerAddMenuController,
+  AgentPickerController,
   getCurrentNotebookComposerFolders,
   createAgentComposerDom,
   disposeAgentComposerDom,
@@ -486,6 +487,7 @@ function AgentConversationDetailContent({
       input,
       codexSettingsPopover: settingsPopover,
       composerRolePopover: rolePopover,
+      composerAgentPopover: agentPopover,
       composerAddPopover: addPopover,
       sendButtonMount,
     } = composerParts;
@@ -657,11 +659,24 @@ function AgentConversationDetailContent({
       },
       onSelect: () => addMenuRef.current?.close(),
     });
+    // AGENT-MARKET M4：「添加内容 → 订阅的 Agent」二级弹层。
+    const agentPicker = new AgentPickerController({
+      trigger: composerRoleButton,
+      popover: agentPopover,
+      t: (key, params) => tRef.current(key, params),
+      isDestroyed: () => destroyedRef.current,
+      injectAgentReference: (attrs) => {
+        composerControllerRef.current?.insertAgentReference(attrs);
+      },
+      onSelect: () => addMenuRef.current?.close(),
+    });
     const addMenu = new ComposerAddMenuController({
       trigger: composerRoleButton,
       popover: addPopover,
       notePopover: rolePopover,
       notePicker,
+      agentPopover,
+      agentPicker,
       images: composerImagesController,
       t: (key) => tRef.current(key),
       isDestroyed: () => destroyedRef.current,
@@ -703,6 +718,7 @@ function AgentConversationDetailContent({
       surface.dispose();
       composerImagesController.dispose();
       notePicker.dispose();
+      agentPicker.dispose();
       addMenu.dispose();
       externalSettings.dispose();
       notebookAgentSettingsDialogRef.current?.close();

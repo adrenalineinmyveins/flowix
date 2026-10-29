@@ -51,6 +51,7 @@ export interface AgentThreadCardDomParts {
   input: HTMLDivElement;
   codexSettingsPopover: HTMLDivElement;
   composerRolePopover: HTMLDivElement;
+  composerAgentPopover: HTMLDivElement;
   sendButtonMount: HTMLSpanElement;
 }
 
@@ -210,6 +211,7 @@ export function createAgentThreadCardDom(
     input,
     codexSettingsPopover,
     composerRolePopover,
+    composerAgentPopover,
     sendButtonMount,
   } = composerParts;
   codexSettingsPopover.addEventListener("mousedown", (event) =>
@@ -222,6 +224,12 @@ export function createAgentThreadCardDom(
     event.stopPropagation(),
   );
   composerRolePopover.addEventListener("click", (event) =>
+    event.stopPropagation(),
+  );
+  composerAgentPopover.addEventListener("mousedown", (event) =>
+    event.stopPropagation(),
+  );
+  composerAgentPopover.addEventListener("click", (event) =>
     event.stopPropagation(),
   );
   /*
@@ -270,6 +278,7 @@ export function createAgentThreadCardDom(
     input,
     codexSettingsPopover,
     composerRolePopover,
+    composerAgentPopover,
     sendButtonMount,
   };
 }

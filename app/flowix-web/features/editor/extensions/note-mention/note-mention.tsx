@@ -9,13 +9,19 @@ import { NoteMentionDropdown } from '@features/editor/extensions/note-mention/no
 import {
   queryMentionNotes,
   toNoteReferenceAttrs,
-  type MentionNoteItem,
 } from '@features/editor/extensions/note-mention/note-mention-data';
+import {
+  isMentionAgent,
+  queryMentionAgents,
+  type MentionItem,
+} from '@features/editor/extensions/agent-reference/agent-mention-data';
 
 const TRIGGER = '@';
 const WIDTH = 280;
+/** @ 菜单里订阅 agent 的展示上限（笔记另有 200 条截断）。 */
+const MENTION_AGENT_LIMIT = 10;
 
-const noteMentionConfig: SuggestionMenuConfig<MentionNoteItem> = {
+const noteMentionConfig: SuggestionMenuConfig<MentionItem> = {
   trigger: TRIGGER,
   width: WIDTH,
 
@@ -36,7 +42,11 @@ const noteMentionConfig: SuggestionMenuConfig<MentionNoteItem> = {
     return query;
   },
 
-  fetchItems: (query) => queryMentionNotes(query),
+  // AGENT-MARKET M4：订阅 agent 与笔记混排（agent 在前），两者数据源各自缓存。
+  fetchItems: (query) =>
+    Promise.all([queryMentionAgents(query), queryMentionNotes(query)]).then(
+      ([agents, notes]) => [...agents.slice(0, MENTION_AGENT_LIMIT), ...notes],
+    ),
 
   render: ({ items, selectedIndex, scrollSelectedItem, hasMore, loading, onSelect, onHover, onLoadMore }) => (
     <NoteMentionDropdown
@@ -52,6 +62,19 @@ const noteMentionConfig: SuggestionMenuConfig<MentionNoteItem> = {
   ),
 
   onSelect: ({ editor, item, deleteTriggerText }) => {
+    if (isMentionAgent(item)) {
+      deleteTriggerText();
+      if (!editor.schema.nodes.agentReference) return;
+      editor.commands.insertContent({
+        type: 'agentReference',
+        attrs: {
+          displayName: item.displayName,
+          address: item.address,
+          relayUrl: item.relayUrl,
+        },
+      });
+      return;
+    }
     deleteTriggerText();
     if (!editor.schema.nodes.noteReference) return;
     editor.commands.insertContent({
@@ -68,12 +91,12 @@ export function openNoteMention(editor: Editor): boolean {
 }
 
 /**
- * `@` trigger for note references. Selecting an item inserts a `noteReference`
- * inline card that can navigate to the target memo.
+ * `@` trigger for note references and subscribed agents. Selecting an item
+ * inserts a `noteReference` / `agentReference` inline card.
  */
-export const NoteMention = createSuggestionExtension<MentionNoteItem>(noteMentionConfig);
+export const NoteMention = createSuggestionExtension<MentionItem>(noteMentionConfig);
 
-const wikiNoteMentionConfig: SuggestionMenuConfig<MentionNoteItem> = {
+const wikiNoteMentionConfig: SuggestionMenuConfig<MentionItem> = {
   ...noteMentionConfig,
   trigger: '[[',
   parseQuery: (view: EditorView, triggerFrom, trigger) => {
@@ -88,7 +111,10 @@ const wikiNoteMentionConfig: SuggestionMenuConfig<MentionNoteItem> = {
     if (query.includes(']') || query.includes('\n')) return null;
     return query;
   },
+  // `[[` 保持纯笔记选择器：Obsidian 语义只指向笔记。
+  fetchItems: (query) => queryMentionNotes(query),
   onSelect: ({ editor, item, deleteTriggerText }) => {
+    if (isMentionAgent(item)) return;
     deleteTriggerText();
     if (!editor.schema.nodes.noteReference) return;
     editor.commands.insertContent({
@@ -102,4 +128,4 @@ const wikiNoteMentionConfig: SuggestionMenuConfig<MentionNoteItem> = {
 };
 
 /** Obsidian-style `[[` note picker. */
-export const WikiNoteMention = createSuggestionExtension<MentionNoteItem>(wikiNoteMentionConfig);
+export const WikiNoteMention = createSuggestionExtension<MentionItem>(wikiNoteMentionConfig);

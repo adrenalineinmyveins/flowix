@@ -1,5 +1,6 @@
 import type { I18nKey } from "@/lib/i18n";
 import type { NotePickerController } from "@features/agent/thread-card/note/note-picker-controller";
+import type { AgentPickerController } from "./agent-picker-controller";
 import type { ComposerImageController } from "./composer-image-controller";
 import { COMPOSER_ATTACHMENT_ACCEPT } from "./composer-image-controller";
 
@@ -8,6 +9,9 @@ export interface ComposerAddMenuControllerOptions {
   popover: HTMLDivElement;
   notePopover: HTMLDivElement;
   notePicker: NotePickerController;
+  /** AGENT-MARKET M4：订阅 agent 二级弹层。 */
+  agentPopover: HTMLDivElement;
+  agentPicker: AgentPickerController;
   images: ComposerImageController;
   t: (key: I18nKey) => string;
   isDestroyed: () => boolean;
@@ -18,12 +22,15 @@ export class ComposerAddMenuController {
   private open = false;
   private disposed = false;
   private noteItem: HTMLButtonElement | null = null;
+  private agentItem: HTMLButtonElement | null = null;
   private submenuCloseTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private readonly options: ComposerAddMenuControllerOptions) {
     options.trigger.addEventListener("click", this.handleTriggerClick);
-    options.notePopover.addEventListener("pointerenter", this.cancelSubmenuClose);
-    options.notePopover.addEventListener("pointerleave", this.handleSubmenuBoundaryLeave);
+    for (const popover of [options.notePopover, options.agentPopover]) {
+      popover.addEventListener("pointerenter", this.cancelSubmenuClose);
+      popover.addEventListener("pointerleave", this.handleSubmenuBoundaryLeave);
+    }
   }
 
   close(): void { this.setOpen(false); }
@@ -34,8 +41,10 @@ export class ComposerAddMenuController {
     this.cancelSubmenuClose();
     this.setOpen(false);
     this.options.trigger.removeEventListener("click", this.handleTriggerClick);
-    this.options.notePopover.removeEventListener("pointerenter", this.cancelSubmenuClose);
-    this.options.notePopover.removeEventListener("pointerleave", this.handleSubmenuBoundaryLeave);
+    for (const popover of [this.options.notePopover, this.options.agentPopover]) {
+      popover.removeEventListener("pointerenter", this.cancelSubmenuClose);
+      popover.removeEventListener("pointerleave", this.handleSubmenuBoundaryLeave);
+    }
     this.options.popover.remove();
   }
 
@@ -56,22 +65,32 @@ export class ComposerAddMenuController {
       document.addEventListener("pointerdown", this.handleOutsidePointer, true);
     } else {
       this.noteItem = null;
+      this.agentItem = null;
       this.options.notePicker.setOpen(false);
+      this.options.agentPicker.setOpen(false);
       document.removeEventListener("pointerdown", this.handleOutsidePointer, true);
     }
   }
 
   private readonly handleOutsidePointer = (event: PointerEvent): void => {
     const target = event.target as Node | null;
-    if (target && (this.options.popover.contains(target) || this.options.notePopover.contains(target) || this.options.trigger.contains(target))) return;
+    if (target && (
+      this.options.popover.contains(target)
+      || this.options.notePopover.contains(target)
+      || this.options.agentPopover.contains(target)
+      || this.options.trigger.contains(target)
+    )) return;
     this.setOpen(false);
   };
 
   private render(): void {
     this.noteItem?.removeEventListener("pointerleave", this.handleSubmenuBoundaryLeave);
+    this.agentItem?.removeEventListener("pointerleave", this.handleSubmenuBoundaryLeave);
     const note = this.createItem(this.options.t("editor.threadCard.addNote"), true);
+    // AGENT-MARKET M4：订阅的 Agent（与「添加笔记」同为二级弹层）。
+    const agent = this.createAgentItem();
     const attachment = this.createItem(this.options.t("editor.threadCard.addAttachment"), false);
-    const items = [note, attachment];
+    const items = [note, agent, attachment];
     const projectAiSettings = this.createItem(this.options.t("editor.threadCard.projectAiSettings"), false, () => {
       this.setOpen(false);
       this.options.openNotebookAgentSettings();
@@ -79,8 +98,10 @@ export class ComposerAddMenuController {
     items.push(projectAiSettings);
     this.options.popover.replaceChildren(...items);
     this.noteItem = note;
+    this.agentItem = agent;
     // The parent item and level-2 popover form one continuous hover region.
     note.addEventListener("pointerleave", this.handleSubmenuBoundaryLeave);
+    agent.addEventListener("pointerleave", this.handleSubmenuBoundaryLeave);
   }
 
   private createItem(label: string, isNote: boolean, onClick?: () => void): HTMLButtonElement {
@@ -95,6 +116,7 @@ export class ComposerAddMenuController {
       item.append(this.chevron());
       item.addEventListener("pointerenter", () => {
         this.cancelSubmenuClose();
+        this.options.agentPicker.setOpen(false);
         this.options.notePicker.openFromParent(item);
       });
       item.addEventListener("focus", () => this.options.notePicker.openFromParent(item));
@@ -116,15 +138,42 @@ export class ComposerAddMenuController {
     return item;
   }
 
+  /** 与「添加笔记」同构的二级弹层项，但指向订阅 agent 列表。 */
+  private createAgentItem(): HTMLButtonElement {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "agent-thread-card__codex-settings-item agent-thread-card__composer-add-item";
+    item.setAttribute("role", "menuitem");
+    item.textContent = this.options.t("editor.threadCard.addAgent");
+    item.append(this.chevron());
+    item.addEventListener("pointerenter", () => {
+      this.cancelSubmenuClose();
+      this.options.notePicker.setOpen(false);
+      this.options.agentPicker.openFromParent(item);
+    });
+    item.addEventListener("focus", () => this.options.agentPicker.openFromParent(item));
+    item.addEventListener("click", (event) => {
+      event.stopPropagation();
+      this.options.agentPicker.openFromParent(item);
+    });
+    return item;
+  }
+
   private readonly handleSubmenuBoundaryLeave = (event: PointerEvent): void => {
     const next = event.relatedTarget as Node | null;
-    if (next && (this.noteItem?.contains(next) || this.options.notePopover.contains(next))) return;
+    const stillInside = (item: HTMLButtonElement | null, popover: HTMLDivElement): boolean =>
+      Boolean(next && (item?.contains(next) || popover.contains(next)));
+    if (
+      stillInside(this.noteItem, this.options.notePopover)
+      || stillInside(this.agentItem, this.options.agentPopover)
+    ) return;
     // A short grace period is the usual cascade-menu behavior and covers the
     // pointer crossing the shared edge between the two fixed popovers.
     this.cancelSubmenuClose();
     this.submenuCloseTimer = setTimeout(() => {
       this.submenuCloseTimer = null;
       this.options.notePicker.setOpen(false);
+      this.options.agentPicker.setOpen(false);
     }, 100);
   };
 

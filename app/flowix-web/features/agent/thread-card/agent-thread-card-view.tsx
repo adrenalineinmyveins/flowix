@@ -57,6 +57,7 @@ import {
   ComposerDraftController,
   ComposerImageController,
   ComposerAddMenuController,
+  AgentPickerController,
   getCurrentNotebookComposerFolders,
   type AgentThreadCardInputImage,
   getAgentThreadCardUserHistoryMessagesFromMessages,
@@ -174,6 +175,7 @@ export class AgentThreadCardView implements ProseMirrorNodeView {
   private externalAgentSettings: ExternalAgentSettingsController;
   private externalSettingsLoadedTypeKey: AgentTypeKey | null = null;
   private notePicker: NotePickerController;
+  private agentPicker: AgentPickerController;
   private composerAddMenu: ComposerAddMenuController;
   private notebookAgentSettingsDialog = new NotebookAgentSettingsDialogController();
   private isCreating = false;
@@ -378,6 +380,7 @@ export class AgentThreadCardView implements ProseMirrorNodeView {
       closeTransientUi: () => {
         this.setCodexSettingsPopoverOpen(false);
         this.notePicker.setOpen(false);
+        this.agentPicker.setOpen(false);
       },
       dragThresholdPx: AGENT_THREAD_CARD_HEADER_DRAG_THRESHOLD_PX,
       getAttrTitle: () => this.node.attrs.title as string | null,
@@ -410,7 +413,7 @@ export class AgentThreadCardView implements ProseMirrorNodeView {
     this.sendButtonMount = domParts.sendButtonMount;
     this.input.addEventListener("focus", this.boundHandleInputFocus);
 
-    const { codexSettingsPopover, composerRolePopover, composerAddPopover } = domParts;
+    const { codexSettingsPopover, composerRolePopover, composerAgentPopover, composerAddPopover } = domParts;
     this.externalAgentSettings = new ExternalAgentSettingsController({
       popover: codexSettingsPopover,
       getTypeKey: () => this.typeKey,
@@ -452,6 +455,15 @@ export class AgentThreadCardView implements ProseMirrorNodeView {
       injectMemoReference: (ref) => this.injectMemoReference(ref),
       onSelect: () => this.composerAddMenu.close(),
     });
+    // AGENT-MARKET M4：「添加内容 → 订阅的 Agent」二级弹层。
+    this.agentPicker = new AgentPickerController({
+      trigger: this.composerRoleIcon,
+      popover: composerAgentPopover,
+      t: (key, params) => this.t(key, params),
+      isDestroyed: () => this.isDestroyed,
+      injectAgentReference: (attrs) => this.injectAgentReference(attrs),
+      onSelect: () => this.composerAddMenu.close(),
+    });
     this.fullscreenLayout = new FullscreenLayoutController({
       dom: this.dom,
       isFullscreen: () => this.isFullscreen,
@@ -487,6 +499,8 @@ export class AgentThreadCardView implements ProseMirrorNodeView {
       popover: composerAddPopover,
       notePopover: composerRolePopover,
       notePicker: this.notePicker,
+      agentPopover: composerAgentPopover,
+      agentPicker: this.agentPicker,
       images: this.composerImages,
       t: (key) => this.t(key),
       isDestroyed: () => this.isDestroyed,
@@ -922,6 +936,15 @@ export class AgentThreadCardView implements ProseMirrorNodeView {
     this.composerController.insertMemoReference(ref);
   }
 
+  /** AGENT-MARKET M4：订阅 agent → composer 注入为行内 chip。 */
+  private injectAgentReference(attrs: {
+    displayName: string;
+    address: string;
+    relayUrl: string;
+  }): void {
+    this.composerController.insertAgentReference(attrs);
+  }
+
   private applyResolvedExternalSessionId(
     threadId: string,
     sessionId: string,
@@ -1277,7 +1300,8 @@ export class AgentThreadCardView implements ProseMirrorNodeView {
       target &&
       (this.dom.contains(target) ||
         this.externalAgentSettings.popoverElement.contains(target) ||
-        this.notePicker.popoverElement.contains(target))
+        this.notePicker.popoverElement.contains(target) ||
+        this.agentPicker.popoverElement.contains(target))
     );
   }
 
@@ -1877,6 +1901,7 @@ export class AgentThreadCardView implements ProseMirrorNodeView {
       true,
     );
     this.notePicker.setOpen(false);
+    this.agentPicker.setOpen(false);
     this.isDestroyed = true;
     this.releaseThreadInterest?.();
     this.releaseThreadInterest = null;
@@ -1887,6 +1912,7 @@ export class AgentThreadCardView implements ProseMirrorNodeView {
     this.runtime.dispose();
     this.externalAgentSettings.dispose();
     this.notePicker.dispose();
+    this.agentPicker.dispose();
     this.composerAddMenu.dispose();
     this.notebookAgentSettingsDialog.close();
     this.fullscreenLayout.dispose();

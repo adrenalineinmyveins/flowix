@@ -38,6 +38,7 @@ import type {
 } from "@features/agent/thread-card/composer/composer-slash-command-controller";
 import type { AgentTypeKey } from "@/types/agent";
 import { NoteReference } from "@features/editor/extensions/note-link";
+import { AgentReference } from "@features/editor/extensions/agent-reference/agent-reference";
 import type { MemoRef } from "@features/agent/thread-card/note/note-picker-controller";
 import type { Root } from "react-dom/client";
 
@@ -140,6 +141,7 @@ export class ComposerController {
           markedOptions: { gfm: true, breaks: true },
         }),
         NoteReference,
+        AgentReference,
         ComposerSkillToken,
         ComposerFolderToken,
         ComposerSlashToken.configure({
@@ -349,6 +351,37 @@ export class ComposerController {
         stale: false,
       },
     });
+    if (after && !/\s/.test(after)) content.push({ type: "text", text: " " });
+
+    this.editor
+      .chain()
+      .focus(null, { scrollIntoView: false })
+      .insertContentAt({ from, to }, content)
+      .run();
+    this.resetHistoryNavigation();
+    this.persistInputDraft();
+    this.updateMultiLineState();
+  }
+
+  /** AGENT-MARKET M4：把订阅 agent 以行内 chip 注入 composer。 */
+  insertAgentReference(attrs: {
+    displayName: string;
+    address: string;
+    relayUrl: string;
+  }): void {
+    if (this.editor.isDestroyed || !attrs.address) return;
+
+    const { selection, doc } = this.editor.state;
+    const from = selection.from;
+    const to = selection.to;
+    const before = from > 0 ? doc.textBetween(from - 1, from, "\n", "\n") : "";
+    const after = to < doc.content.size
+      ? doc.textBetween(to, to + 1, "\n", "\n")
+      : "";
+    const content: Array<Record<string, unknown>> = [];
+
+    if (before && !/\s/.test(before)) content.push({ type: "text", text: " " });
+    content.push({ type: "agentReference", attrs });
     if (after && !/\s/.test(after)) content.push({ type: "text", text: " " });
 
     this.editor

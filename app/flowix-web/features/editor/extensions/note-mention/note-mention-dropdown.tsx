@@ -3,15 +3,20 @@ import { LoaderCircle } from 'lucide-react';
 import { useSelectedItemScroll } from '@features/editor/extensions/shared/use-selected-item-scroll';
 import { OverlayScrollbar } from '@shared/ui/overlay-scrollbar';
 import type { MentionNoteItem } from '@features/editor/extensions/note-mention/note-mention-data';
+import {
+  isMentionAgent,
+  type MentionItem,
+} from '@features/editor/extensions/agent-reference/agent-mention-data';
+import { agentFullAddress } from '@features/editor/extensions/agent-reference/agent-reference';
 import { useI18n } from '@/lib/i18n';
 
 export interface NoteMentionDropdownProps {
-  items: MentionNoteItem[];
+  items: MentionItem[];
   selectedIndex: number;
   scrollSelectedItem: boolean;
   hasMore: boolean;
   loading: boolean;
-  onSelect: (item: MentionNoteItem) => void;
+  onSelect: (item: MentionItem) => void;
   onHover: (index: number) => void;
   onLoadMore: () => void;
 }
@@ -39,6 +44,8 @@ export function NoteMentionDropdown({
     if (event.movementX === 0 && event.movementY === 0) return;
     onHover(index);
   };
+  // AGENT-MARKET M4：混排菜单里有 agent 时换标题，纯笔记时保持原文案。
+  const hasAgent = items.some(isMentionAgent);
 
   return (
     <div
@@ -47,7 +54,7 @@ export function NoteMentionDropdown({
       aria-label="Notes"
     >
       <div className="mention-note-header" aria-label="Mention type">
-        <span>{t('editor.noteMention.header')}</span>
+        <span>{hasAgent ? t('editor.noteMention.mixedHeader') : t('editor.noteMention.header')}</span>
         {loading && (
           <LoaderCircle
             className="mention-note-header-spinner"
@@ -75,9 +82,12 @@ export function NoteMentionDropdown({
           ) : (
             items.map((item, index) => {
               const selected = index === selectedIndex;
+              const key = isMentionAgent(item)
+                ? `agent:${item.address}@${item.relayUrl}`
+                : `${(item as MentionNoteItem).notebookId}:${(item as MentionNoteItem).relativePath}`;
               return (
                 <button
-                  key={`${item.notebookId}:${item.relativePath}`}
+                  key={key}
                   ref={(node) => {
                     itemRefs.current[index] = node;
                   }}
@@ -85,13 +95,20 @@ export function NoteMentionDropdown({
                   role="option"
                   aria-selected={selected}
                   className={`mention-note-item${selected ? ' is-selected' : ''}`}
+                  title={isMentionAgent(item) ? agentFullAddress(item) : undefined}
                   onMouseMove={(event) => handleItemMouseMove(event, index)}
                   onMouseDown={(event) => {
                     event.preventDefault();
                     onSelect(item);
                   }}
                 >
-                  <span className="mention-note-title">{item.title}</span>
+                  {isMentionAgent(item) ? (
+                    <span className="mention-note-title mention-note-title--agent">
+                      @{item.displayName}
+                    </span>
+                  ) : (
+                    <span className="mention-note-title">{item.title}</span>
+                  )}
                 </button>
               );
             })

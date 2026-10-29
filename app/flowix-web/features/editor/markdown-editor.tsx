@@ -28,6 +28,7 @@ import ManagedPasteRules, { pasteClipboardSnapshot } from '@features/editor/exte
 import type { ClipboardSnapshot } from '@features/editor/extensions/paste-rules/clipboard';
 import { LinkSelectionHighlight, MarkdownLink } from '@features/editor/extensions/markdown-link';
 import { NoteReference } from '@features/editor/extensions/note-link';
+import { AgentReference } from '@features/editor/extensions/agent-reference/agent-reference';
 import { NoteMention, WikiNoteMention } from '@features/editor/extensions/note-mention';
 import { TagMention } from '@features/editor/extensions/tag-mention';
 import { CodeBlockShiki } from '@features/editor/extensions/codeblock-shiki/codeblock-shiki';
@@ -1056,6 +1057,7 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
         MarkdownPaste,
         Frontmatter.configure({ propertyTargetId, onViewSourceMode, getAttachmentNotebookId }),
         NoteReference,
+        AgentReference,
         NoteMention,
         WikiNoteMention,
         TagMention,

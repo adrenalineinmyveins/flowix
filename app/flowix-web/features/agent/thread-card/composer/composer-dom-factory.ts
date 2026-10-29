@@ -16,6 +16,8 @@ export interface AgentComposerDomParts {
   input: HTMLDivElement;
   codexSettingsPopover: HTMLDivElement;
   composerRolePopover: HTMLDivElement;
+  /** AGENT-MARKET M4：「订阅的 Agent」二级弹层，复用笔记弹层样式。 */
+  composerAgentPopover: HTMLDivElement;
   sendButtonMount: HTMLSpanElement;
 }
 
@@ -153,13 +155,17 @@ export function createAgentComposerDom(
   composerAddPopover.className = 'agent-thread-card__composer-add-popover';
   composerAddPopover.setAttribute('role', 'menu');
   composerAddPopover.hidden = true;
+  const composerAgentPopover = document.createElement('div');
+  composerAgentPopover.className = 'agent-thread-card__composer-note-popover';
+  composerAgentPopover.setAttribute('role', 'menu');
+  composerAgentPopover.hidden = true;
   composerActions.append(composerRoleIcon);
   // DOM 顺序 ── composerActions (添加按钮) 放在 input 之前, 让非全屏
   // flex (默认 row, DOM 顺序 = 视觉顺序) 状态下添加按钮显示在 input
   // 左侧, 跟全屏态 grid 布局 `grid-column: 1` 把 actions 显式钉在第一列
   // ── 视觉位置对齐。 send button 仍以 sendButtonMount 收尾, 留在最右。
   composer.append(composerImages, composerActions, input, sendButtonMount);
-  document.body.append(codexSettingsPopover, composerAddPopover, composerRolePopover);
+  document.body.append(codexSettingsPopover, composerAddPopover, composerRolePopover, composerAgentPopover);
   // 空区域点击聚焦 ── 见上方 COMPOSER_FOCUS_INTERACTIVE_SELECTOR 注释。
   // 优先使用 pointerdown，避免 click 时浏览器先把焦点移到 body；
   // click 监听作为部分 fullscreen WebView 的事件链兜底。
@@ -174,6 +180,7 @@ export function createAgentComposerDom(
     input,
     codexSettingsPopover,
     composerRolePopover,
+    composerAgentPopover,
     composerAddPopover,
     sendButtonMount,
   };
@@ -184,6 +191,7 @@ export function disposeAgentComposerDom(parts: AgentComposerDomParts): void {
   parts.composer.removeEventListener('click', handleComposerClick);
   parts.codexSettingsPopover.remove();
   parts.composerRolePopover.remove();
+  parts.composerAgentPopover.remove();
   parts.composerAddPopover.remove();
   parts.composer.remove();
 }

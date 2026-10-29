@@ -18,6 +18,10 @@ export {
   type ComposerAddMenuControllerOptions,
 } from "./composer-add-menu-controller";
 export {
+  AgentPickerController,
+  type AgentPickerControllerOptions,
+} from "./agent-picker-controller";
+export {
   COMPOSER_SLASH_COMMANDS,
   ComposerSlashCommandController,
   type ComposerSlashCommand,

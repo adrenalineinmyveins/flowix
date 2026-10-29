@@ -11,6 +11,7 @@ import { BookmarkCheck, BookmarkPlus, ChevronDown, ChevronRight, Copy, Loader2, 
 import { market, redaction } from '@platform/tauri/client';
 import type { SubscribedCard } from '@platform/tauri/client';
 import type { DirectoryCard } from '@/lib/types/redaction';
+import { invalidateMentionAgents } from '@features/editor/extensions/agent-reference/agent-mention-data';
 import { RelayAccountSection } from '@features/agent/components/relay-account-section';
 import { Button } from '@shared/ui/button';
 import { Input } from '@shared/ui/input';
@@ -40,6 +41,8 @@ export function AgentMarket({ notebookPath }: { notebookPath: string }) {
   const reloadSubscriptions = useCallback(async () => {
     try {
       const list = await market.subscriptions();
+      // AGENT-MARKET M4：订阅列表变化后失效 @ 提及缓存（两入口同源）。
+      invalidateMentionAgents();
       if (!disposedRef.current) setSubscriptions(list);
     } catch {
       // 订阅列表读取失败不阻塞市场浏览。
