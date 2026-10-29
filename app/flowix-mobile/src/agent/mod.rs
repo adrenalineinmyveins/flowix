@@ -26,6 +26,10 @@ pub struct AgentProviderConfig {
     pub api_base: String,
     pub api_key: String,
     pub model: String,
+    /// 联网搜索工具（方案 B）：可选 Tavily API key；
+    /// 留空时工具走内置必应网页抓取（免 key，质量以能用为先）。
+    #[serde(default)]
+    pub search_api_key: Option<String>,
 }
 
 impl AgentProviderConfig {
@@ -51,6 +55,32 @@ pub struct AgentState {
     db_path: PathBuf,
     provider_path: PathBuf,
     conn: Mutex<Connection>,
+}
+
+/// 规范化用户输入的 API base：
+/// - 去空白与尾斜杠
+/// - 裸 scheme（`http:x` / `https:x`，缺 `//`）→ 统一 `https://`
+///   （成因多为 https:// 漏字；真 http 自建服务的用户会写全 `http://`）
+/// - 无 scheme 的裸域名 → 补 `https://`
+fn normalize_api_base(raw: &str) -> String {
+    let s = raw.trim().trim_end_matches('/').to_string();
+    if s.is_empty() {
+        return s;
+    }
+    for scheme in ["https", "http"] {
+        if let Some(rest) = s.strip_prefix(&format!("{scheme}://")) {
+            return format!("{scheme}://{rest}");
+        }
+        if let Some(rest) = s.strip_prefix(&format!("{scheme}:")) {
+            if !rest.is_empty() && !rest.starts_with('/') {
+                return format!("https://{rest}");
+            }
+        }
+    }
+    if s.contains("://") {
+        return s;
+    }
+    format!("https://{s}")
 }
 
 impl AgentState {
@@ -92,7 +122,11 @@ impl AgentState {
     }
 
     pub fn save_provider_config(&self, config: &AgentProviderConfig) -> Result<(), String> {
-        let content = serde_json::to_string(config).map_err(|e| e.to_string())?;
+        // apiBase 规范化：容忍常见笔误（"api.x.com"、缺少斜杠的 "http:api.x.com"），
+        // 否则畸形 URL 会让所有对话请求静默失败（用户只看到"没有回复"）。
+        let mut config = config.clone();
+        config.api_base = normalize_api_base(&config.api_base);
+        let content = serde_json::to_string(&config).map_err(|e| e.to_string())?;
         flowix_core::memo_file::atomic_write_bytes(&self.provider_path, content.as_bytes())
             .map_err(|e| e.to_string())
     }
@@ -339,6 +373,19 @@ pub(crate) fn enqueue_thread_change_and_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_base_normalization() {
+        // 常见笔误：缺斜杠、无 scheme、尾斜杠、空白
+        assert_eq!(normalize_api_base("http:api.deepseek.com"), "https://api.deepseek.com");
+        assert_eq!(normalize_api_base("https:api.x.com"), "https://api.x.com");
+        assert_eq!(normalize_api_base("api.deepseek.com/"), "https://api.deepseek.com");
+        assert_eq!(normalize_api_base(" 8.160.162.251:8787 "), "https://8.160.162.251:8787");
+        // http 明确保留、已规范不变
+        assert_eq!(normalize_api_base("http://192.168.1.10:8787"), "http://192.168.1.10:8787");
+        assert_eq!(normalize_api_base("https://api.deepseek.com"), "https://api.deepseek.com");
+        assert_eq!(normalize_api_base(""), "");
+    }
 
     fn temp_agent_state(tag: &str) -> (AgentState, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("flowix-agent-test-{tag}-{}", std::process::id()));

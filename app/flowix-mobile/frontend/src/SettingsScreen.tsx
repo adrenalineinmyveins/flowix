@@ -190,6 +190,16 @@ export function SettingsScreen({ cloud, notebooks, onBack, onLogout }: Props) {
               value={provider.model}
               onChange={(event) => setProvider({ ...provider, model: event.target.value })}
             />
+            <input
+              className="m-input"
+              placeholder="搜索 API Key（可选，Tavily；留空用内置必应搜索）"
+              type="password"
+              autoCapitalize="off"
+              value={provider.searchApiKey ?? ''}
+              onChange={(event) =>
+                setProvider({ ...provider, searchApiKey: event.target.value || null })
+              }
+            />
           </div>
           <div style={{ padding: '12px 0' }}>
             <button className="m-btn-ghost" style={{ width: '100%' }} disabled={busy} onClick={doSaveProvider}>

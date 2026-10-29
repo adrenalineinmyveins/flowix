@@ -109,6 +109,8 @@ pub(crate) async fn chat_send(
     }
     let thread_id = match thread_id {
         Some(id) if id.starts_with("th_") => id,
+        // 新会话页前端传空串（非 null）：视同未指定，走新建
+        Some(id) if id.trim().is_empty() => AgentState::new_thread_id(),
         // 桌面同步卡携带桌面本地 id（无 th_ 前缀）：归一到已同步的 th_ 实体
         // 续聊；未同步到本机时报错，不静默新建分叉线程。
         Some(id) => match agent.thread_payload_normalized(&id)? {
@@ -177,6 +179,17 @@ pub(crate) async fn chat_send(
     Ok(thread_id)
 }
 
+/// 单轮流式补全输出：正文/思考（已边收边 emit），以及完整累积的 tool_calls。
+struct TurnOutput {
+    content: String,
+    reasoning: String,
+    /// (id, name, arguments_json)
+    tool_calls: Vec<(String, String, String)>,
+}
+
+/// 工具循环上限：防模型连续调用工具烧钱；用尽后按已有内容收尾。
+const MAX_TOOL_ROUNDS: usize = 5;
+
 async fn run_chat_turn(
     app: AppHandle,
     agent: Arc<AgentState>,
@@ -195,15 +208,13 @@ async fn run_chat_turn(
         },
     );
 
-    // 请求体：历史投影为 OpenAI 消息数组（reasoning/tool 只读字段不上行）。
-    // 最后一条 user 消息按需拼接上下文块（llmContent 语义，落库仍为原文）。
-    // 带附件的 user 消息用 vision 数组 content（image_url data URL）；
-    // 附件读取失败静默跳过（降级纯文本，不阻断请求）。
+    // 历史投影为 OpenAI 消息数组（reasoning/tool 历史不上行——旧工具结果
+    // 不进上下文，本轮工具结果在循环内以标准 messages 传递）。
     let last_user_index = payload
         .messages
         .iter()
         .rposition(|message| message.role == "user");
-    let messages: Vec<Value> = payload
+    let mut messages: Vec<Value> = payload
         .messages
         .iter()
         .enumerate()
@@ -239,11 +250,6 @@ async fn run_chat_turn(
             })
         })
         .collect();
-    let body = serde_json::json!({
-        "model": config.model,
-        "messages": messages,
-        "stream": true,
-    });
 
     let client = match reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(20))
@@ -255,34 +261,204 @@ async fn run_chat_turn(
             return;
         }
     };
+
+    let web_search_tool = serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "联网搜索最新信息。当问题涉及时效性、新闻、价格、版本号或你不确定的事实性内容时调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "搜索关键词" }
+                },
+                "required": ["query"]
+            }
+        }
+    });
+
+    // 工具循环：模型请求工具 → 执行搜索 → 结果回填 → 再请求，直到纯文本回答或达上限。
+    let mut assistant_content = String::new();
+    let mut reasoning_content = String::new();
+    for round in 0..MAX_TOOL_ROUNDS {
+        let mut body = serde_json::json!({
+            "model": config.model,
+            "messages": &messages,
+            "stream": true,
+        });
+        body["tools"] = serde_json::json!([web_search_tool]);
+        let output = match stream_completion(
+            &app,
+            &thread_id,
+            &stop,
+            &client,
+            &config,
+            body,
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                emit_error_and_end(&app, &thread_id, &error);
+                return;
+            }
+        };
+        reasoning_content.push_str(&output.reasoning);
+        if output.tool_calls.is_empty() {
+            assistant_content = output.content;
+            break;
+        }
+
+        // 1) assistant(tool_calls) 消息入上下文（OpenAI 协议要求 tool 前置）
+        let calls: Vec<Value> = output
+            .tool_calls
+            .iter()
+            .map(|(id, name, args)| {
+                serde_json::json!({
+                    "id": id,
+                    "type": "function",
+                    "function": { "name": name, "arguments": args }
+                })
+            })
+            .collect();
+        messages.push(serde_json::json!({
+            "role": "assistant",
+            "content": if output.content.is_empty() { Value::Null } else { serde_json::json!(output.content) },
+            "tool_calls": calls,
+        }));
+
+        // 2) 执行每个工具调用：搜索 → 工具消息落库（UI 工具行）+ 上下文回填
+        let mut round_failed = false;
+        for (call_id, name, args_json) in &output.tool_calls {
+            let query = serde_json::from_str::<Value>(args_json)
+                .ok()
+                .and_then(|args| args["query"].as_str().map(str::to_string))
+                .unwrap_or_default();
+            if name != "web_search" || query.trim().is_empty() {
+                let hint = format!("AGENT_TOOL_UNSUPPORTED: {name}");
+                messages.push(serde_json::json!({
+                    "role": "tool", "tool_call_id": call_id, "content": hint,
+                }));
+                round_failed = true;
+                continue;
+            }
+            let results = web_search_dispatch(&client, &config, &query).await;
+            let (tool_data, llm_content) = match &results {
+                Ok(data) => (data.clone(), data.clone()),
+                Err(error) => {
+                    let hint = format!("搜索失败：{error}");
+                    round_failed = true;
+                    (hint.clone(), hint)
+                }
+            };
+            // 工具过程走思考通道（不污染正文气泡）
+            let _ = app.emit(
+                "agent-chunk",
+                AgentChunk::Reasoning {
+                    thread_id: thread_id.clone(),
+                    delta: format!("\n[工具] web_search(\"{query}\")\n{}\n", tool_data),
+                },
+            );
+            payload.messages.push(V2ThreadMessage {
+                id: AgentState::new_message_id(),
+                role: "tool".into(),
+                content: String::new(),
+                reasoning: None,
+                tool_name: Some("web_search".into()),
+                tool_input: Some(args_json.clone()),
+                tool_data: Some(tool_data),
+                created_at: chrono::Utc::now().timestamp_millis(),
+                origin: Some("mobile".into()),
+                attachments: Vec::new(),
+            });
+            messages.push(serde_json::json!({
+                "role": "tool", "tool_call_id": call_id, "content": llm_content,
+            }));
+        }
+        if let Err(error) = agent.save_thread_payload(&payload) {
+            emit_error_and_end(&app, &thread_id, &format!("AGENT_PERSIST_FAILED: {error}"));
+            return;
+        }
+        super::enqueue_thread_change_and_sync(&app, &agent, &sync, &payload);
+        let _ = app.emit(THREADS_CHANGED_EVENT, ());
+        if round_failed && round + 1 == MAX_TOOL_ROUNDS {
+            break;
+        }
+    }
+
+    // 回合收尾：assistant 消息落库（停止/中断也保留已生成部分）
+    let stopped = stop.load(Ordering::SeqCst);
+    stop.store(false, Ordering::SeqCst);
+    if assistant_content.is_empty() && !stopped {
+        assistant_content = "（工具调用达到上限，未能生成最终回答，请重试）".into();
+    }
+    if !assistant_content.is_empty() {
+        payload.messages.push(V2ThreadMessage {
+            id: AgentState::new_message_id(),
+            role: "assistant".into(),
+            content: if stopped {
+                format!("{assistant_content}\n\n[已手动停止]")
+            } else {
+                assistant_content
+            },
+            reasoning: (!reasoning_content.is_empty()).then_some(reasoning_content),
+            tool_name: None,
+            tool_input: None,
+            tool_data: None,
+            created_at: chrono::Utc::now().timestamp_millis(),
+            origin: Some("mobile".into()),
+            attachments: Vec::new(),
+        });
+        if let Err(error) = agent.save_thread_payload(&payload) {
+            emit_error_and_end(&app, &thread_id, &format!("AGENT_PERSIST_FAILED: {error}"));
+            return;
+        }
+        super::enqueue_thread_change_and_sync(&app, &agent, &sync, &payload);
+    }
+    let _ = app.emit(
+        "agent-chunk",
+        AgentChunk::StreamEnd {
+            thread_id: thread_id.clone(),
+        },
+    );
+    let _ = app.emit(THREADS_CHANGED_EVENT, ());
+}
+
+/// 单轮 SSE 补全：text/reasoning 增量边收边 emit；tool_calls 增量按 index 累积。
+/// 返回 Err 仅在「无任何可用内容」的失败场景（与旧单轮语义一致）。
+async fn stream_completion(
+    app: &AppHandle,
+    thread_id: &str,
+    stop: &Arc<std::sync::atomic::AtomicBool>,
+    client: &reqwest::Client,
+    config: &super::AgentProviderConfig,
+    body: Value,
+) -> Result<TurnOutput, String> {
     let request = client
         .post(config.chat_completions_url())
         .bearer_auth(&config.api_key)
         .json(&body);
-
-    let response = match request.send().await {
-        Ok(response) => response,
-        Err(error) => {
-            emit_error_and_end(&app, &thread_id, &format!("AGENT_REQUEST_FAILED: {error}"));
-            return;
-        }
-    };
+    let response = request.send().await.map_err(|error| {
+        format!("AGENT_REQUEST_FAILED: {error}")
+    })?;
     if !response.status().is_success() {
         let status = response.status().as_u16();
         let detail = response.text().await.unwrap_or_default();
-        emit_error_and_end(
-            &app,
-            &thread_id,
-            &format!("AGENT_HTTP_{status}: {}", detail.chars().take(300).collect::<String>()),
-        );
-        return;
+        return Err(format!(
+            "AGENT_HTTP_{status}: {}",
+            detail.chars().take(300).collect::<String>()
+        ));
     }
 
-    // 3. SSE 流消费：行缓冲 + data: 帧解析（无现成 SSE crate，手写）
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
-    let mut assistant_content = String::new();
-    let mut reasoning_content = String::new();
+    let mut output = TurnOutput {
+        content: String::new(),
+        reasoning: String::new(),
+        tool_calls: Vec::new(),
+    };
+    // tool_calls 增量按 index 定位累积（OpenAI 流式协议）
+    let mut call_slots: Vec<(String, String, String)> = Vec::new();
     let mut finished = false;
     while !finished {
         if stop.load(Ordering::SeqCst) {
@@ -306,14 +482,15 @@ async fn run_chat_turn(
                     let Ok(event) = serde_json::from_str::<Value>(data) else {
                         continue;
                     };
-                    let delta = &event["choices"][0]["delta"];
+                    let choice = &event["choices"][0];
+                    let delta = &choice["delta"];
                     if let Some(reasoning) = delta["reasoning_content"].as_str() {
                         if !reasoning.is_empty() {
-                            reasoning_content.push_str(reasoning);
+                            output.reasoning.push_str(reasoning);
                             let _ = app.emit(
                                 "agent-chunk",
                                 AgentChunk::Reasoning {
-                                    thread_id: thread_id.clone(),
+                                    thread_id: thread_id.to_string(),
                                     delta: reasoning.to_string(),
                                 },
                             );
@@ -321,74 +498,199 @@ async fn run_chat_turn(
                     }
                     if let Some(text) = delta["content"].as_str() {
                         if !text.is_empty() {
-                            assistant_content.push_str(text);
+                            output.content.push_str(text);
                             let _ = app.emit(
                                 "agent-chunk",
                                 AgentChunk::Text {
-                                    thread_id: thread_id.clone(),
+                                    thread_id: thread_id.to_string(),
                                     delta: text.to_string(),
                                 },
                             );
                         }
                     }
+                    if let Some(calls) = delta["tool_calls"].as_array() {
+                        for call in calls {
+                            let index = call["index"].as_u64().unwrap_or(0) as usize;
+                            while call_slots.len() <= index {
+                                call_slots.push((String::new(), String::new(), String::new()));
+                            }
+                            let slot = &mut call_slots[index];
+                            if let Some(id) = call["id"].as_str() {
+                                if !id.is_empty() {
+                                    slot.0 = id.to_string();
+                                }
+                            }
+                            if let Some(name) = call["function"]["name"].as_str() {
+                                if !name.is_empty() {
+                                    slot.1 = name.to_string();
+                                }
+                            }
+                            if let Some(args) = call["function"]["arguments"].as_str() {
+                                slot.2.push_str(args);
+                            }
+                        }
+                    }
                 }
             }
             Ok(Some(Err(error))) => {
-                if !assistant_content.is_empty() {
-                    // 网络中断但已有部分回答：按已收内容收尾落库
-                    eprintln!("[agent] stream interrupted, keeping partial reply: {error}");
-                } else {
-                    emit_error_and_end(&app, &thread_id, &format!("AGENT_STREAM_FAILED: {error}"));
-                    return;
+                if output.content.is_empty() && call_slots.is_empty() {
+                    return Err(format!("AGENT_STREAM_FAILED: {error}"));
                 }
+                eprintln!("[agent] stream interrupted, keeping partial reply: {error}");
                 break;
             }
             Ok(None) => break,
             Err(_) => {
-                // 120s 无任何 chunk：按超时收尾
-                if assistant_content.is_empty() {
-                    emit_error_and_end(&app, &thread_id, "AGENT_STREAM_TIMEOUT");
-                    return;
+                if output.content.is_empty() && call_slots.is_empty() {
+                    return Err("AGENT_STREAM_TIMEOUT".into());
                 }
                 break;
             }
         }
     }
+    output.tool_calls = call_slots
+        .into_iter()
+        .filter(|(_, name, _)| !name.is_empty())
+        .collect();
+    Ok(output)
+}
 
-    // 4. 回合收尾：assistant 消息落库（停止/中断也保留已生成部分）
-    let stopped = stop.load(Ordering::SeqCst);
-    stop.store(false, Ordering::SeqCst);
-    if !assistant_content.is_empty() {
-        let now = chrono::Utc::now().timestamp_millis();
-        payload.messages.push(V2ThreadMessage {
-            id: AgentState::new_message_id(),
-            role: "assistant".into(),
-            content: if stopped {
-                format!("{assistant_content}\n\n[已手动停止]")
-            } else {
-                assistant_content
-            },
-            reasoning: (!reasoning_content.is_empty()).then_some(reasoning_content),
-            tool_name: None,
-            tool_input: None,
-            tool_data: None,
-            created_at: now,
-            origin: Some("mobile".into()),
-            attachments: Vec::new(),
-        });
-        if let Err(error) = agent.save_thread_payload(&payload) {
-            emit_error_and_end(&app, &thread_id, &format!("AGENT_PERSIST_FAILED: {error}"));
-            return;
-        }
-        super::enqueue_thread_change_and_sync(&app, &agent, &sync, &payload);
+// ── 联网搜索工具（方案 B）──────────────────────────────────────────
+// Tavily（配置 key 时，结果质量高）或内置必应网页抓取（免 key 兜底）。
+
+async fn web_search_dispatch(
+    client: &reqwest::Client,
+    config: &super::AgentProviderConfig,
+    query: &str,
+) -> Result<String, String> {
+    match config.search_api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        Some(key) => tavily_search(client, key, query).await,
+        None => bing_search(client, query).await,
     }
-    let _ = app.emit(
-        "agent-chunk",
-        AgentChunk::StreamEnd {
-            thread_id: thread_id.clone(),
-        },
+}
+
+/// Tavily API：POST /search，返回 markdown 化的结果列表。
+async fn tavily_search(client: &reqwest::Client, key: &str, query: &str) -> Result<String, String> {
+    let response = client
+        .post("https://api.tavily.com/search")
+        .bearer_auth(key)
+        .json(&serde_json::json!({ "query": query, "max_results": 5 }))
+        .send()
+        .await
+        .map_err(|e| format!("TAVILY_REQUEST_FAILED: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("TAVILY_HTTP_{}", response.status().as_u16()));
+    }
+    let value: Value = response
+        .json()
+        .await
+        .map_err(|e| format!("TAVILY_PARSE_FAILED: {e}"))?;
+    let mut lines = Vec::new();
+    if let Some(results) = value["results"].as_array() {
+        for (i, item) in results.iter().enumerate().take(5) {
+            let title = item["title"].as_str().unwrap_or_default();
+            let url = item["url"].as_str().unwrap_or_default();
+            let snippet = item["content"].as_str().unwrap_or_default();
+            lines.push(format!("{}. {} | {}\n{}", i + 1, title, url, snippet));
+        }
+    }
+    if lines.is_empty() {
+        return Err("TAVILY_EMPTY".into());
+    }
+    Ok(lines.join("\n\n"))
+}
+
+/// 必应网页抓取（免 key 兜底）：cn.bing.com 结果页粗解析（b_algo 块的
+/// 标题/链接/摘要）。页面结构变化时会退化到空结果，模型将如实告知。
+async fn bing_search(client: &reqwest::Client, query: &str) -> Result<String, String> {
+    let url = format!(
+        "https://cn.bing.com/search?q={}",
+        urlencode(query)
     );
-    let _ = app.emit(THREADS_CHANGED_EVENT, ());
+    let response = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Mobile Safari/537.36")
+        .header("Accept-Language", "zh-CN,zh;q=0.9")
+        .send()
+        .await
+        .map_err(|e| format!("BING_REQUEST_FAILED: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("BING_HTTP_{}", response.status().as_u16()));
+    }
+    let html = response
+        .text()
+        .await
+        .map_err(|e| format!("BING_READ_FAILED: {e}"))?;
+    let mut lines = Vec::new();
+    for block in html.split("<li class=\"b_algo").skip(1).take(5) {
+        let Some(link) = capture_first(block, "href=\"", "\"") else {
+            continue;
+        };
+        let Some(title) = capture_first(block, "<h2>", "</h2>") else {
+            continue;
+        };
+        let snippet = capture_first(block, "<p", "</p>")
+            .map(|raw| {
+                // 去标签 + 反转义
+                let text = strip_tags(&raw);
+                html_unescape(&text)
+            })
+            .unwrap_or_default();
+        let title = html_unescape(&strip_tags(&title));
+        let snippet = snippet.chars().take(300).collect::<String>();
+        if !link.starts_with("http") {
+            continue;
+        }
+        lines.push(format!("{}. {} | {}\n{}", lines.len() + 1, title, link, snippet));
+    }
+    if lines.is_empty() {
+        return Err("BING_EMPTY（页面结构可能已变化）".into());
+    }
+    Ok(lines.join("\n\n"))
+}
+
+/// 从 text 中取 start 之后、首个 end 之前的片段（片段内标签保留，调用方清洗）。
+fn capture_first(text: &str, start: &str, end: &str) -> Option<String> {
+    let start_idx = text.find(start)? + start.len();
+    let rest = &text[start_idx..];
+    let end_idx = rest.find(end)?;
+    Some(rest[..end_idx].to_string())
+}
+
+fn urlencode(input: &str) -> String {
+    let mut out = String::new();
+    for byte in input.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn strip_tags(html: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for ch in html.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn html_unescape(text: &str) -> String {
+    text.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
 }
 
 /// 附件 → data URL（读失败/空文件返回 None，调用方跳过该附件）。

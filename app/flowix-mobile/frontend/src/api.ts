@@ -84,6 +84,8 @@ export interface AgentProviderConfig {
   apiBase: string;
   apiKey: string;
   model: string;
+  /** 联网搜索工具：可选 Tavily key；留空走内置必应抓取 */
+  searchApiKey?: string | null;
 }
 
 export interface ThreadSummary {
