@@ -37,6 +37,9 @@ android {
             }
         }
         getByName("release") {
+            // 自建云场景：中继/云端均为 http（IP 直连），release 亦放开明文流量。
+            // 待云端补 TLS（域名就位）后可移除此行恢复默认 false。
+            manifestPlaceholders["usesCleartextTraffic"] = "true"
             isMinifyEnabled = true
             proguardFiles(
                 *fileTree(".") { include("**/*.pro") }
