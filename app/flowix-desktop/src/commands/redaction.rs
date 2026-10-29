@@ -549,14 +549,15 @@ pub async fn redaction_directory_publish(
     crate::redaction::directory::publish_confirmed(&root, &draft_id).await
 }
 
-/// 目录搜索（public 卡）。relay_url 缺省用账号中继。
+/// 目录搜索（public 卡）。relay_url/tag 缺省：relay 用账号中继、tag 不过滤
+/// （前端可选参数传 undefined 时键被省略，必填 String 会报 missing key）。
 #[tauri::command]
 pub async fn redaction_directory_search(
     relay_url: Option<String>,
     q: String,
-    tag: String,
+    tag: Option<String>,
 ) -> Result<Vec<crate::redaction::directory::DirectoryCard>, String> {
-    crate::redaction::directory::search(relay_url.as_deref(), &q, &tag).await
+    crate::redaction::directory::search(relay_url.as_deref(), &q, tag.as_deref().unwrap_or("")).await
 }
 
 /// 单卡详情（public/unlisted 可达；private → CARD_FETCH_REJECTED:404）。
