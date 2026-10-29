@@ -82,15 +82,18 @@ function useThreadChat(
   }, [oldest, messages]);
 
   useEffect(() => {
+    console.debug('[atc] mount, threadId=', threadId);
     activeThreadRef.current = threadId;
     setMessages(null);
     setLiveText('');
     setLiveReasoning('');
     void reload();
+    return () => console.debug('[atc] unmount, threadId=', threadId);
   }, [threadId, reload]);
 
   useEffect(() => {
     const unlisten = listenEvent<AgentChunk>('agent-chunk', (chunk) => {
+      console.debug('[atc] chunk', chunk.kind, chunk.thread_id, 'active=', activeThreadRef.current, 'inflight=', inflightRef.current);
       const mine =
         chunk.thread_id === activeThreadRef.current ||
         (activeThreadRef.current === null && inflightRef.current);
@@ -138,6 +141,7 @@ function useThreadChat(
   const send = useCallback(
     async (content: string): Promise<boolean> => {
       const trimmed = content.trim();
+      console.debug('[atc] send enter', JSON.stringify(trimmed), 'streaming=', streaming, 'active=', activeThreadRef.current, 'inflight=', inflightRef.current);
       if (!trimmed || streaming) return false;
       setError('');
       inflightRef.current = true;
@@ -148,11 +152,14 @@ function useThreadChat(
       ]);
       try {
         // P1a：卡片携带所在笔记上下文（仅首条消息生效，落库恒为原文）
+        console.debug('[atc] invoking agent_chat_send');
         const resolved = await api.agentChatSend(activeThreadRef.current, trimmed, noteContextRef.current);
+        console.debug('[atc] send resolved', resolved);
         inflightRef.current = false;
         adoptThreadId(resolved);
         return true;
       } catch (e) {
+        console.debug('[atc] send failed', String(e));
         inflightRef.current = false;
         setError(friendlyAgentError(e));
         return false;
@@ -200,14 +207,20 @@ function AgentThreadCardComponent({ node, editor, getPos, deleteNode }: NodeView
       if (typeof getPos !== 'function') return;
       const pos = getPos();
       if (typeof pos !== 'number') return;
+      // 必须从当前文档读最新 attrs 再合并：NodeView 的 props.node 可能滞后于
+      // 最近一次事务（send 成功后连续两次 updateAttrs——threadId 与 inputDraft——
+      // 若第二次基于旧快照合并，会把第一次刚写入的 threadId 覆盖回 null，
+      // 导致组件重挂后 chunk 全部失配、流式输出丢失）。
+      const currentNode = editor.view.state.doc.nodeAt(pos);
+      if (!currentNode) return;
       editor.view.dispatch(
         editor.view.state.tr.setNodeMarkup(pos, undefined, {
-          ...node.attrs,
+          ...currentNode.attrs,
           ...patch,
         }),
       );
     },
-    [editor, getPos, node.attrs],
+    [editor, getPos],
   );
 
   const handleThreadResolved = useCallback(
