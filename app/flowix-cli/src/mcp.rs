@@ -125,9 +125,11 @@ fn consult_targets_tool_definition() -> Value {
     })
 }
 
-/// AGENT-PROFILE-REDESIGN P2：对话内 agent 配置工具（直读写
-/// `<cwd>/.agents/<id>/profile.md`，与 memo 同权）。写权执法：内容字段
-/// 白名单 + memory 非对称闸门（缩可行、扩引导 UI——记忆库即披露授权）。
+/// AGENT-PROFILE-REDESIGN P2：对话内 agent 配置工具（直读写笔记本
+/// `.agents/<id>/profile.md`，与 memo 同权）。定位走全局笔记本配置而非
+/// cwd——DSH 会话内 CLI 继承的是 appserver 进程目录，cwd 不可靠（M2
+/// 实机验证结论）。写权执法：内容字段白名单 + memory 非对称闸门（缩
+/// 可行、扩引导 UI——记忆库即披露授权）。
 fn agent_profile_tool_definition() -> Value {
     let schema: Value = serde_json::from_str(include_str!(
         "../../../dsh-flowix-memory/agent-profile-tool-schema.json"
@@ -630,18 +632,32 @@ fn call_consult_tool(params: &Map<String, Value>) -> Result<Value, CliError> {
 // AGENT-PROFILE-REDESIGN P2：agent_profile —— 对话内配置（直读写文件）
 // ----------------------------------------------------------------------
 
-fn agents_root_dir() -> Result<std::path::PathBuf, CliError> {
-    let cwd = std::env::current_dir()
-        .map_err(|error| CliError::Other(format!("resolve cwd: {error}")))?;
-    Ok(cwd.join(".agents"))
+/// 已注册笔记本的 (id, name, `.agents` 根) 列表。DSH 会话内 CLI 的 cwd
+/// 是 appserver 进程目录而非会话笔记本根（launcher 不传 cwd），因此定位
+/// 一律走全局配置，与 memo 工具同源。
+fn notebook_agents_roots() -> Result<Vec<(String, String, std::path::PathBuf)>, CliError> {
+    let (configs, _) = store::notebooks_list_data()?;
+    Ok(configs
+        .into_iter()
+        .map(|config| {
+            let root = std::path::PathBuf::from(&config.path).join(".agents");
+            (config.id, config.name, root)
+        })
+        .collect())
 }
 
-fn read_agent_profile(agent_id: &str) -> Result<(flowix_core::agent::AgentProfile, String), CliError> {
-    let path = agents_root_dir()?.join(agent_id).join("profile.md");
-    let content = std::fs::read_to_string(&path)
-        .map_err(|_| CliError::Other(format!("AGENT_NOT_FOUND:{agent_id}")))?;
-    flowix_core::agent::AgentProfile::parse(&content)
-        .map_err(|error| CliError::Other(format!("PROFILE_INVALID:{error}")))
+fn read_agent_profile(
+    agent_id: &str,
+) -> Result<(flowix_core::agent::AgentProfile, String, std::path::PathBuf), CliError> {
+    for (_notebook_id, _notebook_name, root) in notebook_agents_roots()? {
+        let path = root.join(agent_id).join("profile.md");
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let (profile, body) = flowix_core::agent::AgentProfile::parse(&content)
+                .map_err(|error| CliError::Other(format!("PROFILE_INVALID:{error}")))?;
+            return Ok((profile, body, path));
+        }
+    }
+    Err(CliError::Other(format!("AGENT_NOT_FOUND:{agent_id}")))
 }
 
 fn agent_profile_json(profile: &flowix_core::agent::AgentProfile) -> Value {
@@ -681,30 +697,34 @@ fn call_agent_profile_tool(params: &Map<String, Value>) -> Result<Value, CliErro
         .ok_or_else(|| CliError::Usage("agent_profile.action is required".into()))?;
     match action {
         "list" => {
-            let root = agents_root_dir()?;
             let mut agents = Vec::new();
-            if let Ok(entries) = std::fs::read_dir(&root) {
-                for entry in entries.flatten() {
-                    let profile_path = entry.path().join("profile.md");
-                    let Ok(content) = std::fs::read_to_string(&profile_path) else { continue };
-                    if let Ok((profile, _)) = flowix_core::agent::AgentProfile::parse(&content) {
-                        agents.push(json!({
-                            "agentId": profile.agent_id,
-                            "displayName": profile.display_name,
-                            "model": profile.model,
-                        }));
+            for (notebook_id, notebook_name, root) in notebook_agents_roots()? {
+                if let Ok(entries) = std::fs::read_dir(&root) {
+                    for entry in entries.flatten() {
+                        let profile_path = entry.path().join("profile.md");
+                        let Ok(content) = std::fs::read_to_string(&profile_path) else { continue };
+                        if let Ok((profile, _)) = flowix_core::agent::AgentProfile::parse(&content) {
+                            agents.push(json!({
+                                "agentId": profile.agent_id,
+                                "displayName": profile.display_name,
+                                "model": profile.model,
+                                "notebook": notebook_name,
+                                "notebookId": notebook_id,
+                            }));
+                        }
                     }
                 }
             }
+            agents.sort_by(|a, b| a["agentId"].as_str().cmp(&b["agentId"].as_str()));
             Ok(json!({
-                "content": [{"type": "text", "text": format!("{} agent(s) on this device", agents.len())}],
+                "content": [{"type": "text", "text": format!("{} agent(s) across registered notebooks", agents.len())}],
                 "structuredContent": {"agents": agents},
                 "isError": false
             }))
         }
         "get" => {
             let agent_id = required_agent_id(arguments)?;
-            let (profile, _) = read_agent_profile(&agent_id)?;
+            let (profile, _, _) = read_agent_profile(&agent_id)?;
             Ok(json!({
                 "content": [{"type": "text", "text": format!("Agent {} ({})", profile.display_name, profile.agent_id)}],
                 "structuredContent": agent_profile_json(&profile),
@@ -717,7 +737,7 @@ fn call_agent_profile_tool(params: &Map<String, Value>) -> Result<Value, CliErro
                 .get("patch")
                 .and_then(Value::as_object)
                 .ok_or_else(|| CliError::Usage("agent_profile.update requires `patch`".into()))?;
-            let (mut profile, body) = read_agent_profile(&agent_id)?;
+            let (mut profile, body, path) = read_agent_profile(&agent_id)?;
             for (key, value) in patch {
                 match key.as_str() {
                     "displayName" => profile.display_name = string_of(value, "displayName")?,
@@ -766,7 +786,6 @@ fn call_agent_profile_tool(params: &Map<String, Value>) -> Result<Value, CliErro
                 .validate()
                 .map_err(|error| CliError::Other(format!("PROFILE_INVALID:{error}")))?;
             // 原子写（tmp + rename），与桌面 commands/agent_profile 同契约。
-            let path = agents_root_dir()?.join(&agent_id).join("profile.md");
             let temporary = path.with_extension("md.flowix-tmp");
             std::fs::write(&temporary, profile.serialize(&body)).map_err(CliError::Io)?;
             std::fs::rename(&temporary, &path).map_err(CliError::Io)?;
@@ -1002,6 +1021,47 @@ mod tests {
             .collect()
     }
 
+    /// FLOWIX_HOME 串行锁：与 path_store 测试共用 crate 级锁。
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_env::lock_flowix_home()
+    }
+
+    /// 临时 FLOWIX_HOME + 一个指向 root/notebook 的注册笔记本（name=NB）。
+    /// 返回 (root, 原 FLOWIX_HOME)，测试完调 [`restore_home`]。
+    fn install_temp_home(tag: &str) -> (std::path::PathBuf, Option<std::ffi::OsString>) {
+        let root = std::env::temp_dir().join(format!(
+            "flowix-mcp-ap-{}-{}",
+            std::process::id(),
+            tag
+        ));
+        let config = root.join("config");
+        let notebook = root.join("notebook");
+        std::fs::create_dir_all(&notebook).unwrap();
+        let mf = flowix_core::memo_file::MemoFile::new(config.clone());
+        mf.write_notebook_configs(&[flowix_core::memo_file::NotebookConfig {
+            id: "nb1".into(),
+            name: "NB".into(),
+            icon: None,
+            path: notebook.to_string_lossy().to_string(),
+            is_default: true,
+            sort: 0,
+            created_at: 0,
+            updated_at: 0,
+        }])
+        .unwrap();
+        let previous = std::env::var_os("FLOWIX_HOME");
+        std::env::set_var("FLOWIX_HOME", &config);
+        (root, previous)
+    }
+
+    fn restore_home(previous: Option<std::ffi::OsString>, root: std::path::PathBuf) {
+        match previous {
+            Some(value) => std::env::set_var("FLOWIX_HOME", value),
+            None => std::env::remove_var("FLOWIX_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn lists_memo_and_consult_tools() {
         let responses = run(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#);
@@ -1108,14 +1168,62 @@ mod tests {
         );
     }
 
-    /// P2 工具面在测试环境（无 .agents 或缺 agent）给出结构化错误。
+    /// P2 工具面在无匹配 agent 时给出结构化错误（注入空配置目录，确定性）。
     #[test]
     fn agent_profile_update_unknown_agent_is_structured_error() {
+        let _lock = env_lock();
+        let (root, previous) = install_temp_home("unknown-agent");
         let responses = run(
             r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"agent_profile","arguments":{"action":"update","agentId":"agt_missing00","patch":{"system":"x"}}}}"#,
         );
+        restore_home(previous, root);
         let message = responses[0]["error"]["message"].as_str().unwrap_or_default();
         assert!(message.contains("AGENT_NOT_FOUND"), "{message}");
+    }
+
+    /// DSH 实机结论回归：定位必须走全局笔记本配置而非 cwd——测试进程
+    /// cwd 下没有 .agents，仅当实现依赖 cwd 时本测试会失败。
+    #[test]
+    fn agent_profile_resolves_notebooks_via_config_not_cwd() {
+        let _lock = env_lock();
+        let (root, previous) = install_temp_home("config-resolve");
+        let notebook = root.join("notebook");
+        let agents_dir = notebook.join(".agents").join("agt_cli_t1");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        let profile = "---\n\
+            flowix_kind: agent-profile\n\
+            flowix_agent_id: agt_cli_t1\n\
+            flowix_display_name: \"T1\"\n\
+            flowix_bio: \"\"\n\
+            flowix_expertise: []\n\
+            flowix_agent_type: \"deepseek-harness\"\n\
+            flowix_consultable: true\n\
+            flowix_disclosure_scope:\n  - finance\n\
+            flowix_created_at: 1\n\
+            flowix_updated_at: 2\n\
+            ---\n\nbody kept\n";
+        std::fs::write(agents_dir.join("profile.md"), profile).unwrap();
+        let responses = run(concat!(
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"agent_profile","arguments":{"action":"list"}}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"agent_profile","arguments":{"action":"get","agentId":"agt_cli_t1"}}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"agent_profile","arguments":{"action":"update","agentId":"agt_cli_t1","patch":{"system":"test system"}}}}"#,
+            "\n",
+        ));
+        let listed = &responses[0]["result"]["structuredContent"]["agents"];
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        assert_eq!(listed[0]["agentId"], json!("agt_cli_t1"));
+        assert_eq!(listed[0]["notebook"], json!("NB"));
+        let got = &responses[1]["result"]["structuredContent"];
+        // 旧 disclosure_scope 读归一为 memory（tag: 前缀）。
+        assert_eq!(got["memory"], json!(["tag:finance"]));
+        assert_eq!(responses[2]["result"]["structuredContent"]["system"], json!("test system"));
+        // 写回发生在笔记本目录（而非 cwd）。
+        let written = std::fs::read_to_string(agents_dir.join("profile.md")).unwrap();
+        assert!(written.contains("flowix_system: \"test system\""), "{written}");
+        assert!(written.contains("body kept"));
+        restore_home(previous, root);
     }
 
     #[test]

@@ -18,3 +18,18 @@ mod dispatch;
 
 pub use dispatch::run_cli;
 pub use errors::CliError;
+
+/// `FLOWIX_HOME` 是进程级全局 env，所有注入它的测试（path_store / mcp）
+/// 必须经同一把锁串行，否则并发测试互踩配置目录。
+#[cfg(test)]
+pub(crate) mod test_env {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    pub(crate) fn lock_flowix_home() -> MutexGuard<'static, ()> {
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+}

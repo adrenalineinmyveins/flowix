@@ -11,6 +11,20 @@
 | P3 | ✅ UI「对话与记忆」区块（system/memory/tools/skills/metadata + 披露语义标注）+ IPC 透传（UI 全权：memory 扩缩放行）+ 旧 disclosureScope 入口归一 memory + i18n×2。cards 7 测全绿 |
 | P4 | ✅ F4 `build_consult_prompt` 注入 `<system-instruction>` + `<long-term-memory>` 目录（含披露边界声明）；nurture `should_feed_agent` 切 memory（tag: 项参与闸、note/collection 不参与）。consult 11 / nurture 20 / redaction 67 / desktop 801 / workspace 全绿 |
 | 回归 | 桌面 801/801、workspace 全部 crate 绿、前端 cards 7/7；既有消费方（F4 编排/F2 喂养/redaction/目录）零回退 |
+| 实机 1（进程级） | ✅ 隔离笔记本 + JSONL pipe 驱动 `flowix-cli mcp`：7/7（四工具/list/get/update/mem 缩小放行/扩大拒/越权字段拒）+ 落盘终态正确 |
+| 实机 2（DSH 会话内，23:0x） | ✅ 全链打通：对话→LLM→agent_profile→落盘。发现并修复 2 个集成缺陷（见下） |
+
+### 实机测试发现与修复（2026-10-28 DSH 会话内验证）
+
+| # | 缺陷 | 根因 | 修复 |
+| --- | --- | --- | --- |
+| F-1 | `agent_profile list` 返回 0 agent | 工具用 `current_dir()` 定位 `.agents`，但 DSH 会话内 CLI 经 launcher（不传 cwd）继承的是 **appserver 进程目录**而非会话笔记本根（thread/start 的 cwd 只进会话元数据，不传导到 MCP 子进程） | CLI `mcp.rs` 改走全局笔记本配置（`store::notebooks_list_data`，与 memo 工具同源）：list 扫全部注册笔记本（带 notebook/notebookId 字段），get/update 按 agent_id 跨笔记本定位。+2 单测（`agent_profile_resolves_notebooks_via_config_not_cwd` 等），CLI 68 测全绿 |
+| F-2 | 选中身份卡即渲染崩溃 `Cannot read properties of undefined (reading 'join')` | P1 写废弃后 IPC 不再序列化 `flowix_disclosure_scope`，UI `formFromProfile` 仍直接 `.join()` | 按 D-4/D-6 合并决策从 UI 移除 disclosureScope 表单字段（memory 即唯一入口）；类型字段改可选；清 6 个死 i18n 键。cards 7 测全绿 + tsc 通过 |
+
+实测记录（Loop 笔记本 · 财报解读助手 agt_a83d9cf0f4a530af · deepseek-chat）：
+1. 对话请求 list+get → agent 正确枚举并读取（turn 内 agent 还自行把旧 `flowix_disclosure_scope` 归一写成了 `flowix_memory: ["tag:finance/财报"]`，serialize 格式与正文保留均正确）
+2. 对话令其修改 system → `flowix_system: "E2E-1028 实机测试标记"` 落盘（测试后已恢复原档）
+3. 对话令其新增 memory `tag:diary/e2e` → `Error: MEMORY_EXPANSION_REQUIRES_UI:tag:diary/e2e` 在对话中原样暴露，磁盘无变化（memory/updated_at 均未动）
 
 ## 0. 需求与现状评估
 

@@ -48,6 +48,7 @@ pub mod file_browser_watch;
 pub mod font;
 pub mod helpers;
 pub mod kv;
+pub mod market;
 pub mod media;
 pub mod memo;
 pub mod notebook;

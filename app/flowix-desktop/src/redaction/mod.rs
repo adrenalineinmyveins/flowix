@@ -31,6 +31,7 @@ pub mod directory;
 pub mod e2e;
 pub mod inbound;
 pub mod outbox;
+pub mod subscriptions;
 pub mod transport;
 
 pub use inbound::{

@@ -336,6 +336,13 @@ fn targets_snapshot() -> serde_json::Value {
                     .unwrap_or_else(|| namespaced.clone()),
             })
         })
+        // AGENT-MARKET D-6：订阅的外部 agent（快照自带完整地址，不依赖本地账号）。
+        .chain(crate::redaction::subscriptions::list().into_iter().map(|sub| {
+            serde_json::json!({
+                "agentId": sub.address,
+                "address": format!("{}@{}", sub.address, sub.relay_url),
+            })
+        }))
         .collect();
     serde_json::json!({
         "ok": true,
@@ -393,6 +400,49 @@ async fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> std:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AGENT-MARKET D-6（T10）：订阅的外部 agent 以完整地址并入 consult_targets。
+    #[test]
+    fn targets_include_subscribed_cards_with_full_address() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::redaction::subscriptions::test_support::set_test_path(Some(
+            dir.path().join("subscriptions.json"),
+        ));
+        crate::redaction::subscriptions::test_support::set_entries(vec![
+            crate::redaction::subscriptions::SubscribedCard {
+                address: "alice/caibao".into(),
+                relay_url: "http://relay.test".into(),
+                display_name: "财报解读助手".into(),
+                specialty_tags: vec!["finance".into()],
+                min_redaction_level: "R2".into(),
+                auto_answer: "off".into(),
+                card_public_key: String::new(),
+                subscribed_at: 1,
+                refreshed_at: 1,
+            },
+        ]);
+        let snapshot = targets_snapshot();
+        let targets = snapshot["targets"].as_array().unwrap();
+        let found = targets
+            .iter()
+            .find(|target| target["agentId"] == serde_json::json!("alice/caibao"))
+            .expect("subscribed card in targets");
+        assert_eq!(
+            found["address"],
+            serde_json::json!("alice/caibao@http://relay.test")
+        );
+        // T10 后半：退订后从 targets 消失。
+        crate::redaction::subscriptions::unsubscribe("alice/caibao").unwrap();
+        let after = targets_snapshot();
+        let targets_after = after["targets"].as_array().unwrap();
+        assert!(
+            !targets_after
+                .iter()
+                .any(|target| target["agentId"] == serde_json::json!("alice/caibao")),
+            "退订后 targets 不再包含该卡"
+        );
+        crate::redaction::subscriptions::test_support::set_test_path(None);
+    }
 
     #[test]
     fn parse_request_full_roundtrip() {

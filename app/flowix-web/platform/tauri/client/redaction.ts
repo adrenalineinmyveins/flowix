@@ -113,7 +113,8 @@ export const redaction = {
 
   accountForget: () => invoke<void>('redaction_account_forget'),
 
-  /** 目录卡发布预览（L1 过闸 → draft 留档待人审）。autoAnswer 见 FD-12 M4。 */
+  /** 目录卡发布预览（L1 过闸 → draft 留档待人审）。autoAnswer 见 FD-12 M4；
+   * agentId（AGENT-MARKET D-2）身份卡页发布时关联本地卡。 */
   directoryPreview: (
     cwd: string,
     agentSlug: string,
@@ -122,9 +123,10 @@ export const redaction = {
     visibility: string,
     minRedactionLevel: string,
     autoAnswer?: string,
+    agentId?: string,
   ) =>
     invoke<DirectoryPreviewResult>('redaction_directory_preview', {
-      cwd, agentSlug, displayName, specialtyTags, visibility, minRedactionLevel, autoAnswer,
+      cwd, agentSlug, displayName, specialtyTags, visibility, minRedactionLevel, autoAnswer, agentId,
     }),
 
   directoryConfirm: (cwd: string, draftId: string, approved: boolean) =>

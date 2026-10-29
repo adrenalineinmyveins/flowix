@@ -11,9 +11,15 @@ const agentProfileMock = vi.hoisted(() => ({
   getState: vi.fn(),
 }));
 
+const marketMock = vi.hoisted(() => ({
+  myCards: vi.fn(),
+  unpublish: vi.fn(),
+}));
+
 vi.mock('@platform/tauri/client', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   agentProfile: agentProfileMock,
+  market: marketMock,
 }));
 
 import type { AgentProfile } from '@/lib/types/agent-profile';
@@ -79,8 +85,8 @@ function selects(): HTMLSelectElement[] {
   return [...host.querySelectorAll('select')];
 }
 
-function textareas(): HTMLTextAreaElement[] {
-  return [...host.querySelectorAll('textarea')];
+function textInputs(): HTMLInputElement[] {
+  return [...host.querySelectorAll<HTMLInputElement>('input:not([type="checkbox"])')];
 }
 
 function setValue(
@@ -135,6 +141,7 @@ beforeEach(() => {
       }),
   );
   agentProfileMock.delete.mockResolvedValue(undefined);
+  marketMock.myCards.mockResolvedValue([]);
   useNoteStore.setState({ agentProfileViewTarget: null, agentProfilesVersion: 0 });
   host = document.createElement('div');
   document.body.appendChild(host);
@@ -173,13 +180,42 @@ describe('agent profile list panel', () => {
     });
     expect(agentProfileMock.list).toHaveBeenCalledTimes(2);
   });
+
+  it('shows publish badge in the list and unpublish action in the editor (AGENT-MARKET M1)', async () => {
+    marketMock.myCards.mockResolvedValue([
+      {
+        agentId: FIRST.flowix_agent_id,
+        displayName: FIRST.flowix_display_name,
+        expertise: FIRST.flowix_expertise,
+        publishState: 'published',
+        publishedSlug: 'caibao',
+        visibility: 'unlisted',
+        drifted: true,
+      },
+    ]);
+    await mount(<AgentProfileListPanel notebookPath={CWD} />);
+
+    // 列表徽章：drifted 提示优先于 published。
+    expect(host.textContent).toContain('内容已变化');
+
+    // 编辑器：发布态提示 + 下架入口（未登录账号 → 发布按钮禁用文案在）。
+    await act(async () => {
+      useNoteStore.setState({ agentProfileViewTarget: { agentId: FIRST.flowix_agent_id } });
+    });
+    await mount(<AgentProfileEditor notebookPath={CWD} />);
+    expect(host.textContent).toContain('身份卡内容已变化');
+    expect(host.textContent).toContain('未登录中继账号');
+    const unpublishButton = [...document.body.querySelectorAll('button')]
+      .find((node) => node.textContent?.trim() === '下架');
+    expect(unpublishButton).toBeDefined();
+  });
 });
 
 describe('agent profile editor', () => {
-  it('shows the placeholder when no target is selected', async () => {
+  it('shows the market home when no target is selected (AGENT-MARKET D-1 default)', async () => {
     await mount(<AgentProfileEditor notebookPath={CWD} />);
 
-    expect(host.textContent).toContain('从左侧选择一张身份卡');
+    expect(host.textContent).toContain('身份卡市场');
     expect(agentProfileMock.get).not.toHaveBeenCalled();
   });
 
@@ -200,8 +236,14 @@ describe('agent profile editor', () => {
     });
     // selects: [0] agent 类型, [1] 披露等级。
     await act(async () => setValue(selects()[1], 'R2'));
-    // textareas: [0] 简介, [1] 专长, [2] 披露范围。
-    await act(async () => setValue(textareas()[2], 'finance/财报'));
+    // 记忆库（即披露授权）走 chips 编辑：手输框（inputs: [0] 名称, [1] 模型,
+    // [2] memory 手输）+ Enter 提交。
+    await act(async () => setValue(textInputs()[2], 'tag:finance/财报'));
+    await act(async () => {
+      textInputs()[2].dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }),
+      );
+    });
 
     await click('保存');
 
@@ -212,7 +254,7 @@ describe('agent profile editor', () => {
         displayName: '财报解读助手',
         consultable: false,
         redactionLevel: 'R2',
-        disclosureScope: ['finance/财报'],
+        memory: ['tag:finance/财报'],
         model: '',
       }),
     );

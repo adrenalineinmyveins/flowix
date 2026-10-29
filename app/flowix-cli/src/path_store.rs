@@ -264,13 +264,10 @@ pub(crate) fn print(value: Value, json: bool) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn path_crud_does_not_create_memo_identity() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_env::lock_flowix_home();
         let root = std::env::temp_dir().join(format!(
             "flowix-cli-path-{}-{}",
             std::process::id(),

@@ -1,9 +1,13 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Bot, Fingerprint, Inbox, Loader2, Plus, Save, Trash2, X } from 'lucide-react';
+import { Bot, Fingerprint, Inbox, Loader2, Plus, Save, Store, Trash2, X } from 'lucide-react';
 
-import { agentProfile } from '@platform/tauri/client';
+import { agentProfile, market, redaction, tags as tagsClient } from '@platform/tauri/client';
+import type { MarketMyCard } from '@platform/tauri/client';
+import type { RelayAccountInfo } from '@/lib/types/redaction';
+import { PublishCardDialog } from '@features/agent/components/publish-card-dialog';
+import { AgentMarket } from '@features/agent/components/agent-market';
 import type { AgentProfile, AgentState } from '@/lib/types/agent-profile';
 import { PROFILE_REDACTION_LEVELS } from '@/lib/types/agent-profile';
 import { AGENT_TYPES } from '@/lib/agent-types';
@@ -29,6 +33,13 @@ const LEVEL_LABEL_KEYS: Record<string, I18nKey> = {
   R3: 'agent.profile.level.r3',
 };
 
+/** AGENT-MARKET M1：发布态徽章文案键。 */
+const PUBLISH_STATE_KEYS: Record<string, I18nKey> = {
+  draft: 'agent.market.state.draft',
+  confirmed: 'agent.market.state.confirmed',
+  published: 'agent.market.state.published',
+};
+
 const inputClass =
   'h-9 w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 text-sm text-[var(--foreground)] outline-none transition-colors placeholder:text-[var(--muted-foreground)] focus:border-[var(--primary)] focus:ring-2 focus:ring-[color-mix(in_oklch,var(--primary)_16%,transparent)]';
 const textareaClass =
@@ -42,13 +53,12 @@ interface ProfileForm {
   model: string;
   consultable: boolean;
   redactionLevel: string;
-  disclosureScope: string;
-  /** AGENT-PROFILE-REDESIGN P3：扩展字段。 */
+  /** AGENT-PROFILE-REDESIGN P3：扩展字段（memory/tools/skills 为条目数组）。 */
   system: string;
-  tools: string;
-  skills: string;
+  tools: string[];
+  skills: string[];
   metadata: string;
-  memory: string;
+  memory: string[];
 }
 
 function formFromProfile(profile: AgentProfile): ProfileForm {
@@ -60,14 +70,13 @@ function formFromProfile(profile: AgentProfile): ProfileForm {
     model: profile.flowix_model ?? '',
     consultable: profile.flowix_consultable,
     redactionLevel: profile.flowix_redaction_level ?? '',
-    disclosureScope: profile.flowix_disclosure_scope.join('\n'),
     system: profile.flowix_system ?? '',
-    tools: (profile.flowix_tools ?? []).join('\n'),
-    skills: (profile.flowix_skills ?? []).join('\n'),
+    tools: [...(profile.flowix_tools ?? [])],
+    skills: [...(profile.flowix_skills ?? [])],
     metadata: Object.entries(profile.flowix_metadata ?? {})
       .map(([key, value]) => `${key}=${value}`)
       .join('\n'),
-    memory: (profile.flowix_memory ?? []).join('\n'),
+    memory: [...(profile.flowix_memory ?? [])],
   };
 }
 
@@ -88,6 +97,132 @@ function parseLines(raw: string): string[] {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
+}
+
+/** 追加条目（去空白、去重），返回新数组。 */
+function appendItem(items: string[], raw: string): string[] {
+  const value = raw.trim();
+  if (!value || items.includes(value)) return items;
+  return [...items, value];
+}
+
+/** chips 容器 + 单个 chip 的删除按钮（memory/tools/skills 共用）。 */
+function ChipRow({ items, onRemove }: { items: string[]; onRemove: (item: string) => void }) {
+  if (items.length === 0) return null;
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {items.map((item) => (
+        <span
+          key={item}
+          className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--muted)] px-2.5 py-0.5 font-mono text-xs text-[var(--foreground)]"
+        >
+          {item}
+          <button
+            type="button"
+            className="text-[var(--muted-foreground)] transition-colors hover:text-[var(--destructive)]"
+            onClick={() => onRemove(item)}
+            aria-label={`remove ${item}`}
+          >
+            <X className="h-3 w-3" />
+          </button>
+        </span>
+      ))}
+    </div>
+  );
+}
+
+/** 自由 chips 编辑器（tools/skills）：输入回车追加，chip 可删。 */
+function ChipsEditor({ items, onChange, placeholder }: { items: string[]; onChange: (items: string[]) => void; placeholder?: string }) {
+  const [draft, setDraft] = useState('');
+  const commit = () => {
+    if (!draft.trim()) return;
+    onChange(appendItem(items, draft));
+    setDraft('');
+  };
+  return (
+    <div className="space-y-2">
+      <ChipRow items={items} onRemove={(item) => onChange(items.filter((value) => value !== item))} />
+      <input
+        className={inputClass}
+        value={draft}
+        placeholder={placeholder}
+        onChange={(event) => setDraft(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter') {
+            event.preventDefault();
+            commit();
+          }
+        }}
+        onBlur={commit}
+      />
+    </div>
+  );
+}
+
+/**
+ * 记忆库编辑器（AGENT-PROFILE-REDESIGN P3 迭代）：
+ * tag 项从笔记本标签下拉选取（`tag:<path>`）；note:/collection: 与清单外
+ * tag 走手输。已选项 chips 可删。UI 全权——扩缩均放行（UI 即人审）。
+ */
+function MemoryEditor({
+  items,
+  onChange,
+  notebookTags,
+  pickLabel,
+  manualPlaceholder,
+  emptyLabel,
+}: {
+  items: string[];
+  onChange: (items: string[]) => void;
+  notebookTags: { id: string; name: string }[];
+  pickLabel: string;
+  manualPlaceholder?: string;
+  emptyLabel?: string;
+}) {
+  const [draft, setDraft] = useState('');
+  const commit = () => {
+    if (!draft.trim()) return;
+    onChange(appendItem(items, draft));
+    setDraft('');
+  };
+  const selectedTagPaths = new Set(items.filter((item) => item.startsWith('tag:')).map((item) => item.slice('tag:'.length)));
+  const addableTags = notebookTags.filter((tag) => !selectedTagPaths.has(tag.name));
+  return (
+    <div className="space-y-2">
+      <ChipRow items={items} onRemove={(item) => onChange(items.filter((value) => value !== item))} />
+      <div className="flex gap-2">
+        <select
+          className={cn(inputClass, 'py-0')}
+          value=""
+          onChange={(event) => {
+            const name = event.target.value;
+            if (name) onChange(appendItem(items, `tag:${name}`));
+          }}
+          disabled={addableTags.length === 0}
+        >
+          <option value="">{addableTags.length === 0 ? (emptyLabel ?? pickLabel) : pickLabel}</option>
+          {addableTags.map((tag) => (
+            <option key={tag.id} value={tag.name}>
+              {tag.name}
+            </option>
+          ))}
+        </select>
+        <input
+          className={inputClass}
+          value={draft}
+          placeholder={manualPlaceholder}
+          onChange={(event) => setDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') {
+              event.preventDefault();
+              commit();
+            }
+          }}
+          onBlur={commit}
+        />
+      </div>
+    </div>
+  );
 }
 
 function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
@@ -142,6 +277,8 @@ function StateChip({ label, value }: { label: string; value: string }) {
 export function AgentProfileListPanel({ notebookPath }: { notebookPath: string }) {
   const { t } = useI18n();
   const [profiles, setProfiles] = useState<AgentProfile[] | null>(null);
+  /** AGENT-MARKET M1：发布态徽章数据（agentId → 状态）。 */
+  const [myCards, setMyCards] = useState<Record<string, MarketMyCard>>({});
   const [loading, setLoading] = useState(true);
   const target = useNoteStore((state) => state.agentProfileViewTarget);
   const version = useNoteStore((state) => state.agentProfilesVersion);
@@ -150,9 +287,13 @@ export function AgentProfileListPanel({ notebookPath }: { notebookPath: string }
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const list = await agentProfile.list(notebookPath);
+      const [list, cards] = await Promise.all([
+        agentProfile.list(notebookPath),
+        market.myCards(notebookPath).catch(() => [] as MarketMyCard[]),
+      ]);
       if (disposedRef.current) return;
       setProfiles(list);
+      setMyCards(Object.fromEntries(cards.map((card) => [card.agentId, card])));
     } catch {
       if (!disposedRef.current) setProfiles([]);
     } finally {
@@ -170,6 +311,8 @@ export function AgentProfileListPanel({ notebookPath }: { notebookPath: string }
 
   const setTarget = useNoteStore((state) => state.setAgentProfileViewTarget);
   const activeAgentId = target && 'agentId' in target ? target.agentId : null;
+  /** AGENT-MARKET D-1：市场入口默认选中（target 为 null 或 market）。 */
+  const marketActive = !target || 'market' in target;
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-[var(--list-bg)]">
@@ -209,6 +352,22 @@ export function AgentProfileListPanel({ notebookPath }: { notebookPath: string }
               </p>
             )}
             <div className="space-y-1">
+              {/* AGENT-MARKET D-1：市场入口（默认选中，中列显示市场主页）。 */}
+              <button
+                type="button"
+                onClick={() => setTarget({ market: true })}
+                className={cn(
+                  'flex w-full items-center gap-1.5 rounded-lg px-2.5 py-2 text-left outline-none transition-colors',
+                  marketActive
+                    ? 'bg-[var(--muted)]'
+                    : 'hover:bg-[color-mix(in_oklch,var(--muted)_50%,transparent)]',
+                )}
+              >
+                <Store className="h-3.5 w-3.5 shrink-0 text-[var(--brand)]" />
+                <span className="min-w-0 flex-1 truncate text-sm font-medium text-[var(--foreground)]">
+                  {t('agent.market.entry')}
+                </span>
+              </button>
               {profiles?.map((profile) => {
                 const active = profile.flowix_agent_id === activeAgentId;
                 return (
@@ -241,6 +400,29 @@ export function AgentProfileListPanel({ notebookPath }: { notebookPath: string }
                       {AGENT_TYPES.find((type) => type.key === profile.flowix_agent_type)?.name ?? profile.flowix_agent_type}
                       {profile.flowix_expertise.length > 0 && ` · ${profile.flowix_expertise.join(' / ')}`}
                     </span>
+                    {(() => {
+                      // AGENT-MARKET M1：发布态徽章（none 不占位）。
+                      const card = myCards[profile.flowix_agent_id];
+                      if (!card || card.publishState === 'none') return null;
+                      const unpublished = card.publishState === 'published' && card.visibility === 'private';
+                      const label = unpublished
+                        ? t('agent.market.stateUnpublished')
+                        : card.drifted
+                          ? t('agent.market.stateDrifted')
+                          : t(PUBLISH_STATE_KEYS[card.publishState] ?? 'agent.market.state.published');
+                      return (
+                        <span
+                          className={cn(
+                            'w-fit rounded px-1 py-px text-[10px] leading-4',
+                            card.drifted || card.publishState === 'draft' || card.publishState === 'confirmed'
+                              ? 'bg-[color-mix(in_oklch,var(--primary)_14%,transparent)] text-[var(--primary)]'
+                              : 'bg-[var(--muted)] text-[var(--muted-foreground)]',
+                          )}
+                        >
+                          {label}
+                        </span>
+                      );
+                    })()}
                   </button>
                 );
               })}
@@ -289,7 +471,9 @@ export function AgentProfileTitlebar({
           ? t('agent.profile.createTitle')
           : target && 'inbox' in target
             ? t('agent.inbox.title')
-            : t('agent.profile.title')}
+            : target && 'market' in target
+              ? t('agent.market.title')
+              : t('agent.profile.title')}
       </span>
       <button
         type="button"
@@ -324,7 +508,72 @@ export function AgentProfileEditor({ notebookPath }: { notebookPath: string }) {
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null);
   const disposedRef = useRef(false);
 
+  // AGENT-MARKET M1：发布管理（状态 + 账号 + 下架中）。
+  const [myCard, setMyCard] = useState<MarketMyCard | null>(null);
+  const [account, setAccount] = useState<RelayAccountInfo | null>(null);
+  const [publishOpen, setPublishOpen] = useState(false);
+  const [unpublishing, setUnpublishing] = useState(false);
+  const [unpublishConfirm, setUnpublishConfirm] = useState(false);
+
   const agentId = target && 'agentId' in target ? target.agentId : null;
+
+  // 发布态 + 中继账号（未登录时发布按钮给出引导文案）。
+  const reloadMyCard = useCallback(async () => {
+    try {
+      const cards = await market.myCards(notebookPath);
+      if (disposedRef.current) return;
+      setMyCard(agentId ? cards.find((card) => card.agentId === agentId) ?? null : null);
+    } catch {
+      if (!disposedRef.current) setMyCard(null);
+    }
+  }, [notebookPath, agentId]);
+
+  useEffect(() => {
+    void reloadMyCard();
+    void redaction.accountStatus()
+      .then((status) => {
+        if (!disposedRef.current) setAccount(status);
+      })
+      .catch(() => undefined);
+  }, [reloadMyCard]);
+
+  const unpublish = useCallback(async () => {
+    if (!agentId || unpublishing) return;
+    setUnpublishing(true);
+    setError(null);
+    try {
+      await market.unpublish(notebookPath, agentId);
+      setUnpublishConfirm(false);
+      await reloadMyCard();
+      bumpProfiles();
+    } catch (cause) {
+      if (!disposedRef.current) setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setUnpublishing(false);
+    }
+  }, [agentId, unpublishing, notebookPath, reloadMyCard, bumpProfiles]);
+
+  // 记忆库下拉数据源：当前笔记本标签（path → id 匹配，取不到则为空）。
+  const notebooks = useNoteStore((state) => state.notebooks);
+  const [notebookTags, setNotebookTags] = useState<{ id: string; name: string }[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    const notebookId = notebooks.find((notebook) => notebook.path === notebookPath)?.id;
+    if (!notebookId) {
+      setNotebookTags([]);
+      return undefined;
+    }
+    void tagsClient.getAll(notebookId)
+      .then((result) => {
+        if (!cancelled) setNotebookTags(result.tags);
+      })
+      .catch(() => {
+        if (!cancelled) setNotebookTags([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [notebooks, notebookPath]);
 
   // 加载选中身份卡（含本地运行状态）。
   useEffect(() => {
@@ -381,13 +630,12 @@ export function AgentProfileEditor({ notebookPath }: { notebookPath: string }) {
         model: form.model.trim(),
         consultable: form.consultable,
         redactionLevel: form.redactionLevel,
-        disclosureScope: parseLines(form.disclosureScope),
         // P3 扩展字段：UI 全权（memory 扩缩均放行——UI 即人审）。
         system: form.system,
-        tools: parseLines(form.tools),
-        skills: parseLines(form.skills),
+        tools: form.tools,
+        skills: form.skills,
         metadata: parseMetadata(form.metadata),
-        memory: parseLines(form.memory),
+        memory: form.memory,
       });
       if (disposedRef.current) return;
       setProfile(updated);
@@ -440,15 +688,9 @@ export function AgentProfileEditor({ notebookPath }: { notebookPath: string }) {
     }
   }, [saving, notebookPath, setTarget, bumpProfiles]);
 
-  // 未选择目标：空态提示（列表在中列）。
-  if (!target) {
-    return (
-      <div className="flex h-full items-center justify-center px-6">
-        <p className="max-w-[36ch] text-center text-sm leading-6 text-[var(--muted-foreground)]">
-          {t('agent.profile.editorEmpty')}
-        </p>
-      </div>
-    );
+  // AGENT-MARKET D-1：市场为默认视图（未选目标或显式选中市场）。
+  if (!target || 'market' in target) {
+    return <AgentMarket notebookPath={notebookPath} />;
   }
 
   // 收件箱：入站咨询信封的拉取 / 接受 / 拒绝。
@@ -560,32 +802,74 @@ export function AgentProfileEditor({ notebookPath }: { notebookPath: string }) {
                   onChange={(consultable) => patchForm({ consultable })}
                   label={t('agent.profile.consultable')}
                 />
-                <div className="grid gap-4 sm:grid-cols-2">
-                  <Field label={t('agent.profile.redactionLevel')}>
-                    <select
-                      className={cn(inputClass, 'py-0')}
-                      value={form.redactionLevel}
-                      onChange={(event) => patchForm({ redactionLevel: event.target.value })}
-                    >
-                      {PROFILE_REDACTION_LEVELS.map((level) => (
-                        <option key={level} value={level}>
-                          {t(LEVEL_LABEL_KEYS[level])}
-                        </option>
-                      ))}
-                    </select>
-                  </Field>
-                  <Field label={t('agent.profile.disclosureScope')} hint={t('agent.profile.disclosureScopeHint')}>
-                    <textarea
-                      className={cn(textareaClass, 'min-h-16 font-mono text-xs leading-5')}
-                      value={form.disclosureScope}
-                      onChange={(event) => patchForm({ disclosureScope: event.target.value })}
-                      placeholder={t('agent.profile.disclosureScopePlaceholder')}
-                    />
-                  </Field>
-                </div>
+                <Field label={t('agent.profile.redactionLevel')}>
+                  <select
+                    className={cn(inputClass, 'py-0')}
+                    value={form.redactionLevel}
+                    onChange={(event) => patchForm({ redactionLevel: event.target.value })}
+                  >
+                    {PROFILE_REDACTION_LEVELS.map((level) => (
+                      <option key={level} value={level}>
+                        {t(LEVEL_LABEL_KEYS[level])}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
                 <p className="text-xs leading-5 text-[var(--muted-foreground)]">
                   {t('agent.profile.privacyHint')}
                 </p>
+              </section>
+
+              {/* AGENT-MARKET M1：市场发布管理（发布/更新/下架）。 */}
+              <section className="space-y-2">
+                <h2 className="text-sm font-semibold text-[var(--foreground)]">{t('agent.market.publishSection')}</h2>
+                {myCard && myCard.publishState !== 'none' ? (
+                  <p className="text-xs leading-5 text-[var(--muted-foreground)]">
+                    {myCard.publishState === 'published' && myCard.visibility === 'private'
+                      ? t('agent.market.unpublishedHint')
+                      : t('agent.market.publishedHint', {
+                          address: `${account?.username ?? '…'}/${myCard.publishedSlug ?? ''}`,
+                          visibility: myCard.visibility ?? '',
+                        })}
+                    {myCard.drifted && ` ${t('agent.market.driftHint')}`}
+                  </p>
+                ) : (
+                  <p className="text-xs leading-5 text-[var(--muted-foreground)]">
+                    {t('agent.market.noneHint')}
+                  </p>
+                )}
+                {!account && (
+                  <p className="text-xs leading-5 text-[var(--destructive)]">
+                    {t('agent.market.noAccount')}
+                  </p>
+                )}
+                <div className="flex gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="h-7 gap-1 text-xs"
+                    disabled={!account || unpublishing}
+                    onClick={() => setPublishOpen(true)}
+                  >
+                    {myCard && myCard.publishState !== 'none' && myCard.visibility !== 'private'
+                      ? t('agent.market.update')
+                      : myCard?.visibility === 'private'
+                        ? t('agent.market.republish')
+                        : t('agent.market.publish')}
+                  </Button>
+                  {myCard?.publishState === 'published' && myCard.visibility !== 'private' && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      className="h-7 gap-1 text-xs text-[var(--destructive)]"
+                      disabled={unpublishing}
+                      onClick={() => setUnpublishConfirm(true)}
+                    >
+                      {unpublishing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+                      {t('agent.market.unpublish')}
+                    </Button>
+                  )}
+                </div>
               </section>
 
               {/* AGENT-PROFILE-REDESIGN P3：对话系统提示 + 记忆库（即披露授权）。 */}
@@ -600,11 +884,13 @@ export function AgentProfileEditor({ notebookPath }: { notebookPath: string }) {
                   />
                 </Field>
                 <Field label={t('agent.profile.memory')} hint={t('agent.profile.memoryHint')}>
-                  <textarea
-                    className={cn(textareaClass, 'min-h-16 font-mono text-xs leading-5')}
-                    value={form.memory}
-                    onChange={(event) => patchForm({ memory: event.target.value })}
-                    placeholder={t('agent.profile.memoryPlaceholder')}
+                  <MemoryEditor
+                    items={form.memory}
+                    onChange={(memory) => patchForm({ memory })}
+                    notebookTags={notebookTags}
+                    pickLabel={t('agent.profile.memoryPickTag')}
+                    manualPlaceholder={t('agent.profile.memoryManualPlaceholder')}
+                    emptyLabel={t('agent.profile.memoryNoTags')}
                   />
                 </Field>
                 <p className="text-xs leading-5 text-[var(--muted-foreground)]">
@@ -612,18 +898,16 @@ export function AgentProfileEditor({ notebookPath }: { notebookPath: string }) {
                 </p>
                 <div className="grid grid-cols-2 gap-3">
                   <Field label={t('agent.profile.tools')} hint={t('agent.profile.toolsHint')}>
-                    <textarea
-                      className={cn(textareaClass, 'min-h-14 font-mono text-xs leading-5')}
-                      value={form.tools}
-                      onChange={(event) => patchForm({ tools: event.target.value })}
+                    <ChipsEditor
+                      items={form.tools}
+                      onChange={(tools) => patchForm({ tools })}
                       placeholder={t('agent.profile.listPlaceholder')}
                     />
                   </Field>
                   <Field label={t('agent.profile.skills')} hint={t('agent.profile.skillsHint')}>
-                    <textarea
-                      className={cn(textareaClass, 'min-h-14 font-mono text-xs leading-5')}
-                      value={form.skills}
-                      onChange={(event) => patchForm({ skills: event.target.value })}
+                    <ChipsEditor
+                      items={form.skills}
+                      onChange={(skills) => patchForm({ skills })}
                       placeholder={t('agent.profile.listPlaceholder')}
                     />
                   </Field>
@@ -708,6 +992,62 @@ export function AgentProfileEditor({ notebookPath }: { notebookPath: string }) {
               onClick={() => deleteTarget && void remove(deleteTarget.id)}
             >
               {t('agent.profile.deleteTitle')}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* AGENT-MARKET M1：发布对话框（profile 预填 + agentId 关联）。 */}
+      {publishOpen && profile && agentId && (
+        <PublishCardDialog
+          notebookPath={notebookPath}
+          username={account?.username ?? ''}
+          initial={{
+            agentId,
+            slug: myCard?.publishedSlug ?? '',
+            displayName: profile.flowix_display_name,
+            tags: profile.flowix_expertise.join(', '),
+            visibility: myCard?.visibility && myCard.visibility !== 'private'
+              ? myCard.visibility as 'public' | 'unlisted'
+              : 'unlisted',
+          }}
+          onClose={() => setPublishOpen(false)}
+          onPublished={() => {
+            void reloadMyCard();
+            bumpProfiles();
+          }}
+        />
+      )}
+
+      {/* AGENT-MARKET M1：下架确认（D-3：重发 private 卡，等价下架）。 */}
+      <Dialog
+        open={unpublishConfirm}
+        onOpenChange={(open) => {
+          if (!open) setUnpublishConfirm(false);
+        }}
+      >
+        <DialogContent className="rounded-xl border border-[var(--border-popup)] bg-[var(--card)] shadow-[0_4px_24px_-3px_rgb(0_0_0_/_0.24)]">
+          <DialogHeader>
+            <DialogTitle>{t('agent.market.unpublish')}</DialogTitle>
+            <DialogDescription>{t('agent.market.unpublishDescription')}</DialogDescription>
+          </DialogHeader>
+          <div className="mt-4 flex justify-end gap-2">
+            <Button
+              type="button"
+              variant="ghost"
+              className="h-8 px-3 text-sm"
+              onClick={() => setUnpublishConfirm(false)}
+            >
+              {t('dialog.cancel')}
+            </Button>
+            <Button
+              type="button"
+              className="h-8 rounded-lg px-3 text-sm"
+              disabled={unpublishing}
+              onClick={() => void unpublish()}
+            >
+              {unpublishing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+              {t('agent.market.unpublish')}
             </Button>
           </div>
         </DialogContent>

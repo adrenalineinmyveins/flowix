@@ -502,6 +502,7 @@ pub fn redaction_account_forget() -> Result<(), String> {
 }
 
 /// 目录卡发布预览：卡文本过 L1 规则脱敏 → draft 留档待人审。
+/// `agent_id`（AGENT-MARKET D-2）：身份卡页发布时关联本地卡；缺省 = 收件箱手填。
 #[tauri::command]
 pub fn redaction_directory_preview(
     cwd: String,
@@ -511,10 +512,12 @@ pub fn redaction_directory_preview(
     visibility: String,
     min_redaction_level: String,
     auto_answer: Option<String>,
+    agent_id: Option<String>,
 ) -> Result<DirectoryPreviewResult, String> {
     let root = notebook_root(&cwd)?;
     let (draft, original) = crate::redaction::directory::publish_preview(
         &root,
+        agent_id.as_deref(),
         &agent_slug,
         &display_name,
         &specialty_tags,

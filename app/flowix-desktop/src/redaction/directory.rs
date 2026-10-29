@@ -37,6 +37,14 @@ pub struct DirectoryCardDraft {
     /// FD-12 M4 能力位：`off`（默认）| `R3`（自动回答入站咨询并直发回程）。
     #[serde(default)]
     pub auto_answer: String,
+    /// AGENT-MARKET D-2：关联的本地身份卡（None = 旧档/收件箱手填发布）。
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// 脱敏前原文（D-4 漂移比对用；旧档缺省不比对）。
+    #[serde(default)]
+    pub source_name: Option<String>,
+    #[serde(default)]
+    pub source_tags: Vec<String>,
     #[serde(default)]
     pub l1_hits: Vec<flowix_redaction::RuleHit>,
     pub created_at: i64,
@@ -106,8 +114,10 @@ pub fn read_draft(root: &Path, id: &str) -> Result<DirectoryCardDraft, String> {
 
 /// 发布预览：卡文本（名称 + 标签）过 L1 规则脱敏 → draft 留档待人审。
 /// 返回 (draft, 脱敏前原文)——UI 对比展示人审依据。
+/// `agent_id`：AGENT-MARKET D-2 身份卡关联（None = 收件箱手填发布）。
 pub fn publish_preview(
     notebook_root: &Path,
+    agent_id: Option<&str>,
     agent_slug: &str,
     display_name: &str,
     specialty_tags: &[String],
@@ -187,6 +197,9 @@ pub fn publish_preview(
         visibility: visibility.to_string(),
         min_redaction_level: min_redaction_level.to_string(),
         auto_answer,
+        agent_id: agent_id.map(str::trim).filter(|value| !value.is_empty()).map(str::to_string),
+        source_name: Some(display_name.trim().to_string()),
+        source_tags: specialty_tags.iter().map(|tag| tag.trim().to_string()).filter(|tag| !tag.is_empty()).collect(),
         l1_hits: report.hits,
         created_at: now_unix(),
         settled_at: None,
@@ -260,6 +273,129 @@ pub async fn publish_confirmed(notebook_root: &Path, id: &str) -> Result<Directo
     draft.published_at = Some(now_unix());
     write_draft(notebook_root, &draft)?;
     Ok(draft)
+}
+
+// ----------------------------------------------------------------------
+// AGENT-MARKET M1：我的发布管理（聚合 / 下架）
+// ----------------------------------------------------------------------
+
+/// 我的卡发布态聚合（profile + 关联 draft 状态，契约见 AGENT-MARKET §4）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketMyCard {
+    pub agent_id: String,
+    pub display_name: String,
+    pub expertise: Vec<String>,
+    /// `none` | `draft` | `confirmed` | `published`（cancelled 不构成发布态）。
+    pub publish_state: String,
+    pub published_slug: Option<String>,
+    pub visibility: Option<String>,
+    /// 发布白名单内容（名称/专长）与当前 profile 漂移；旧档无原文不比对。
+    pub drifted: bool,
+}
+
+fn status_rank(status: &CardStatus) -> u8 {
+    match status {
+        CardStatus::Published => 3,
+        CardStatus::Confirmed => 2,
+        CardStatus::Draft => 1,
+        CardStatus::Cancelled => 0,
+    }
+}
+
+fn load_drafts(root: &Path) -> Vec<DirectoryCardDraft> {
+    let Ok(entries) = std::fs::read_dir(directory_dir(root)) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .filter_map(|path| std::fs::read(&path).ok())
+        .filter_map(|bytes| serde_json::from_slice::<DirectoryCardDraft>(&bytes).ok())
+        .collect()
+}
+
+/// 某 agent 的有效档：**created_at 最新**的非 cancelled 档——重发/下架
+/// 都产生新档，最新档即用户最新意图（下架 private 覆盖旧 published 档
+/// 的聚合视图）；无有效档返回 None。
+fn latest_effective_draft<'a>(
+    drafts: &'a [DirectoryCardDraft],
+    agent_id: &str,
+) -> Option<&'a DirectoryCardDraft> {
+    let mut best: Option<&DirectoryCardDraft> = None;
+    for draft in drafts.iter().filter(|d| d.agent_id.as_deref() == Some(agent_id)) {
+        if status_rank(&draft.status) == 0 {
+            continue;
+        }
+        if best.is_none_or(|current| draft.created_at >= current.created_at) {
+            best = Some(draft);
+        }
+    }
+    best
+}
+
+/// 聚合：本地身份卡列表 × 发布档关联（纯本地读，无网络）。
+pub fn market_my_cards(
+    notebook_root: &Path,
+    profiles: &[(String, flowix_core::agent::AgentProfile)],
+) -> Result<Vec<MarketMyCard>, String> {
+    let drafts = load_drafts(notebook_root);
+    let mut cards = Vec::with_capacity(profiles.len());
+    for (agent_id, profile) in profiles {
+        let effective = latest_effective_draft(&drafts, agent_id);
+        let (state, slug, visibility, drifted) = match effective {
+            None => ("none", None, None, false),
+            Some(draft) => {
+                let drifted = matches!(draft.status, CardStatus::Published | CardStatus::Confirmed)
+                    && draft.source_name.is_some()
+                    && (draft.source_name.as_deref() != Some(profile.display_name.as_str())
+                        || {
+                            let mut a = draft.source_tags.clone();
+                            let mut b = profile.expertise.clone();
+                            a.sort();
+                            b.sort();
+                            a != b
+                        });
+                let state = match draft.status {
+                    CardStatus::Published => "published",
+                    CardStatus::Confirmed => "confirmed",
+                    CardStatus::Draft => "draft",
+                    CardStatus::Cancelled => "none",
+                };
+                (state, Some(draft.agent_slug.clone()), Some(draft.visibility.clone()), drifted)
+            }
+        };
+        cards.push(MarketMyCard {
+            agent_id: agent_id.clone(),
+            display_name: profile.display_name.clone(),
+            expertise: profile.expertise.clone(),
+            publish_state: state.to_string(),
+            published_slug: slug.filter(|_| state != "none"),
+            visibility: visibility.filter(|_| state != "none"),
+            drifted,
+        });
+    }
+    Ok(cards)
+}
+
+/// 下架（本地层）：克隆该 agent 当前有效档为 visibility=private 的 confirmed
+/// 新档（内容与 L1 结论不变；人审由 UI 下架确认对话框承担，状态机仍走
+/// confirmed → publish 单出口）。返回新档 id，供 IPC 层接 `publish_confirmed`。
+pub fn unpublish_draft(notebook_root: &Path, agent_id: &str) -> Result<DirectoryCardDraft, String> {
+    let drafts = load_drafts(notebook_root);
+    let current = latest_effective_draft(&drafts, agent_id)
+        .filter(|draft| matches!(draft.status, CardStatus::Published | CardStatus::Confirmed))
+        .ok_or_else(|| format!("CARD_NOT_PUBLISHED:{agent_id}"))?;
+    let mut next = current.clone();
+    next.id = format!("dir_{}", &Uuid::new_v4().simple().to_string()[..12]);
+    next.status = CardStatus::Confirmed;
+    next.visibility = "private".to_string();
+    next.created_at = now_unix();
+    next.settled_at = Some(now_unix());
+    next.published_at = None;
+    write_draft(notebook_root, &next)?;
+    Ok(next)
 }
 
 /// 目录搜索（public 卡）。relay_url 缺省用账号中继。
@@ -412,12 +548,34 @@ pub async fn usage_summary(days: i64) -> Result<UsageSummary, String> {
 mod tests {
     use super::*;
 
+    fn profile(display_name: &str, expertise: &[&str]) -> flowix_core::agent::AgentProfile {
+        flowix_core::agent::AgentProfile {
+            agent_id: "agt_m1test".into(),
+            display_name: display_name.into(),
+            bio: String::new(),
+            expertise: expertise.iter().map(|tag| tag.to_string()).collect(),
+            agent_type: "deepseek-harness".into(),
+            model: None,
+            consultable: true,
+            redaction_level: None,
+            disclosure_scope: Vec::new(),
+            system: String::new(),
+            tools: Vec::new(),
+            skills: Vec::new(),
+            metadata: Default::default(),
+            memory: Vec::new(),
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
     #[test]
     fn preview_redacts_and_settles() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let (draft, original) = publish_preview(
             root,
+            Some("agt_m1test"),
             "researcher",
             "张三的财报助手 13800138000",
             &["finance".to_string()],
@@ -428,7 +586,11 @@ mod tests {
         .unwrap();
         assert_eq!(draft.status, CardStatus::Draft);
         assert_eq!(draft.agent_slug, "researcher");
+        assert_eq!(draft.agent_id.as_deref(), Some("agt_m1test"));
         assert_eq!(draft.auto_answer, "R3");
+        // D-4：脱敏前原文落档（漂移比对源）。
+        assert_eq!(draft.source_name.as_deref(), Some("张三的财报助手 13800138000"));
+        assert_eq!(draft.source_tags, vec!["finance".to_string()]);
         assert!(original.contains("13800138000"));
         // L1 命中手机号 → 出设备名占位化。
         assert!(!draft.display_name.contains("13800138000"), "{}", draft.display_name);
@@ -446,23 +608,140 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         assert_eq!(
-            publish_preview(root, "Bad Slug", "n", &[], "public", "R1", "off").unwrap_err(),
+            publish_preview(root, None, "Bad Slug", "n", &[], "public", "R1", "off").unwrap_err(),
             "AGENT_SLUG_INVALID"
         );
         assert_eq!(
-            publish_preview(root, "ok", "n", &[], "hidden", "R1", "off").unwrap_err(),
+            publish_preview(root, None, "ok", "n", &[], "hidden", "R1", "off").unwrap_err(),
             "VISIBILITY_INVALID"
         );
         assert_eq!(
-            publish_preview(root, "ok", "n", &[], "public", "R9", "off").unwrap_err(),
+            publish_preview(root, None, "ok", "n", &[], "public", "R9", "off").unwrap_err(),
             "MIN_LEVEL_INVALID"
         );
         // FD-12 M4：能力位枚举校验；空串兼容为 off。
         assert_eq!(
-            publish_preview(root, "ok", "n", &[], "public", "R1", "R2").unwrap_err(),
+            publish_preview(root, None, "ok", "n", &[], "public", "R1", "R2").unwrap_err(),
             "AUTO_ANSWER_INVALID"
         );
-        let (draft, _) = publish_preview(root, "ok2", "n", &[], "public", "R1", "").unwrap();
+        let (draft, _) = publish_preview(root, None, "ok2", "n", &[], "public", "R1", "").unwrap();
         assert_eq!(draft.auto_answer, "off");
+        assert_eq!(draft.agent_id, None);
+    }
+
+    #[test]
+    fn market_my_cards_aggregates_states_and_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        // agt_a：未发布；agt_b：published 且无漂移；agt_c：published 后改名 → drifted。
+        let published_b = DirectoryCardDraft {
+            id: "dir_b".into(),
+            status: CardStatus::Published,
+            agent_slug: "helper-b".into(),
+            display_name: "B".into(),
+            specialty_tags: vec!["finance".into()],
+            visibility: "unlisted".into(),
+            min_redaction_level: "R1".into(),
+            auto_answer: "off".into(),
+            agent_id: Some("agt_b".into()),
+            source_name: Some("B".into()),
+            source_tags: vec!["finance".into()],
+            l1_hits: Vec::new(),
+            created_at: 10,
+            settled_at: Some(11),
+            published_at: Some(12),
+        };
+        let mut drifted_c = published_b.clone();
+        drifted_c.id = "dir_c".into();
+        drifted_c.agent_id = Some("agt_c".into());
+        drifted_c.agent_slug = "helper-c".into();
+        drifted_c.source_name = Some("旧名字".into());
+        write_draft(root, &published_b).unwrap();
+        write_draft(root, &drifted_c).unwrap();
+
+        let profiles = vec![
+            ("agt_a".to_string(), profile("A", &[])),
+            ("agt_b".to_string(), profile("B", &["finance"])),
+            ("agt_c".to_string(), profile("新名字", &["finance"])),
+        ];
+        let cards = market_my_cards(root, &profiles).unwrap();
+        assert_eq!(cards.len(), 3);
+        let a = cards.iter().find(|c| c.agent_id == "agt_a").unwrap();
+        assert_eq!((a.publish_state.as_str(), a.published_slug.is_none(), a.drifted), ("none", true, false));
+        let b = cards.iter().find(|c| c.agent_id == "agt_b").unwrap();
+        assert_eq!(
+            (b.publish_state.as_str(), b.published_slug.as_deref(), b.visibility.as_deref(), b.drifted),
+            ("published", Some("helper-b"), Some("unlisted"), false)
+        );
+        let c = cards.iter().find(|c| c.agent_id == "agt_c").unwrap();
+        assert_eq!(c.publish_state, "published");
+        assert!(c.drifted, "改名后应提示漂移");
+    }
+
+    #[test]
+    fn legacy_draft_without_agent_id_is_ignored_not_crashing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        // 旧档（收件箱手填发布）：无 agentId / source 字段。
+        let legacy = serde_json::json!({
+            "id": "dir_legacy",
+            "status": "published",
+            "agentSlug": "old",
+            "displayName": "旧卡",
+            "specialtyTags": [],
+            "visibility": "public",
+            "minRedactionLevel": "R1",
+            "autoAnswer": "off",
+            "createdAt": 1
+        });
+        let dir = directory_dir(root);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("dir_legacy.json"), legacy.to_string()).unwrap();
+
+        let profiles = vec![("agt_a".to_string(), profile("A", &[]))];
+        let cards = market_my_cards(root, &profiles).unwrap();
+        assert_eq!(cards[0].publish_state, "none", "无关联档不影响状态");
+    }
+
+    #[test]
+    fn unpublish_draft_creates_private_confirmed_clone() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (draft, _) = publish_preview(
+            root,
+            Some("agt_m1test"),
+            "helper",
+            "名字",
+            &["finance".to_string()],
+            "unlisted",
+            "R1",
+            "off",
+        )
+        .unwrap();
+        settle_draft(root, &draft.id, true).unwrap();
+        let mut published = read_draft(root, &draft.id).unwrap();
+        published.status = CardStatus::Published;
+        published.published_at = Some(99);
+        // 模拟真实时间差：发布在前，下架在后（真实链路两动作间隔秒级以上）。
+        published.created_at = now_unix() - 10;
+        write_draft(root, &published).unwrap();
+
+        let next = unpublish_draft(root, "agt_m1test").unwrap();
+        assert_eq!(next.status, CardStatus::Confirmed);
+        assert_eq!(next.visibility, "private");
+        assert_ne!(next.id, draft.id, "下架产生新档，原档留痕");
+        assert_eq!(next.agent_slug, "helper");
+        assert_eq!(next.source_name.as_deref(), Some("名字"));
+
+        // 未发布/未确认的 agent 下架被拒。
+        assert!(unpublish_draft(root, "agt_missing").unwrap_err().contains("CARD_NOT_PUBLISHED"));
+        // 聚合视角（本地层）：最新档生效为 confirmed/private（IPC 层接
+        // publish_confirmed 后推进 published/private——本测试不触网）。
+        let profiles = vec![("agt_m1test".to_string(), profile("名字", &["finance"]))];
+        let cards = market_my_cards(root, &profiles).unwrap();
+        assert_eq!(
+            (cards[0].publish_state.as_str(), cards[0].visibility.as_deref()),
+            ("confirmed", Some("private"))
+        );
     }
 }
