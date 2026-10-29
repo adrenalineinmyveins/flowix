@@ -74,7 +74,6 @@ export function EditorScreen({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [saveState, setSaveState] = useState<SaveState>('saved');
-  const [toolbarUp, setToolbarUp] = useState(false);
   const [charCount, setCharCount] = useState(0);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [historyList, setHistoryList] = useState<HistoryEntry[]>([]);
@@ -280,28 +279,8 @@ export function EditorScreen({
     [performSave],
   );
 
-  // 键盘弹出：工具栏悬浮键盘上方（visualViewport 跟随）
-  useEffect(() => {
-    const viewport = window.visualViewport;
-    if (!viewport) return;
-    const update = () => {
-      const overlap = Math.max(0, window.innerHeight - viewport.height - viewport.offsetTop);
-      const up = overlap > 60;
-      setToolbarUp(up);
-      document.documentElement.style.setProperty(
-        '--kb-offset',
-        `${up ? Math.round(overlap + viewport.offsetTop) : 0}px`,
-      );
-    };
-    viewport.addEventListener('resize', update);
-    viewport.addEventListener('scroll', update);
-    update();
-    return () => {
-      viewport.removeEventListener('resize', update);
-      viewport.removeEventListener('scroll', update);
-      document.documentElement.style.removeProperty('--kb-offset');
-    };
-  }, []);
+  // 注：工具栏已固定文档上端，键盘弹出无需 visualViewport 跟随
+  // （旧实现：底部工具栏 translateY 上浮，见 git 历史）。
 
   if (!editor) return null;
 
@@ -393,7 +372,7 @@ export function EditorScreen({
         </>
       )}
 
-      <div className={`format-toolbar ${toolbarUp ? 'keyboard-up' : ''}`}>
+      <div className="format-toolbar">
         <button
           className={`tool-btn ${editor.isActive('bold') ? 'active' : ''}`}
           onClick={() => editor.chain().focus().toggleBold().run()}

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ArrowUp, Check, ChevronDown, Copy, ImagePlus, Settings, Square, Terminal, X } from 'lucide-react';
+import { ArrowLeft, ArrowUp, Check, ChevronDown, Copy, ImagePlus, Settings, Square, Terminal, X } from 'lucide-react';
 import {
   api,
   listenEvent,
@@ -511,7 +511,7 @@ export function ChatScreen({ threadId, onBack, onThreadCreated, attachmentNotebo
     <div className="m-screen chat-screen">
       <header className="m-bar">
         <button className="m-icon-btn" onClick={onBack} aria-label="返回">
-          <ArrowUp style={{ transform: 'rotate(-90deg)' }} size={20} />
+          <ArrowLeft size={20} />
         </button>
         <div className="m-bar-title chat-title">{title || 'AI 对话'}</div>
         <div className="m-bar-spacer" />

@@ -34,7 +34,8 @@
 .prose-mobile {
   max-width: 720px;
   margin: 0 auto;
-  padding: 16px 20px calc(24px + var(--m-toolbar-h) + env(safe-area-inset-bottom));
+  /* 顶部让位上端固定工具栏；底部仅留呼吸空隙 */
+  padding: calc(12px + var(--m-toolbar-h)) 20px calc(24px + env(safe-area-inset-bottom));
 }
 
 .prose-mobile .tiptap {
@@ -443,35 +444,30 @@
   flex: 1;
 }
 
-/* ── 底部格式工具栏 ───────────────────────────────────── */
+/* ── 格式工具栏（文档上端，header 之下） ──────────────── */
 
 .format-toolbar {
   position: fixed;
   left: 0;
   right: 0;
-  bottom: 0;
+  /* 工具栏固定文档上端（header 之下）：底部方案会遮挡正文最后一行，
+     且键盘弹出时无需 visualViewport 上浮跟随。 */
+  top: var(--m-bar-h);
   z-index: 30;
   display: flex;
   align-items: center;
   gap: 2px;
-  height: calc(var(--m-toolbar-h) + env(safe-area-inset-bottom));
-  padding: 0 4px env(safe-area-inset-bottom);
+  height: var(--m-toolbar-h);
+  padding: 0 4px;
   background: var(--card);
-  border-top: 1px solid var(--divider);
+  border-bottom: 1px solid var(--divider);
   overflow-x: auto;
   scrollbar-width: none;
-  transition: transform var(--m-dur) var(--m-ease), opacity 150ms;
+  transition: opacity 150ms;
 }
 
 .format-toolbar::-webkit-scrollbar {
   display: none;
-}
-
-/* 键盘弹出：由 JS 写入 --kb-offset，工具栏悬浮键盘上方 */
-.format-toolbar.keyboard-up {
-  transform: translateY(calc(-1 * var(--kb-offset, 0px)));
-  border-top: none;
-  box-shadow: var(--m-shadow);
 }
 
 .tool-btn {
