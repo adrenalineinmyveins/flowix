@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
-import { ArrowLeft, LogOut, RefreshCw, Download, Sparkles } from 'lucide-react';
-import { api, AgentProviderConfig, CloudState, NotebookInfo, UpdateCheck } from './api';
+import { ArrowLeft, LogOut, RefreshCw, Download, Sparkles, Globe, Inbox } from 'lucide-react';
+import { api, AgentProviderConfig, CloudState, NotebookInfo, RedactionStatus, UpdateCheck } from './api';
 import { saveTheme, THEME_OPTIONS, ThemeId } from './theme';
 
 interface Props {
@@ -37,13 +37,52 @@ export function SettingsScreen({ cloud, notebooks, onBack, onLogout }: Props) {
     apiKey: '',
     model: '',
   });
+  const [net, setNet] = useState<RedactionStatus | null>(null);
+  const [netUsername, setNetUsername] = useState('');
+  const [netRelayUrl, setNetRelayUrl] = useState('');
 
   useEffect(() => {
     api
       .agentProviderGet()
       .then(setProvider)
       .catch(() => undefined);
+    api
+      .redactionStatus()
+      .then((status) => {
+        setNet(status);
+        if (status.registered) setNetRelayUrl(status.relayUrl);
+      })
+      .catch(() => undefined);
   }, []);
+
+  const doNetRegister = async () => {
+    if (busy) return;
+    setBusy(true);
+    setMessage('注册网络身份中…');
+    try {
+      const info = await api.redactionRegister(netUsername, netRelayUrl);
+      setNet({ registered: true, username: info.username, relayUrl: info.relayUrl, publicKey: info.publicKey, agentId: info.agentId });
+      setMessage(`网络身份就绪：${info.agentId}`);
+    } catch (e) {
+      setMessage(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doNetPoll = async () => {
+    if (busy) return;
+    setBusy(true);
+    setMessage('拉取收件箱…');
+    try {
+      const summary = await api.redactionPollOnce();
+      setMessage(`收件箱：新收 ${summary.received} 条（重复 ${summary.duplicates}）`);
+    } catch (e) {
+      setMessage(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const doSaveProvider = async () => {
     if (busy) return;
@@ -207,6 +246,76 @@ export function SettingsScreen({ cloud, notebooks, onBack, onLogout }: Props) {
               保存 AI 配置
             </button>
           </div>
+        </div>
+
+        <div className="m-card">
+          <div className="m-card-title">网络身份</div>
+          <div className="card-hint" style={{ textAlign: 'left' }}>
+            注册后本机拥有中继身份（Ed25519 密钥即身份），可被其他 Flowix 用户的 agent
+            咨询；私钥只存本机，不上云。地址格式：用户名/mob@中继地址
+          </div>
+          {net?.registered ? (
+            <>
+              <div className="m-card-row">
+                <span>身份地址</span>
+                <span className="value" style={{ wordBreak: 'break-all' }}>{net.agentId}</span>
+              </div>
+              <div className="m-card-row">
+                <span>中继</span>
+                <span className="value" style={{ wordBreak: 'break-all' }}>{net.relayUrl}</span>
+              </div>
+              <div style={{ display: 'flex', gap: 10, padding: '12px 0' }}>
+                <button className="m-btn-ghost" style={{ flex: 1 }} disabled={busy} onClick={doNetPoll}>
+                  <Inbox size={16} />
+                  拉取收件箱
+                </button>
+                <button
+                  className="m-btn-danger"
+                  style={{ flex: 1 }}
+                  disabled={busy}
+                  onClick={async () => {
+                    if (busy) return;
+                    setBusy(true);
+                    try {
+                      await api.redactionForget();
+                      setNet({ registered: false, username: '', relayUrl: '', publicKey: '', agentId: '' });
+                      setMessage('已忘记本机网络身份');
+                    } catch (e) {
+                      setMessage(String(e));
+                    } finally {
+                      setBusy(false);
+                    }
+                  }}
+                >
+                  <LogOut size={16} />
+                  忘记身份
+                </button>
+              </div>
+            </>
+          ) : (
+            <div className="provider-form">
+              <input
+                className="m-input"
+                placeholder="用户名（如 alice）"
+                autoCapitalize="off"
+                value={netUsername}
+                onChange={(event) => setNetUsername(event.target.value)}
+              />
+              <input
+                className="m-input"
+                placeholder="中继地址，如 http://8.160.162.251:8788"
+                autoCapitalize="off"
+                value={netRelayUrl}
+                onChange={(event) => setNetRelayUrl(event.target.value)}
+              />
+              <div style={{ padding: '12px 0 0' }}>
+                <button className="m-btn-ghost" style={{ width: '100%' }} disabled={busy} onClick={doNetRegister}>
+                  <Globe size={16} />
+                  注册 / 登录
+                </button>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="m-card">

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ArrowLeft, ArrowUp, Check, ChevronDown, Copy, ImagePlus, Settings, Square, Terminal, X } from 'lucide-react';
+import { ArrowLeft, ArrowUp, Check, ChevronDown, Copy, ImagePlus, Send, Settings, Square, Terminal, X } from 'lucide-react';
 import {
   api,
   listenEvent,
@@ -284,6 +284,24 @@ export function ChatScreen({ threadId, onBack, onThreadCreated, attachmentNotebo
   // 流式中的 assistant 增量（独立于已落库消息；stream_end 后由后端落库刷新）
   const [liveText, setLiveText] = useState('');
   const [liveReasoning, setLiveReasoning] = useState('');
+  // M4 网络会话人工代答回信
+  const [busyReply, setBusyReply] = useState(false);
+  const [replyMsg, setReplyMsg] = useState('');
+
+  const doNetReply = async () => {
+    if (busyReply) return;
+    setBusyReply(true);
+    setReplyMsg('');
+    try {
+      const result = await api.redactionReply(threadId);
+      setReplyMsg(`已投递（HTTP ${result.httpStatus}，回执 ${result.replyReceiptId}）`);
+      await reload();
+    } catch (e) {
+      setReplyMsg(String(e));
+    } finally {
+      setBusyReply(false);
+    }
+  };
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   // 滚动跟随（P1b）：仅当用户在底部附近时自动滚，向上翻阅脱离跟随
@@ -575,6 +593,19 @@ export function ChatScreen({ threadId, onBack, onThreadCreated, attachmentNotebo
       ) : null}
 
       <footer className="chat-input-bar">
+        {threadId === 'th_net_inbox' ? (
+          <div className="chat-net-reply">
+            <button
+              className="m-btn-ghost"
+              disabled={busyReply}
+              onClick={() => void doNetReply()}
+            >
+              <Send size={15} className={busyReply ? 'spin' : undefined} />
+              {busyReply ? '回信投递中…' : '发送回信（AI 最近草稿）'}
+            </button>
+            {replyMsg ? <span className="chat-net-reply-msg">{replyMsg}</span> : null}
+          </div>
+        ) : null}
         {pending.length > 0 ? (
           <div className="chat-pending-bar">
             {pending.map((item) => (
