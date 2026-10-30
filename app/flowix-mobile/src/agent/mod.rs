@@ -10,6 +10,7 @@
 
 mod chat;
 pub(crate) mod commands;
+pub(crate) mod tools;
 
 use flowix_sync::{V2LocalThread, V2ThreadPayload};
 use rusqlite::{Connection, OptionalExtension};

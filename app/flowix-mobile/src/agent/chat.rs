@@ -14,7 +14,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 /// 流式事件（wire 协议，字段 snake_case）。
 #[derive(Debug, Clone, Serialize)]
@@ -262,20 +262,14 @@ async fn run_chat_turn(
         }
     };
 
-    let web_search_tool = serde_json::json!({
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": "联网搜索最新信息。当问题涉及时效性、新闻、价格、版本号或你不确定的事实性内容时调用。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string", "description": "搜索关键词" }
-                },
-                "required": ["query"]
-            }
-        }
-    });
+    // 工具注册表上下文（note_search/note_read 需要本机笔记索引）
+    let mobile_state = app.state::<crate::cache::MobileState>();
+    let tool_ctx = super::tools::ToolCtx {
+        state: mobile_state.inner(),
+        client: &client,
+        config: &config,
+    };
+    let tool_definitions = super::tools::definitions();
 
     // 工具循环：模型请求工具 → 执行搜索 → 结果回填 → 再请求，直到纯文本回答或达上限。
     let mut assistant_content = String::new();
@@ -286,7 +280,7 @@ async fn run_chat_turn(
             "messages": &messages,
             "stream": true,
         });
-        body["tools"] = serde_json::json!([web_search_tool]);
+        body["tools"] = serde_json::Value::Array(tool_definitions.clone());
         let output = match stream_completion(
             &app,
             &thread_id,
@@ -327,26 +321,15 @@ async fn run_chat_turn(
             "tool_calls": calls,
         }));
 
-        // 2) 执行每个工具调用：搜索 → 工具消息落库（UI 工具行）+ 上下文回填
+        // 2) 执行每个工具调用：注册表分发 → 工具消息落库（UI 工具行）+ 上下文回填
         let mut round_failed = false;
         for (call_id, name, args_json) in &output.tool_calls {
-            let query = serde_json::from_str::<Value>(args_json)
-                .ok()
-                .and_then(|args| args["query"].as_str().map(str::to_string))
-                .unwrap_or_default();
-            if name != "web_search" || query.trim().is_empty() {
-                let hint = format!("AGENT_TOOL_UNSUPPORTED: {name}");
-                messages.push(serde_json::json!({
-                    "role": "tool", "tool_call_id": call_id, "content": hint,
-                }));
-                round_failed = true;
-                continue;
-            }
-            let results = web_search_dispatch(&client, &config, &query).await;
+            let args: Value = serde_json::from_str(args_json).unwrap_or(Value::Null);
+            let results = super::tools::execute(&tool_ctx, name, &args).await;
             let (tool_data, llm_content) = match &results {
                 Ok(data) => (data.clone(), data.clone()),
                 Err(error) => {
-                    let hint = format!("搜索失败：{error}");
+                    let hint = format!("工具执行失败：{error}");
                     round_failed = true;
                     (hint.clone(), hint)
                 }
@@ -356,7 +339,7 @@ async fn run_chat_turn(
                 "agent-chunk",
                 AgentChunk::Reasoning {
                     thread_id: thread_id.clone(),
-                    delta: format!("\n[工具] web_search(\"{query}\")\n{}\n", tool_data),
+                    delta: format!("\n[工具] {name}({args_json})\n{}\n", tool_data),
                 },
             );
             payload.messages.push(V2ThreadMessage {
@@ -364,7 +347,7 @@ async fn run_chat_turn(
                 role: "tool".into(),
                 content: String::new(),
                 reasoning: None,
-                tool_name: Some("web_search".into()),
+                tool_name: Some(name.clone()),
                 tool_input: Some(args_json.clone()),
                 tool_data: Some(tool_data),
                 created_at: chrono::Utc::now().timestamp_millis(),
@@ -553,144 +536,6 @@ async fn stream_completion(
         .filter(|(_, name, _)| !name.is_empty())
         .collect();
     Ok(output)
-}
-
-// ── 联网搜索工具（方案 B）──────────────────────────────────────────
-// Tavily（配置 key 时，结果质量高）或内置必应网页抓取（免 key 兜底）。
-
-async fn web_search_dispatch(
-    client: &reqwest::Client,
-    config: &super::AgentProviderConfig,
-    query: &str,
-) -> Result<String, String> {
-    match config.search_api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
-        Some(key) => tavily_search(client, key, query).await,
-        None => bing_search(client, query).await,
-    }
-}
-
-/// Tavily API：POST /search，返回 markdown 化的结果列表。
-async fn tavily_search(client: &reqwest::Client, key: &str, query: &str) -> Result<String, String> {
-    let response = client
-        .post("https://api.tavily.com/search")
-        .bearer_auth(key)
-        .json(&serde_json::json!({ "query": query, "max_results": 5 }))
-        .send()
-        .await
-        .map_err(|e| format!("TAVILY_REQUEST_FAILED: {e}"))?;
-    if !response.status().is_success() {
-        return Err(format!("TAVILY_HTTP_{}", response.status().as_u16()));
-    }
-    let value: Value = response
-        .json()
-        .await
-        .map_err(|e| format!("TAVILY_PARSE_FAILED: {e}"))?;
-    let mut lines = Vec::new();
-    if let Some(results) = value["results"].as_array() {
-        for (i, item) in results.iter().enumerate().take(5) {
-            let title = item["title"].as_str().unwrap_or_default();
-            let url = item["url"].as_str().unwrap_or_default();
-            let snippet = item["content"].as_str().unwrap_or_default();
-            lines.push(format!("{}. {} | {}\n{}", i + 1, title, url, snippet));
-        }
-    }
-    if lines.is_empty() {
-        return Err("TAVILY_EMPTY".into());
-    }
-    Ok(lines.join("\n\n"))
-}
-
-/// 必应网页抓取（免 key 兜底）：cn.bing.com 结果页粗解析（b_algo 块的
-/// 标题/链接/摘要）。页面结构变化时会退化到空结果，模型将如实告知。
-async fn bing_search(client: &reqwest::Client, query: &str) -> Result<String, String> {
-    let url = format!(
-        "https://cn.bing.com/search?q={}",
-        urlencode(query)
-    );
-    let response = client
-        .get(&url)
-        .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Mobile Safari/537.36")
-        .header("Accept-Language", "zh-CN,zh;q=0.9")
-        .send()
-        .await
-        .map_err(|e| format!("BING_REQUEST_FAILED: {e}"))?;
-    if !response.status().is_success() {
-        return Err(format!("BING_HTTP_{}", response.status().as_u16()));
-    }
-    let html = response
-        .text()
-        .await
-        .map_err(|e| format!("BING_READ_FAILED: {e}"))?;
-    let mut lines = Vec::new();
-    for block in html.split("<li class=\"b_algo").skip(1).take(5) {
-        let Some(link) = capture_first(block, "href=\"", "\"") else {
-            continue;
-        };
-        let Some(title) = capture_first(block, "<h2>", "</h2>") else {
-            continue;
-        };
-        let snippet = capture_first(block, "<p", "</p>")
-            .map(|raw| {
-                // 去标签 + 反转义
-                let text = strip_tags(&raw);
-                html_unescape(&text)
-            })
-            .unwrap_or_default();
-        let title = html_unescape(&strip_tags(&title));
-        let snippet = snippet.chars().take(300).collect::<String>();
-        if !link.starts_with("http") {
-            continue;
-        }
-        lines.push(format!("{}. {} | {}\n{}", lines.len() + 1, title, link, snippet));
-    }
-    if lines.is_empty() {
-        return Err("BING_EMPTY（页面结构可能已变化）".into());
-    }
-    Ok(lines.join("\n\n"))
-}
-
-/// 从 text 中取 start 之后、首个 end 之前的片段（片段内标签保留，调用方清洗）。
-fn capture_first(text: &str, start: &str, end: &str) -> Option<String> {
-    let start_idx = text.find(start)? + start.len();
-    let rest = &text[start_idx..];
-    let end_idx = rest.find(end)?;
-    Some(rest[..end_idx].to_string())
-}
-
-fn urlencode(input: &str) -> String {
-    let mut out = String::new();
-    for byte in input.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
-}
-
-fn strip_tags(html: &str) -> String {
-    let mut out = String::new();
-    let mut in_tag = false;
-    for ch in html.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(ch),
-            _ => {}
-        }
-    }
-    out
-}
-
-fn html_unescape(text: &str) -> String {
-    text.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&nbsp;", " ")
 }
 
 /// 附件 → data URL（读失败/空文件返回 None，调用方跳过该附件）。
