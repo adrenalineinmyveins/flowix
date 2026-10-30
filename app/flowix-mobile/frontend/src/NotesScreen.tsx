@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Bot,
   ChevronDown,
   CloudOff,
   FileText,
@@ -22,6 +23,7 @@ interface Props {
   onOpenSettings: () => void;
   onOpenSearch: () => void;
   onOpenChats: () => void;
+  onOpenAgents: () => void;
 }
 
 /** 相对时间（桌面文案风格：刚刚 / N 分钟前 / N 小时前 / 日期）。 */
@@ -45,6 +47,7 @@ export function NotesScreen({
   onOpenSettings,
   onOpenSearch,
   onOpenChats,
+  onOpenAgents,
 }: Props) {
   const [activeNotebook, setActiveNotebook] = useState<string>('');
   const [notes, setNotes] = useState<NoteInfo[]>([]);
@@ -168,6 +171,9 @@ export function NotesScreen({
         </button>
         <button className="m-icon-btn" onClick={onOpenChats} aria-label="AI 对话">
           <MessageSquare />
+        </button>
+        <button className="m-icon-btn" onClick={onOpenAgents} aria-label="Agent">
+          <Bot />
         </button>
         <button className="m-icon-btn" onClick={onOpenSettings} aria-label="设置">
           <SettingsIcon />

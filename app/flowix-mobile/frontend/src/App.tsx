@@ -7,13 +7,14 @@ import { SettingsScreen } from './SettingsScreen';
 import { SearchScreen } from './SearchScreen';
 import { ChatListScreen } from './ChatListScreen';
 import { ChatScreen } from './ChatScreen';
+import { AgentHubScreen } from './AgentHubScreen';
 
 export interface OpenNote {
   notebookId: string;
   relativePath: string;
 }
 
-type Screen = 'boot' | 'login' | 'notes' | 'editor' | 'settings' | 'search' | 'chats' | 'chat';
+type Screen = 'boot' | 'login' | 'notes' | 'editor' | 'settings' | 'search' | 'chats' | 'chat' | 'agents';
 
 /** 返回键契约：进栈 pushState，系统返回触发 popstate 回退；
  * 栈底（notes/login）再按返回交给系统默认行为。 */
@@ -161,6 +162,17 @@ export function App() {
     );
   }
 
+  if (screen === 'agents') {
+    return (
+      <div key="agents" className="m-push-enter" style={{ height: '100%' }}>
+        <AgentHubScreen
+          onBack={() => back('notes')}
+          onOpenSettings={() => go('settings')}
+        />
+      </div>
+    );
+  }
+
   if (screen === 'search') {
     return (
       <div key="search" className="m-fade-enter" style={{ height: '100%' }}>
@@ -223,6 +235,7 @@ export function App() {
         onOpenSettings={() => go('settings')}
         onOpenSearch={() => go('search')}
         onOpenChats={() => go('chats')}
+        onOpenAgents={() => go('agents')}
       />
     </div>
   );

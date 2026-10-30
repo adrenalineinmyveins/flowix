@@ -8,6 +8,8 @@ mod agent;
 mod cache;
 mod cloud;
 mod commands;
+mod market;
+mod redaction;
 mod sync;
 
 use std::sync::Arc;
@@ -31,6 +33,7 @@ pub fn run() {
             app.manage(sync);
             let agent = Arc::new(agent::AgentState::new(&dir)?);
             app.manage(agent);
+            redaction::spawn_poll_task(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -64,7 +67,18 @@ pub fn run() {
             agent::commands::agent_thread_delete,
             agent::commands::agent_thread_update,
             agent::commands::agent_chat_send,
-            agent::commands::agent_chat_stop
+            agent::commands::agent_chat_stop,
+            redaction::redaction_status,
+            redaction::redaction_register,
+            redaction::redaction_poll_once,
+            redaction::redaction_forget,
+            redaction::redaction_reply,
+            market::market_search,
+            market::market_subscriptions,
+            market::market_subscribe,
+            market::market_unsubscribe,
+            market::agent_card_get,
+            market::agent_card_set
         ])
         .run(tauri::generate_context!())
         .expect("error while running flowix mobile");

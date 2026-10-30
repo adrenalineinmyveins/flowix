@@ -124,6 +124,46 @@ export interface ThreadMessagesPage {
   oldestId?: string | null;
 }
 
+/** 网络身份（M3）：本机 relay 账号与收件通道状态 */
+export interface RedactionStatus {
+  registered: boolean;
+  username: string;
+  relayUrl: string;
+  publicKey: string;
+  agentId: string;
+}
+
+export interface RedactionAccountInfo {
+  username: string;
+  userId: string;
+  publicKey: string;
+  relayUrl: string;
+  agentId: string;
+}
+
+/** Agent 市场（浏览+订阅）与个人 Agent 名片 */
+export interface MarketCard {
+  address: string;
+  username: string;
+  agentSlug: string;
+  displayName: string;
+  visibility: string;
+  card?: Record<string, unknown> | null;
+  updatedAt: number;
+}
+
+export interface SubscriptionEntry {
+  address: string;
+  displayName: string;
+  subscribedAt: number;
+}
+
+export interface AgentCard {
+  name: string;
+  bio: string;
+  skills: string[];
+}
+
 /** D6：面向用户的错误文案映射；未命中返回原文 */
 export function friendlyAgentError(raw: string): string {
   const text = String(raw);
@@ -188,6 +228,26 @@ export const api = {
   agentProviderGet: () => invoke<AgentProviderConfig>('agent_provider_get'),
   agentProviderSet: (config: AgentProviderConfig) =>
     invoke<void>('agent_provider_set', { config }),
+
+  redactionStatus: () => invoke<RedactionStatus>('redaction_status'),
+  redactionRegister: (username: string, relayUrl: string) =>
+    invoke<RedactionAccountInfo>('redaction_register', { username, relayUrl }),
+  redactionPollOnce: () =>
+    invoke<{ received: number; duplicates: number; rejected: number }>('redaction_poll_once'),
+  redactionForget: () => invoke<void>('redaction_forget'),
+  redactionReply: (threadId: string) =>
+    invoke<{ delivered: boolean; httpStatus: number; replyReceiptId: string }>('redaction_reply', {
+      threadId,
+    }),
+
+  marketSearch: (query: string) => invoke<MarketCard[]>('market_search', { query }),
+  marketSubscriptions: () => invoke<SubscriptionEntry[]>('market_subscriptions'),
+  marketSubscribe: (address: string, displayName: string) =>
+    invoke<SubscriptionEntry[]>('market_subscribe', { address, displayName }),
+  marketUnsubscribe: (address: string) =>
+    invoke<SubscriptionEntry[]>('market_unsubscribe', { address }),
+  agentCardGet: () => invoke<AgentCard>('agent_card_get'),
+  agentCardSet: (card: AgentCard) => invoke<AgentCard>('agent_card_set', { card }),
   agentThreadList: () => invoke<ThreadSummary[]>('agent_thread_list'),
   agentThreadMessages: (threadId: string) =>
     invoke<ThreadMessage[]>('agent_thread_messages', { threadId }),
