@@ -212,7 +212,7 @@ impl RedactionOutboxRecord {
 pub fn draft_from_preview(
     question: &str,
     scope_entry_ids: &[String],
-    report: &crate::redaction::RedactionPreviewReport,
+    report: &crate::RedactionPreviewReport,
     now_ms: i64,
 ) -> RedactionOutboxRecord {
     RedactionOutboxRecord {
@@ -377,7 +377,7 @@ fn enforce_fifo(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::redaction::RedactionPreviewReport;
+    use crate::RedactionPreviewReport;
 
     fn report(payload: &str) -> RedactionPreviewReport {
         let mut map = BTreeMap::new();

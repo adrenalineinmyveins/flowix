@@ -1519,7 +1519,6 @@ dependencies = [
  "base64 0.22.1",
  "block2",
  "chrono",
- "crypto_box",
  "dirs 5.0.1",
  "dunce",
  "ed25519-dalek",
@@ -1529,6 +1528,7 @@ dependencies = [
  "flowix-plugin-runtime",
  "flowix-redaction",
  "flowix-relay",
+ "flowix-relay-client",
  "flowix-sync",
  "fs2",
  "futures",
@@ -1594,6 +1594,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "flowix-core",
+ "flowix-relay-client",
  "flowix-sync",
  "futures",
  "reqwest 0.12.28",
@@ -1645,6 +1646,27 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "uuid",
+]
+
+[[package]]
+name = "flowix-relay-client"
+version = "1.5.6"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "crypto_box",
+ "dirs 5.0.1",
+ "ed25519-dalek",
+ "flowix-redaction",
+ "flowix-relay",
+ "rand 0.8.6",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
  "uuid",
 ]
 

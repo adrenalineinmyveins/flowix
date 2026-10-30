@@ -23,16 +23,15 @@ use flowix_redaction::{
 use crate::config::access::{AgentAccessEntry, AgentAccessKind};
 use crate::nurture::should_accept_event_in_notebook;
 
-pub mod account;
 pub mod auto_grant;
 pub mod consult_bridge;
 pub mod consult_registry;
 pub mod directory;
-pub mod e2e;
-pub mod inbound;
-pub mod outbox;
 pub mod subscriptions;
-pub mod transport;
+
+// Relay 网络客户端栈已抽至 flowix-relay-client（MOBILE-AGENT-NETWORK §4.2），
+// 模块名 re-export 保持 `crate::redaction::account::X` 等既有引用不变。
+pub use flowix_relay_client::{account, e2e, inbound, outbox, transport};
 
 pub use inbound::{
     inbound_dir, list_inbound, poll_agent_inbox, register_device, relay_endpoint,
@@ -588,24 +587,9 @@ pub async fn wait_for_confirmation(
 // DSH 接线与完整 preview 编排
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RedactionPreviewReport {
-    /// 关联 outbox 留档（draft 态），确认门与发送出口都以它为凭据。
-    pub receipt_id: String,
-    pub final_text: String,
-    pub placeholder_map: BTreeMap<String, String>,
-    pub l1_hits: Vec<l1::RuleHit>,
-    pub attempts: u32,
-    pub used_fallback: bool,
-    pub included_paths: Vec<String>,
-    pub dropped_paths: Vec<String>,
-    pub truncated: bool,
-    pub target_level: String,
-    pub rule_set_version: String,
-    /// FD-12 M1：出站形态（`zero-material` | `open-scope` | `fallback` | `full`）。
-    pub distill_mode: String,
-}
+/// 纯数据类型已随迁 flowix-relay-client（outbox 依赖），此处 re-export
+/// 保持 `crate::redaction::RedactionPreviewReport` 既有引用不变。
+pub use flowix_relay_client::RedactionPreviewReport;
 
 /// 完整 preview 管线：scope 解析 → L0 → L1 → L2（DSH 蒸馏 + L3 复扫回炉）。
 ///

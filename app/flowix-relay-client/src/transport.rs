@@ -36,7 +36,8 @@ pub fn validate_relay_url(relay_url: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 从唯一出口取 confirmed 信封字节并投递到中继。
+/// 从唯一出口取 confirmed 信封字节并投递到中继（匿名档：不带 Bearer，
+/// 中继按 IP 计量配额）。
 ///
 /// - 未过确认门：`UNCONFIRMED_SEND_BLOCKED:*`（与 redaction_send 同一兜底）
 /// - 投递失败（网络错误 / 非 2xx）：返回 Err，留档保持 confirmed 可重试
@@ -45,6 +46,17 @@ pub async fn deliver_confirmed_envelope(
     receipt_id: &str,
     relay_url: &str,
 ) -> Result<RelayDeliverResult, String> {
+    deliver_confirmed_envelope_with_token(notebook_root, receipt_id, relay_url, None).await
+}
+
+/// 同上，可携带 Bearer（deviceToken）：中继把带 token 的投递计入
+/// 认证档配额（30/h）而非匿名 IP 档（3/h）。信封字节与匿名路径完全一致。
+pub async fn deliver_confirmed_envelope_with_token(
+    notebook_root: &Path,
+    receipt_id: &str,
+    relay_url: &str,
+    bearer_token: Option<&str>,
+) -> Result<RelayDeliverResult, String> {
     validate_relay_url(relay_url)?;
     // 唯一出口：字节与留档逐字节一致（幂等取出）。
     let bytes = take_confirmed_payload(notebook_root, receipt_id)?;
@@ -52,15 +64,20 @@ pub async fn deliver_confirmed_envelope(
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .no_proxy() // 自建中继直连（同 account.rs 实机诊断结论）
         .build()
         .map_err(|error| format!("RELAY_CLIENT_INIT_FAILED:{error}"))?;
     // relayUrl 兼容 base / base/v1 两种配置写法（wire v1 端点固定 /v1/outbox）。
     let outbox_url = relay_endpoint(relay_url, "/v1/outbox");
-    let response = client
+    let mut request = client
         .post(outbox_url)
         .header("content-type", "application/json")
         .header("x-flowix-envelope", "flowix.consult.v1")
-        .body(bytes)
+        .body(bytes);
+    if let Some(token) = bearer_token {
+        request = request.bearer_auth(token);
+    }
+    let response = request
         .send()
         .await
         .map_err(|error| format!("RELAY_DELIVERY_FAILED:{error}"))?;
@@ -79,8 +96,8 @@ pub async fn deliver_confirmed_envelope(
 mod tests {
     use super::*;
 
-    use crate::redaction::outbox::{draft_from_preview, settle, write_record, OutboxStatus};
-    use crate::redaction::RedactionPreviewReport;
+    use crate::outbox::{draft_from_preview, settle, write_record, OutboxStatus};
+    use crate::RedactionPreviewReport;
 
     fn report() -> RedactionPreviewReport {
         RedactionPreviewReport {
@@ -138,7 +155,7 @@ mod tests {
             error.starts_with("RELAY_DELIVERY_FAILED"),
             "{error}"
         );
-        let record = crate::redaction::read_record(root, &receipt)
+        let record = crate::outbox::read_record(root, &receipt)
             .expect("record still present after failed delivery");
         assert_eq!(record.status, OutboxStatus::Confirmed);
         // 重试仍能从出口取到字节（byte-equal 纪律）。

@@ -4,7 +4,7 @@
 //! 私钥只在本文件，出站信封签名与登录挑战共用。注册/登录共用一个端点：
 //! 新 username 注册即发 token；已有 username 走挑战签名换发。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -99,23 +99,36 @@ pub fn account_path() -> Result<PathBuf, String> {
     Ok(home.join(".flowix").join("redaction").join("account.json"))
 }
 
-pub fn read_account() -> Option<RelayAccount> {
-    let path = account_path().ok()?;
-    let raw = std::fs::read_to_string(path).ok()?;
+/// 账号目录（含 account.json）：桌面为 `~/.flowix/redaction`，
+/// 移动端经 `*_at` 系列注入 app data dir。
+fn account_root() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or_else(|| "HOME_UNAVAILABLE".to_string())?;
+    Ok(home.join(".flowix").join("redaction"))
+}
+
+/// 读账号（`root` = 含 account.json 的目录）。
+pub fn read_account_at(root: &Path) -> Option<RelayAccount> {
+    let raw = std::fs::read_to_string(root.join("account.json")).ok()?;
     // 与 config 同源的 BOM 容错。
     serde_json::from_str::<RelayAccount>(raw.trim_start_matches('\u{feff}')).ok()
 }
 
-pub fn write_account(account: &RelayAccount) -> Result<(), String> {
-    let path = account_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("ACCOUNT_DIR_FAILED: {e}"))?;
-    }
+pub fn read_account() -> Option<RelayAccount> {
+    read_account_at(&account_root().ok()?)
+}
+
+/// 写账号（原子写 tmp + rename；`root` = 含 account.json 的目录）。
+pub fn write_account_at(root: &Path, account: &RelayAccount) -> Result<(), String> {
+    std::fs::create_dir_all(root).map_err(|e| format!("ACCOUNT_DIR_FAILED: {e}"))?;
     let raw = serde_json::to_string_pretty(account).map_err(|e| format!("ACCOUNT_SERIALIZE_FAILED: {e}"))?;
-    let tmp = path.with_extension("json.tmp");
+    let tmp = root.join("account.json.tmp");
     std::fs::write(&tmp, raw).map_err(|e| format!("ACCOUNT_WRITE_FAILED: {e}"))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("ACCOUNT_WRITE_FAILED: {e}"))?;
+    std::fs::rename(&tmp, &root.join("account.json")).map_err(|e| format!("ACCOUNT_WRITE_FAILED: {e}"))?;
     Ok(())
+}
+
+pub fn write_account(account: &RelayAccount) -> Result<(), String> {
+    write_account_at(&account_root()?, account)
 }
 
 pub fn forget_account() -> Result<(), String> {
@@ -132,15 +145,23 @@ fn relay_endpoint(relay_url: &str, path: &str) -> String {
 }
 
 async fn http_client() -> Result<reqwest::Client, String> {
+    // 自建中继固定直连：禁用系统/环境代理，避免本地代理抖动拖垮账号链路
+    // （2026-10-31 实机诊断：Clash 节点瞬断导致 consult 与目录接口同时超时）。
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .no_proxy()
         .build()
         .map_err(|e| format!("ACCOUNT_CLIENT_INIT_FAILED: {e}"))
 }
 
-/// 注册或登录：本机已有同中继账号 → 复用私钥走挑战登录；否则生成新密钥
-/// 注册（201 即得 token）。username 被他人占用 → `USERNAME_TAKEN`。
-pub async fn register_or_login(username: &str, relay_url: &str) -> Result<RelayAccount, String> {
+/// 注册或登录（`root` = 含 account.json 的目录）：本机已有同中继账号 →
+/// 复用私钥走挑战登录；否则生成新密钥注册（201 即得 token）。
+/// username 被他人占用 → `USERNAME_TAKEN`。
+pub async fn register_or_login_at(
+    root: &Path,
+    username: &str,
+    relay_url: &str,
+) -> Result<RelayAccount, String> {
     let username = username.trim().to_lowercase();
     if username.len() < 3
         || username.len() > 32
@@ -151,7 +172,7 @@ pub async fn register_or_login(username: &str, relay_url: &str) -> Result<RelayA
     }
     super::transport::validate_relay_url(relay_url)?;
 
-    let existing = read_account();
+    let existing = read_account_at(root);
     let signing_key = match &existing {
         Some(account) if account.username == username && account.relay_url == relay_url.trim() => {
             account.signing_key()?
@@ -210,8 +231,13 @@ pub async fn register_or_login(username: &str, relay_url: &str) -> Result<RelayA
         public_key,
         relay_url: relay_url.trim().to_string(),
     };
-    write_account(&account)?;
+    write_account_at(root, &account)?;
     Ok(account)
+}
+
+/// 桌面默认路径包装（`~/.flowix/redaction`）。
+pub async fn register_or_login(username: &str, relay_url: &str) -> Result<RelayAccount, String> {
+    register_or_login_at(&account_root()?, username, relay_url).await
 }
 
 #[cfg(test)]
@@ -283,5 +309,17 @@ mod tests {
         assert!(account.signing_key().is_ok());
         let corrupted = RelayAccount { signing_key: "!!!".into(), ..test_account() };
         assert!(corrupted.signing_key().is_err());
+    }
+
+    #[test]
+    fn account_roundtrip_at_injected_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        // 注入目录读写 roundtrip：文件落在 root/account.json。
+        assert!(read_account_at(root).is_none());
+        write_account_at(root, &test_account()).unwrap();
+        let loaded = read_account_at(root).unwrap();
+        assert_eq!(loaded.username, "alice");
+        assert!(root.join("account.json").is_file());
     }
 }

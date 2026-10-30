@@ -18,6 +18,7 @@ flowix-core = { workspace = true }
 flowix-plugin-runtime = { workspace = true }
 flowix-redaction = { workspace = true }
 flowix-relay = { workspace = true }
+flowix-relay-client = { path = "../flowix-relay-client" }
 flowix-sync = { workspace = true }
 tauri = { version = "2", features = ["protocol-asset", "macos-private-api", "unstable"] }
 tauri-plugin-opener = "2"
@@ -47,10 +48,9 @@ reqwest = { workspace = true, features = ["blocking", "stream"] }
 futures-util = "0.3"
 async-trait = "0.1"
 base64 = "0.22"
-# FD-11 v2：中继账号密钥（Ed25519 签名/挑战登录）。
+# FD-11 v2：中继账号密钥（Ed25519 签名/挑战登录）——现由 flowix-relay-client 承载，
+# 此处保留供 tests/cross_user_m5.rs 构造签名密钥。
 ed25519-dalek = "2"
-# FD-11 P2-9 盲转加密：NaCl box（X25519 + XSalsa20-Poly1305）。
-crypto_box = "0.8"
 rand = "0.8"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "ico", "tiff"] }
 nanoid = { workspace = true }

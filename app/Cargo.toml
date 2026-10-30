@@ -7,6 +7,7 @@ members = [
     "flowix-plugin-runtime",
     "flowix-redaction",
     "flowix-relay",
+    "flowix-relay-client",
     "flowix-sync",
     "flowix-cloud",
     "flowix-cli",
@@ -24,6 +25,7 @@ flowix-core = { path = "flowix-core" }
 flowix-plugin-runtime = { path = "flowix-plugin-runtime" }
 flowix-redaction = { path = "flowix-redaction" }
 flowix-relay = { path = "flowix-relay" }
+flowix-relay-client = { path = "flowix-relay-client" }
 flowix-sync = { path = "flowix-sync" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

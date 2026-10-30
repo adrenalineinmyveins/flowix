@@ -220,6 +220,7 @@ pub async fn poll_agent_inbox(
 ) -> Result<PollSummary, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .no_proxy() // 自建中继直连（同 account.rs 实机诊断结论）
         .build()
         .map_err(|e| format!("INBOX_CLIENT_INIT_FAILED:{e}"))?;
     let inbox_url = relay_endpoint(relay_url, "/v1/inbox");
@@ -371,6 +372,7 @@ pub async fn register_device(
 ) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .no_proxy() // 自建中继直连（同 account.rs 实机诊断结论）
         .build()
         .map_err(|e| format!("INBOX_CLIENT_INIT_FAILED: {e}"))?;
     let url = relay_endpoint(relay_url, "/v1/devices");

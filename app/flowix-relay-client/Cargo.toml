@@ -1,0 +1,29 @@
+[package]
+name = "flowix-relay-client"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# Relay 网络客户端共享栈（MOBILE-AGENT-NETWORK.md §4.2）：自 desktop redaction 抽取，
+# 桌面/移动共用。依赖 flowix-relay（wire 类型单一来源）与 flowix-redaction（L1 RuleHit）。
+
+[dependencies]
+base64 = "0.22"
+chrono = { workspace = true }
+# FD-11 P2-9 盲转加密：NaCl box（X25519 + XSalsa20-Poly1305）。
+crypto_box = "0.8"
+dirs = { workspace = true }
+# FD-11 v2：中继账号密钥（Ed25519 签名/挑战登录）。
+ed25519-dalek = "2"
+flowix-redaction = { path = "../flowix-redaction" }
+flowix-relay = { path = "../flowix-relay" }
+rand = "0.8"
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }
