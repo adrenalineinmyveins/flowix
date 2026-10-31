@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-Flowix 是一款桌面笔记应用（**Tauri 2 + Rust 后端，React 19 + TS + Tiptap 前端**），内置 AI 代理（`rllm` v1.1，OpenAI / Anthropic / DeepSeek 全部走 `openai_compatible` provider）。
+Flowix 是一款桌面笔记应用（**Tauri 2 + Rust 后端，React 19 + TS + Tiptap 前端**）。对话 agent 全部为外部 CLI runtime（codex / claude / hermes / opencode / pi / DeepSeek Harness，经 `agent_external/runtime_registry.rs` 统一注册派发）；早期的进程内 LLM runtime（rllm / `openai_compatible` provider）已整体移除。
 
 
 ## 命令
@@ -282,56 +282,46 @@ flowix-main/
 │   │           └── tests.rs              # 单元测试
 │   │
 │   ├── flowix-desktop/                   # Tauri 2 桌面壳
-│   │   ├── tauri.conf.json               # Tauri 配置
+│   │   ├── tauri.conf.json               # Tauri 配置（+ dev / production 覆盖层）
 │   │   ├── build.rs                      # 构建脚本
 │   │   ├── binaries/                     # CLI sidecar 产物
 │   │   └── src/
 │   │       ├── main.rs                   # 应用入口
 │   │       ├── lib.rs                    # 装配 run()
-│   │       ├── agent.rs                  # AI 代理
-│   │       ├── agent_access.rs           # 代理鉴权
-│   │       ├── threads.rs                # 会话线程
-│   │       ├── fs_watcher.rs             # 文件监听
-│   │       ├── memo_events.rs            # 笔记事件
-│   │       ├── global_meta_data.rs       # 全局元数据
-│   │       ├── user_config.rs            # 用户配置
-│   │       ├── path_scope.rs             # 路径白名单
-│   │       ├── commands/                 # Tauri IPC 命令
-│   │       │   ├── memo.rs               # 笔记命令
-│   │       │   ├── notebook.rs           # 笔记本命令
-│   │       │   ├── agent.rs              # 代理命令
-│   │       │   ├── thread.rs             # 线程命令
-│   │       │   ├── settings.rs           # 设置命令
-│   │       │   ├── tag.rs                # 标签命令
-│   │       │   ├── file.rs               # 文件命令
-│   │       │   ├── dialog.rs             # 系统对话框
-│   │       │   ├── kv.rs                 # KV 存储
-│   │       │   └── window.rs             # 窗口控制
-│   │       ├── providers/                # LLM provider
-│   │       │   ├── openai_compatible.rs  # 统一接入
-│   │       │   └── tools/                # 函数工具
-│   │       │       ├── filesystem.rs     # 文件工具
-│   │       │       └── notebook.rs       # 笔记工具
-│   │       ├── watcher/                  # 监听器流水线
-│   │       │   ├── dispatcher.rs         # 事件派发
-│   │       │   ├── processor.rs          # 事件处理
-│   │       │   ├── event.rs              # 事件类型
-│   │       │   ├── path.rs               # 路径工具
-│   │       │   ├── whitelist.rs          # 路径白名单
-│   │       │   └── filter/               # 过滤管线
-│   │       │       ├── debouncer.rs      # 防抖
-│   │       │       ├── id_dedup.rs       # ID 去重
-│   │       │       ├── path_filter.rs    # 路径过滤
-│   │       │       └── self_write.rs     # 自写过滤
-│   │       ├── prompt/                   # 系统提示词
-│   │       │   ├── base.rs               # 基础提示
-│   │       │   ├── behavior.rs           # 行为规范
-│   │       │   ├── safety.rs             # 安全约束
-│   │       │   └── tools.rs              # 工具声明
-│   │       └── open_target/              # 跨端链接打开
-│   │           ├── parser.rs             # URL 解析
-│   │           ├── resolver.rs           # 目标解析
-│   │           └── handler.rs            # 跳转处理
+│   │       ├── app/                      # Tauri 装配（bootstrap / state）
+│   │       ├── agent_external/           # 外部 agent runtime（全部对话 agent）
+│   │       │   ├── runtime_registry.rs   # ExternalRuntimeKind 注册表 + chat 派发
+│   │       │   ├── lifecycle.rs / shared.rs / cli_resolver.rs
+│   │       │   ├── codex/                # Codex（app_server 协议）
+│   │       │   ├── claude/               # Claude CLI
+│   │       │   ├── hermes/  opencode/  pi/
+│   │       │   ├── deepseek_harness/     # DSH 宿主（manager / host_registry / app_server）
+│   │       │   └── mobile.rs             # 云同步跨端会话（OpenAI 兼容 SSE 直连）
+│   │       ├── agent_session/            # 会话存储（ThreadManager + 迁移）
+│   │       ├── agent_wire.rs             # 前端事件线协议（AgentChunk 等）
+│   │       ├── agent_types.rs            # AgentId / 默认 agent
+│   │       ├── agent_lifecycle.rs / agent_history.rs / agent_external_config.rs
+│   │       ├── nurture/                  # 个人 Agent 喂养（profile 事件闸 / runner）
+│   │       ├── consult/                  # 内置咨询入口
+│   │       ├── redaction/                # 披露与中继（身份卡体系）
+│   │       │   ├── directory.rs          # 身份卡市场发布 / 搜索 / 下架（AGENT-MARKET M1）
+│   │       │   ├── subscriptions.rs      # 订阅快照 CRUD（M3）
+│   │       │   ├── consult_bridge.rs     # consult_remote 回环 HTTP 桥（FD-12）
+│   │       │   └── consult_registry.rs / auto_grant.rs
+│   │       ├── plugin.rs                 # 工具策略（consult_remote verdict 等）
+│   │       ├── watcher/                  # 文件监听管线
+│   │       │   ├── manager.rs / runtime.rs / processor.rs / event.rs
+│   │       │   ├── path.rs / whitelist.rs / tombstone.rs / rename_tracker.rs
+│   │       │   └── filter/               # 过滤管线（防抖 / ID 去重 / 自写过滤）
+│   │       ├── config/                   # 用户配置
+│   │       ├── maintenance/              # 维护任务
+│   │       └── commands/                 # Tauri IPC 命令
+│   │           ├── memo.rs / notebook.rs / tag.rs / file.rs / dialog.rs / kv.rs / window.rs
+│   │           ├── agent/                # 代理命令（chat / runtime / model_catalog / terminal…）
+│   │           ├── thread.rs / settings.rs / cloud.rs / export.rs / dsh.rs…
+│   │           ├── agent_profile.rs      # 身份卡 CRUD（.agents/<id>/profile.md）
+│   │           ├── market.rs             # 身份卡市场 IPC（M1 发布 / M3 订阅）
+│   │           └── redaction.rs / consult.rs / skill.rs / plugin.rs…
 │   │
 │   ├── flowix-cli/                       # CLI sidecar（Tauri shell 调用）
 │   │   └── src/
@@ -344,80 +334,20 @@ flowix-main/
 │   │       └── errors.rs                 # 错误定义
 │   │
 │   └── flowix-web/                       # React 19 + Vite 前端
-│       ├── index.html                    # HTML 入口
-│       ├── main.tsx                      # Vite 入口
-│       ├── app.tsx                       # 根组件
-│       ├── types/                        # 全局类型
-│       ├── components/
-│       │   ├── editor/                   # Tiptap 富文本
-│       │   │   ├── markdown-editor.tsx   # 编辑器壳
-│       │   │   ├── extensions/           # Tiptap 扩展
-│       │   │   │   ├── slash-menu.tsx    # 斜杠菜单
-│       │   │   │   ├── frontmatter.tsx   # 元数据头
-│       │   │   │   ├── tag.ts            # 标签节点
-│       │   │   │   ├── mermaid-diagram.tsx# Mermaid 图
-│       │   │   │   ├── search-replace.ts # 查找替换
-│       │   │   │   ├── markdown-link.ts  # 链接节点
-│       │   │   │   ├── markdown-paste.ts # 粘贴处理
-│       │   │   │   ├── attachment-link/  # 附件嵌入
-│       │   │   │   ├── note-reference/   # 笔记互链
-│       │   │   │   ├── codeblock-shiki/  # 代码块
-│       │   │   │   └── shiki/            # 语法高亮
-│       │   │   └── components/           # 浮动菜单
-│       │   ├── ui/                       # shadcn 基础组件
-│       │   └── error-boundary.tsx        # 错误边界
-│       ├── lib/
-│       │   ├── store/                    # Zustand 状态层
-│       │   │   ├── memo-store.ts         # 笔记状态
-│       │   │   ├── document-store.ts     # 文档状态
-│       │   │   ├── document-buffer.ts    # 文档缓冲
-│       │   │   ├── document-session-service.ts # 会话服务
-│       │   │   ├── buffer-registry.ts    # 缓冲注册
-│       │   │   ├── save-queue.ts         # 保存队列
-│       │   │   ├── chat-store.ts         # 对话状态
-│       │   │   ├── settings-store.ts     # 设置状态
-│       │   │   ├── user-settings-store.ts# 用户偏好
-│       │   │   ├── agent-access-store.ts # 代理状态
-│       │   │   └── tag-store.ts          # 标签状态
-│       │   ├── tauri/
-│       │   │   ├── client.ts             # IPC 封装
-│       │   │   └── event-bus.ts          # 事件总线
-│       │   ├── hooks/                    # React Hooks
-│       │   ├── shortcuts/                # 快捷键系统
-│       │   │   ├── registry.ts           # 注册中心
-│       │   │   ├── matcher.ts            # 键序匹配
-│       │   │   ├── parser.ts             # 组合解析
-│       │   │   └── shortcuts-provider.tsx# Provider
-│       │   ├── theme/                    # 主题系统
-│       │   ├── openByTarget/             # 链接调度
-│       │   ├── message/                  # 消息解析
-│       │   ├── memo-dispatcher.ts        # 笔记派发
-│       │   ├── memo-dispatcher-dedup.ts  # 派发去重
-│       │   ├── event-dispatcher.ts       # 事件派发
-│       │   ├── export.ts                 # 导出工具
-│       │   └── toast.tsx                 # Toast 通知
-│       └── windows/
-│           ├── main/                     # 主窗口
-│           │   ├── main-layout.tsx       # 三栏布局
-│           │   ├── menu-board.tsx        # 菜单面板
-│           │   ├── global-search-command.tsx # 全局搜索
-│           │   ├── agent-panel/          # AI 对话面板
-│           │   │   ├── agent-root.tsx    # 面板根
-│           │   │   ├── chat-history.tsx  # 历史列表
-│           │   │   ├── chat-message.tsx  # 单条消息
-│           │   │   ├── agent-inputbox.tsx# 输入框
-│           │   │   └── messages/         # 消息渲染
-│           │   ├── document-pane/        # 文档面板
-│           │   │   ├── document-container.tsx # 文档容器
-│           │   │   └── session/          # 文档会话 hooks
-│           │   ├── memo-pane/            # 笔记列表
-│           │   │   ├── memo-list.tsx     # 列表本体
-│           │   │   └── memo-card1.tsx    # 笔记卡片
-│           │   ├── status-bar/           # 底部状态栏
-│           │   └── drag-overlay/         # 拖拽蒙层
-│           └── preferences/              # 偏好窗口
-│               ├── preferences-view.tsx  # 偏好主视图
-│               └── sections/             # 各分区面板
+│       ├── entrypoints/                  # desktop.tsx / main.ts（入口挂载）
+│       ├── features/                     # 功能域（状态随域走 features/*/store）
+│       │   ├── agent/                    # 对话卡 thread-card / 市场 market / 个人 Agent profile / runtime 配置
+│       │   ├── editor/                   # Tiptap 编辑器壳 + extensions（mention / agent-reference / slash-menu…）
+│       │   ├── memo/                     # 笔记列表与导航
+│       │   ├── document/                 # 文档容器与会话
+│       │   ├── workspace/                # 工作区导航 / 焦点
+│       │   ├── shell/                    # 三栏主布局
+│       │   ├── preferences/  properties/  collection/  plugin/  notifications/…
+│       │   └── multidimensional-table/  media-library/  onboarding/  shortcuts/  theme/  surface/
+│       ├── lib/                          # settings-store / tauri client / i18n / shortcuts / toast
+│       ├── platform/tauri/client/        # IPC 封装（按域拆分：agent / market / agent-profile / notes…）
+│       ├── shared/                       # 共享 UI 组件
+│       └── styles/  types/  mock/
 │
 ├── scripts/
 │   ├── build-cli.mjs                     # 编 CLI sidecar
@@ -440,6 +370,6 @@ flowix-main/
 
 **说明：**
 - **`flowix-core`** 是纯 Rust 库，无 Tauri 依赖，被 `flowix-desktop` 与 `flowix-cli` 共享 —— CLI 通过 sidecar 形式打包进 desktop binaries 目录。
-- **`flowix-desktop`** 负责 Tauri 装配：commands（IPC）、watcher（文件监听管线）、providers（LLM 调用，统一走 `openai_compatible`）、prompt（系统提示词）、open_target（深链）。
-- **`flowix-web`** 单仓双窗口（main + preferences）：state 用 Zustand，编辑器用 Tiptap + Shiki，IPC 走 `lib/tauri/client.ts`。
+- **`flowix-desktop`** 负责 Tauri 装配：commands（IPC）、agent_external（全部对话 agent 的外部 runtime 注册 / 生命周期 / 会话投影）、nurture（个人 Agent 喂养）、redaction（身份卡市场 / 订阅 / consult 桥）、watcher（文件监听管线）。历史架构中的 `providers/`（openai_compatible）、`prompt/`、`open_target/` 等内置 LLM 路径已随 runtime 外部化移除。
+- **`flowix-web`** 单窗口（main）：state 用 Zustand（按功能域放在 `features/*/store`），编辑器用 Tiptap + Shiki，IPC 走 `platform/tauri/client/`（按域拆分）。
 - 顶层 `skills/`、`dist/`、`node_modules/`、`app/target/` 为产物 / 资源 / 衍生目录，已省略。
