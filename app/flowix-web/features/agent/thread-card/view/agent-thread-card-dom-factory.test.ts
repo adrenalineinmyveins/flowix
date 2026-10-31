@@ -16,6 +16,7 @@ describe('agent thread card message scrollbar', () => {
       onDeleteClick: () => {},
       onFullscreenClick: () => {},
       onCollapseClick: () => {},
+      onSaveProfileClick: () => {},
       onBodyClick: () => {},
       onBodyScroll: () => {},
       onBodyWheel: () => {},
@@ -27,5 +28,28 @@ describe('agent thread card message scrollbar', () => {
     expect(parts.body.classList.contains('overlay-scrollbar')).toBe(true);
     expect(frame?.querySelector('.overlay-scrollbar-thumb')).not.toBeNull();
     parts.disposeBodyScrollbar();
+  });
+
+  /** AGENT-ASSET-ROADMAP P1-C：头部「保存为个人 Agent」按钮接线。 */
+  it('renders the save-as-agent action and forwards its click', () => {
+    const clicks: number[] = [];
+    const parts = createAgentThreadCardDom({
+      inputDraft: '',
+      t: (key) => key,
+      onCardMouseDown: () => {},
+      onTitleDoubleClick: () => {},
+      onDeleteClick: () => {},
+      onFullscreenClick: () => {},
+      onCollapseClick: () => {},
+      onSaveProfileClick: () => clicks.push(1),
+      onBodyClick: () => {},
+      onBodyScroll: () => {},
+      onBodyWheel: () => {},
+    });
+
+    expect(parts.saveProfileButton.getAttribute('aria-label')).toBe('editor.threadCard.saveAsAgent');
+    expect(parts.saveProfileButton.hidden).toBe(false);
+    parts.saveProfileButton.click();
+    expect(clicks).toHaveLength(1);
   });
 });

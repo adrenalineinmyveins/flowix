@@ -15,7 +15,7 @@ vi.mock('@platform/tauri/client', () => ({
   market: { subscriptions: mocks.subscriptions },
 }));
 
-function card(address: string, displayName: string): SubscribedCard {
+function card(address: string, displayName: string, refreshedAt = 1): SubscribedCard {
   return {
     address,
     relayUrl: 'https://relay.example.com',
@@ -25,7 +25,7 @@ function card(address: string, displayName: string): SubscribedCard {
     autoAnswer: 'on',
     cardPublicKey: 'pk',
     subscribedAt: 1,
-    refreshedAt: 1,
+    refreshedAt,
   };
 }
 
@@ -36,7 +36,7 @@ afterEach(() => {
 
 describe('queryMentionAgents', () => {
   it('maps subscriptions to mention items and caches between queries', async () => {
-    mocks.subscriptions.mockResolvedValue([card('alice/agent-1', 'Alice 助手')]);
+    mocks.subscriptions.mockResolvedValue([card('alice/agent-1', 'Alice 助手', 1000)]);
     const first = await queryMentionAgents('');
     expect(first).toEqual([
       {
@@ -44,6 +44,7 @@ describe('queryMentionAgents', () => {
         address: 'alice/agent-1',
         displayName: 'Alice 助手',
         relayUrl: 'https://relay.example.com',
+        refreshedAt: 1000,
       },
     ]);
     await queryMentionAgents('');
@@ -77,7 +78,7 @@ describe('queryMentionAgents', () => {
 
 describe('isMentionAgent', () => {
   it('discriminates the union by kind', () => {
-    expect(isMentionAgent({ kind: 'agent', address: 'a/b', displayName: 'A', relayUrl: 'r' })).toBe(true);
+    expect(isMentionAgent({ kind: 'agent', address: 'a/b', displayName: 'A', relayUrl: 'r', refreshedAt: 1 })).toBe(true);
     expect(isMentionAgent({
       relativePath: 'a.md', filename: 'a.md', title: 'A', updatedAt: 0,
       notebookId: 'n', notebookName: 'N', notebookPath: '/n', originalPath: null,

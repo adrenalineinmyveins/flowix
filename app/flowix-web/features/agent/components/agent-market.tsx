@@ -12,6 +12,7 @@ import { market, redaction } from '@platform/tauri/client';
 import type { SubscribedCard } from '@platform/tauri/client';
 import type { DirectoryCard } from '@/lib/types/redaction';
 import { invalidateMentionAgents } from '@features/editor/extensions/agent-reference/agent-mention-data';
+import { formatTimeAgo } from '@/lib/format-time-ago';
 import { RelayAccountSection } from '@features/agent/components/relay-account-section';
 import { Button } from '@shared/ui/button';
 import { Input } from '@shared/ui/input';
@@ -291,7 +292,12 @@ export function AgentMarket({ notebookPath }: { notebookPath: string }) {
             </p>
           ) : (
             <ul className="space-y-1">
-              {subscriptions.map((item) => (
+              {subscriptions.map((item) => {
+                // P1-D：快照陈旧度（>7 天警示色，配合刷新按钮）。
+                const stale =
+                  item.refreshedAt > 0 &&
+                  Date.now() / 1000 - item.refreshedAt > 7 * 24 * 3600;
+                return (
                 <li
                   key={item.address}
                   className="flex items-center justify-between gap-2 rounded-md border border-[var(--border)] px-2 py-1.5 text-xs"
@@ -301,6 +307,18 @@ export function AgentMarket({ notebookPath }: { notebookPath: string }) {
                     <p className="truncate text-[var(--muted-foreground)]">
                       {item.address}@{item.relayUrl}
                     </p>
+                    {item.refreshedAt > 0 && (
+                      <p
+                        className={cn(
+                          'truncate text-[10px]',
+                          stale ? 'text-amber-600' : 'text-[var(--muted-foreground)]',
+                        )}
+                      >
+                        {t('agent.market.snapshotUpdated', {
+                          time: formatTimeAgo(item.refreshedAt * 1000, t),
+                        })}
+                      </p>
+                    )}
                   </div>
                   <div className="flex shrink-0 gap-1">
                     <Button
@@ -326,7 +344,8 @@ export function AgentMarket({ notebookPath }: { notebookPath: string }) {
                     </Button>
                   </div>
                 </li>
-              ))}
+                );
+              })}
             </ul>
           )}
         </section>

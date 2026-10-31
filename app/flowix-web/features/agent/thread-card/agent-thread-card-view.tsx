@@ -22,6 +22,7 @@ import { deriveThreadTitleFromPrompt, defaultThreadTitle } from "@features/agent
 import { toast } from "@/lib/toast";
 import { useNoteStore } from "@features/memo/store/note-store";
 import { agent } from "@platform/tauri/client/agent";
+import { agentProfile } from "@platform/tauri/client/agent-profile";
 import { normalizeAgentTypeKey } from "@/lib/agent-types";
 import { getCurrentAppLanguage } from "@features/preferences/public/runtime-api";
 import type { AgentRuntimeSettingKind } from "@features/agent/runtime/agent-runtime-spec";
@@ -177,6 +178,7 @@ export class AgentThreadCardView implements ProseMirrorNodeView {
   private notePicker: NotePickerController;
   private agentPicker: AgentPickerController;
   private composerAddMenu: ComposerAddMenuController;
+  private saveProfileButton: HTMLButtonElement;
   private notebookAgentSettingsDialog = new NotebookAgentSettingsDialogController();
   private isCreating = false;
   private isDestroyed = false;
@@ -333,6 +335,11 @@ export class AgentThreadCardView implements ProseMirrorNodeView {
         const tr = this.view.state.tr.delete(pos, pos + this.node.nodeSize);
         this.view.dispatch(tr);
       },
+      // AGENT-ASSET-ROADMAP P1-C：会话沉淀为个人 Agent 身份卡。
+      onSaveProfileClick: (event) => {
+        event.stopPropagation();
+        this.saveAsAgentProfile();
+      },
       onFullscreenClick: (event) => {
         event.stopPropagation();
         this.toggleFullscreen();
@@ -400,6 +407,9 @@ export class AgentThreadCardView implements ProseMirrorNodeView {
     this.metaEl = domParts.metaEl;
     this.runStatusEl = domParts.runStatusEl;
     this.deleteButton = domParts.deleteButton;
+    // mobile 为云同步只读会话（K2），无人格化入口。
+    this.saveProfileButton = domParts.saveProfileButton;
+    this.saveProfileButton.hidden = this.typeKey === "mobile";
     this.fullscreenButton = domParts.fullscreenButton;
     this.actionsDivider = domParts.actionsDivider;
     this.collapseButton = domParts.collapseButton;
@@ -943,6 +953,44 @@ export class AgentThreadCardView implements ProseMirrorNodeView {
     relayUrl: string;
   }): void {
     this.composerController.insertAgentReference(attrs);
+  }
+
+  /**
+   * AGENT-ASSET-ROADMAP P1-C：把当前会话沉淀为个人 Agent 身份卡草稿。
+   * 人格与历史分离——只取标题/首条消息摘要/runtime 类型生成 profile.md，
+   * 不复制会话历史；发布仍走 M1 链路由用户人审。
+   */
+  private saveAsAgentProfile(): void {
+    if (this.isDestroyed || this.typeKey === "mobile") return;
+    const notebookPath = this.notebookPath;
+    if (!notebookPath) {
+      toast.warning(this.t("editor.threadCard.saveAsAgentNoNotebook"));
+      return;
+    }
+    const firstMessage = this.firstUserMessageText() ?? "";
+    const displayName =
+      (this.instance?.title ?? (this.node.attrs.title as string | null) ?? "")
+        .trim()
+      || firstMessage.slice(0, 24).trim()
+      || defaultThreadTitle(this.typeKey);
+    void agentProfile
+      .create(notebookPath, {
+        displayName,
+        bio: firstMessage.slice(0, 80),
+        expertise: [],
+        agentType: this.typeKey,
+      })
+      .then((profile) => {
+        toast.success(
+          this.t("editor.threadCard.saveAsAgentDone", {
+            name: profile.flowix_display_name,
+          }),
+        );
+        useNoteStore.getState().setMiddleColumnView("agents");
+      })
+      .catch((error: unknown) => {
+        toast.error(errorMessage(error));
+      });
   }
 
   private applyResolvedExternalSessionId(

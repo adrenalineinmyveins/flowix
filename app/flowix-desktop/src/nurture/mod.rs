@@ -79,7 +79,7 @@ pub fn start_trigger(app: tauri::AppHandle) -> tauri::async_runtime::JoinHandle<
             let profiles = list_notebook_profiles(Path::new(notebook_root));
             let mut sched = scheduler().lock().unwrap_or_else(|e| e.into_inner());
             for (agent_id, profile) in profiles {
-                if !should_feed_agent(&profile, &event.tags) {
+                if !should_feed_agent(&profile, &event.notebook_id, &event.tags) {
                     continue;
                 }
                 let _ =
@@ -90,11 +90,26 @@ pub fn start_trigger(app: tauri::AppHandle) -> tauri::async_runtime::JoinHandle<
 }
 
 /// per-agent 闸（AGENT-PROFILE-REDESIGN D-4）：profile 声明 `flowix_memory`
-/// 时，事件标签须命中其中 tag 项（或其子树）；note:/collection: 项不适用
-/// 于 tag 事件闸；为空表示不限（跟随全局授权）。与 F6 联动一致：
+/// 时，事件须命中任一记忆源——`notebook:` 项按事件笔记本 ID 精确匹配，
+/// `tag:` 项按标签命中自身或子树；note:/collection: 项不适用于事件闸；
+/// 为空表示不限（跟随全局授权）。与 F6 联动一致：
 /// 喂养输入范围 = 记忆库 = 对外披露范围。
-pub fn should_feed_agent(profile: &flowix_core::agent::AgentProfile, tags: &[String]) -> bool {
+/// （跨笔记本声明 notebook: 不会触发喂养——事件只扫描所在笔记本的
+/// profile，与 note: 跨笔记本引用的既有约束一致。）
+pub fn should_feed_agent(
+    profile: &flowix_core::agent::AgentProfile,
+    event_notebook_id: &str,
+    tags: &[String],
+) -> bool {
     if profile.memory.is_empty() {
+        return true;
+    }
+    if profile
+        .memory
+        .iter()
+        .filter_map(|reference| reference.strip_prefix("notebook:"))
+        .any(|nb| nb == event_notebook_id)
+    {
         return true;
     }
     profile
@@ -645,20 +660,29 @@ mod tests {
     fn per_agent_gate_follows_disclosure_scope() {
         let mut profile = test_profile("agt_x");
         // 空记忆库：跟随全局，任何标签都喂。
-        assert!(should_feed_agent(&profile, &["任意".into()]));
+        assert!(should_feed_agent(&profile, "nb", &["任意".into()]));
         // 声明 tag 记忆源：命中自身或子树才喂（D-4：memory 即披露范围）。
         profile.memory = vec!["tag:finance/财报".into()];
-        assert!(should_feed_agent(&profile, &["finance/财报".into()]));
-        assert!(should_feed_agent(&profile, &["finance/财报/q3".into()]));
-        assert!(!should_feed_agent(&profile, &["finance".into()]));
-        assert!(!should_feed_agent(&profile, &["industry/电商".into()]));
-        assert!(!should_feed_agent(&profile, &[]));
-        // 非 tag 记忆源（note/collection）不参与 tag 事件闸。
+        assert!(should_feed_agent(&profile, "nb", &["finance/财报".into()]));
+        assert!(should_feed_agent(&profile, "nb", &["finance/财报/q3".into()]));
+        assert!(!should_feed_agent(&profile, "nb", &["finance".into()]));
+        assert!(!should_feed_agent(&profile, "nb", &["industry/电商".into()]));
+        assert!(!should_feed_agent(&profile, "nb", &[]));
+        // 非 tag 记忆源（note/collection）不参与事件闸。
         profile.memory = vec!["note:work::a.md".into()];
-        assert!(!should_feed_agent(&profile, &["finance".into()]));
+        assert!(!should_feed_agent(&profile, "nb", &["finance".into()]));
         // 多记忆源任一 tag 命中。
         profile.memory = vec!["tag:a".into(), "tag:b/c".into()];
-        assert!(should_feed_agent(&profile, &["b/c/d".into()]));
+        assert!(should_feed_agent(&profile, "nb", &["b/c/d".into()]));
+        // notebook: 记忆源：事件笔记本 ID 精确匹配即喂，与标签无关。
+        profile.memory = vec!["notebook:nb".into()];
+        assert!(should_feed_agent(&profile, "nb", &[]));
+        assert!(should_feed_agent(&profile, "nb", &["任意".into()]));
+        assert!(!should_feed_agent(&profile, "nb2", &["任意".into()]));
+        // notebook: 与 tag: 混用时任一命中即喂。
+        profile.memory = vec!["notebook:other".into(), "tag:finance".into()];
+        assert!(should_feed_agent(&profile, "nb", &["finance".into()]));
+        assert!(!should_feed_agent(&profile, "nb", &["industry".into()]));
     }
 
     #[test]

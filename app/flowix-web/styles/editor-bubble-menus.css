@@ -518,6 +518,18 @@
   color: var(--primary);
 }
 
+/* AGENT-ASSET-ROADMAP P1-D：agent 行内快照时间（>7 天转警示色）。 */
+.mention-note-agent-time {
+  margin-left: 6px;
+  color: var(--muted-foreground);
+  font-size: 0.6875rem;
+  font-weight: 400;
+}
+
+.mention-note-dropdown .mention-note-agent-time--stale {
+  color: color-mix(in oklch, var(--destructive) 75%, var(--foreground));
+}
+
 /* Middle-column navigation submenus (tags / filter / sort / view) use the
  * shared mention label class, but their item text should remain regular. */
 .memo-navigation-submenu-item .mention-note-title {

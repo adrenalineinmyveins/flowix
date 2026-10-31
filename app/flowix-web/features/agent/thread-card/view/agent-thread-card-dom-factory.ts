@@ -2,6 +2,7 @@ import type { I18nKey } from "@/lib/i18n";
 import {
   createChevronIcon,
   createFullscreenIcon,
+  createSaveProfileIcon,
   createTrashIcon,
 } from "@features/agent/thread-card/agent-thread-card-icons";
 import { createAgentComposerDom } from "@features/agent/thread-card/composer";
@@ -15,6 +16,8 @@ export interface AgentThreadCardDomFactoryOptions {
   onDeleteClick: (event: MouseEvent) => void;
   onFullscreenClick: (event: MouseEvent) => void;
   onCollapseClick: (event: MouseEvent) => void;
+  /** AGENT-ASSET-ROADMAP P1-C：把会话沉淀为个人 Agent 身份卡。 */
+  onSaveProfileClick: (event: MouseEvent) => void;
   onBodyClick: (event: MouseEvent) => void;
   onBodyScroll: (event: Event) => void;
   onBodyWheel: (event: WheelEvent) => void;
@@ -37,6 +40,7 @@ export interface AgentThreadCardDomParts {
   runStatusEl: HTMLSpanElement;
   actionsDivider: HTMLSpanElement;
   deleteButton: HTMLButtonElement;
+  saveProfileButton: HTMLButtonElement;
   fullscreenButton: HTMLButtonElement;
   collapseButton: HTMLButtonElement;
   body: HTMLElement;
@@ -116,6 +120,19 @@ export function createAgentThreadCardDom(
   deleteButton.append(createTrashIcon());
   deleteButton.addEventListener("click", options.onDeleteClick);
 
+  // AGENT-ASSET-ROADMAP P1-C：会话 → 个人 Agent 身份卡（mobile 只读会话由 view 侧隐藏）。
+  const saveProfileButton = document.createElement("button");
+  saveProfileButton.type = "button";
+  saveProfileButton.className =
+    "agent-thread-card__icon-btn agent-thread-card__save-profile";
+  saveProfileButton.setAttribute(
+    "aria-label",
+    options.t("editor.threadCard.saveAsAgent"),
+  );
+  saveProfileButton.title = options.t("editor.threadCard.saveAsAgent");
+  saveProfileButton.append(createSaveProfileIcon());
+  saveProfileButton.addEventListener("click", options.onSaveProfileClick);
+
   const fullscreenButton = document.createElement("button");
   fullscreenButton.type = "button";
   fullscreenButton.className =
@@ -145,6 +162,7 @@ export function createAgentThreadCardDom(
 
   actions.append(
     metaEl,
+    saveProfileButton,
     deleteButton,
     actionsDivider,
     fullscreenButton,
@@ -264,6 +282,7 @@ export function createAgentThreadCardDom(
     runStatusEl,
     actionsDivider,
     deleteButton,
+    saveProfileButton,
     fullscreenButton,
     collapseButton,
     body,

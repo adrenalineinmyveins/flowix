@@ -405,6 +405,23 @@ mod tests {
         assert_eq!(read.expertise, vec!["finance/财报".to_string()]);
     }
 
+    /// TA3（AGENT-ASSET-ROADMAP P1-C）：重复保存会话产生独立身份卡，不覆盖。
+    /// agent_id 由 `generate_agent_id()` 随机生成，同名天然不冲突。
+    #[test]
+    fn repeated_creates_are_independent() {
+        let (_temp, root) = temp_root();
+        let cwd = root.to_string_lossy().into_owned();
+        let first =
+            agent_profile_create(cwd.clone(), "会话A".into(), String::new(), vec![], "codex".into())
+                .unwrap();
+        let second =
+            agent_profile_create(cwd.clone(), "会话A".into(), String::new(), vec![], "codex".into())
+                .unwrap();
+        assert_ne!(first.agent_id, second.agent_id);
+        let list = agent_profile_list(cwd).unwrap();
+        assert_eq!(list.len(), 2);
+    }
+
     #[test]
     fn list_returns_all_profiles() {
         let (_temp, root) = temp_root();

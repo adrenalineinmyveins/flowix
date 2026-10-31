@@ -26,6 +26,10 @@ const ICON_FOLDER_PATH =
 const ICON_LAPTOP_PATH =
   "M232,168h-8V72a24,24,0,0,0-24-24H56A24,24,0,0,0,32,72v96H24a8,8,0,0,0-8,8v16a24,24,0,0,0,24,24H216a24,24,0,0,0,24-24V176A8,8,0,0,0,232,168ZM48,72a8,8,0,0,1,8-8H200a8,8,0,0,1,8,8v96H48ZM224,192a8,8,0,0,1-8,8H40a8,8,0,0,1-8-8v-8H224ZM152,88a8,8,0,0,1-8,8H112a8,8,0,0,1,0-16h32A8,8,0,0,1,152,88Z";
 const ICON_PLUS_PATH = "M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z";
+// Lucide user-plus（stroke）：人形 + 右侧加号。
+const ICON_USER_PLUS_BODY_PATH = "M2 21a8 8 0 0 1 13.292-6";
+const ICON_USER_PLUS_HEAD_PATH = "M15 8a5 5 0 1 1-10 0 5 5 0 1 1 10 0";
+const ICON_USER_PLUS_PLUS_PATH = "M19 16v6M22 19h-6";
 const ICON_ALERT_PATH =
   "M12 9v4M12 17h.01M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z";
 const ICON_LOADER_PATH = "M21 12a9 9 0 1 1-6.219-8.56";
@@ -149,6 +153,14 @@ export function createPlusIcon(): SVGSVGElement {
     createSvg("0 0 24 24", "agent-thread-card__access-add-icon"),
     ICON_PLUS_PATH,
   );
+}
+
+/** 「保存为个人 Agent」按钮图标（AGENT-ASSET-ROADMAP P1-C）。 */
+export function createSaveProfileIcon(): SVGSVGElement {
+  const svg = createSvg("0 0 24 24", "agent-thread-card__save-profile-icon");
+  appendStrokePath(svg, ICON_USER_PLUS_BODY_PATH);
+  appendStrokePath(svg, ICON_USER_PLUS_HEAD_PATH);
+  return appendStrokePath(svg, ICON_USER_PLUS_PLUS_PATH);
 }
 
 export function createComposerAddIcon(): SVGSVGElement {

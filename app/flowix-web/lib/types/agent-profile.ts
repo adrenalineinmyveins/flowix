@@ -26,7 +26,7 @@ export interface AgentProfile {
   flowix_tools?: string[];
   flowix_skills?: string[];
   flowix_metadata?: Record<string, string>;
-  /** 记忆库即披露授权：tag:… / note:<nb>::<path> / collection:<id>。 */
+  /** 记忆库即披露授权：notebook:<nb>（整本）/ tag:… / note:<nb>::<path> / collection:<id>。 */
   flowix_memory?: string[];
   flowix_created_at: number;
   flowix_updated_at: number;

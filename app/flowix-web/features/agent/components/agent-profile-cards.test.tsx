@@ -14,6 +14,8 @@ const agentProfileMock = vi.hoisted(() => ({
 const marketMock = vi.hoisted(() => ({
   myCards: vi.fn(),
   unpublish: vi.fn(),
+  // P2-E：已订阅分组数据源（默认空列表）。
+  subscriptions: vi.fn().mockResolvedValue([]),
 }));
 
 vi.mock('@platform/tauri/client', async (importOriginal) => ({
@@ -85,10 +87,6 @@ function selects(): HTMLSelectElement[] {
   return [...host.querySelectorAll('select')];
 }
 
-function textInputs(): HTMLInputElement[] {
-  return [...host.querySelectorAll<HTMLInputElement>('input:not([type="checkbox"])')];
-}
-
 function setValue(
   element: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement,
   value: string,
@@ -142,7 +140,15 @@ beforeEach(() => {
   );
   agentProfileMock.delete.mockResolvedValue(undefined);
   marketMock.myCards.mockResolvedValue([]);
-  useNoteStore.setState({ agentProfileViewTarget: null, agentProfilesVersion: 0 });
+  useNoteStore.setState({
+    agentProfileViewTarget: null,
+    agentProfilesVersion: 0,
+    // 记忆库笔记本下拉数据源。
+    notebooks: [
+      { id: 'nb_loop', name: 'Loop', path: CWD, createdAt: 1, updatedAt: 1, isDefault: true },
+      { id: 'nb_life', name: 'Life', path: '/notes/life', createdAt: 1, updatedAt: 1, isDefault: false },
+    ],
+  });
   host = document.createElement('div');
   document.body.appendChild(host);
   root = createRoot(host);
@@ -234,16 +240,10 @@ describe('agent profile editor', () => {
       const toggle = host.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
       toggle.click();
     });
-    // selects: [0] agent 类型, [1] 披露等级。
+    // selects: [0] agent 类型, [1] 披露等级, [2] 记忆库笔记本选取。
     await act(async () => setValue(selects()[1], 'R2'));
-    // 记忆库（即披露授权）走 chips 编辑：手输框（inputs: [0] 名称, [1] 模型,
-    // [2] memory 手输）+ Enter 提交。
-    await act(async () => setValue(textInputs()[2], 'tag:finance/财报'));
-    await act(async () => {
-      textInputs()[2].dispatchEvent(
-        new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }),
-      );
-    });
+    // 记忆库（即披露授权）：从笔记本下拉选取整本笔记本（notebook:<id>）。
+    await act(async () => setValue(selects()[2], 'nb_loop'));
 
     await click('保存');
 
@@ -254,7 +254,7 @@ describe('agent profile editor', () => {
         displayName: '财报解读助手',
         consultable: false,
         redactionLevel: 'R2',
-        memory: ['tag:finance/财报'],
+        memory: ['notebook:nb_loop'],
         model: '',
       }),
     );

@@ -8,6 +8,8 @@ export interface MentionAgentItem {
   address: string;
   displayName: string;
   relayUrl: string;
+  /** 快照刷新时间（Unix 秒；P1-D 陈旧度展示）。 */
+  refreshedAt: number;
 }
 
 export type MentionItem = MentionNoteItem | MentionAgentItem;
@@ -25,6 +27,7 @@ async function fetchMentionAgents(): Promise<MentionAgentItem[]> {
     address: item.address,
     displayName: item.displayName,
     relayUrl: item.relayUrl,
+    refreshedAt: item.refreshedAt,
   }));
 }
 

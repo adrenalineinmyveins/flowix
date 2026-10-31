@@ -18,9 +18,10 @@ const MAX_METADATA_BYTES: usize = 4096;
 const MAX_TOOLS_SKILLS: usize = 32;
 const MAX_TOOL_SKILL_ITEM_CHARS: usize = 64;
 
-/// 记忆库引用三形态前缀（AGENT-PROFILE-REDESIGN D-4）。
+/// 记忆库引用形态前缀（AGENT-PROFILE-REDESIGN D-4；notebook: 整本笔记本）。
 pub const MEMORY_PREFIX_TAG: &str = "tag:";
 pub const MEMORY_PREFIX_NOTE: &str = "note:";
+pub const MEMORY_PREFIX_NOTEBOOK: &str = "notebook:";
 pub const MEMORY_PREFIX_COLLECTION: &str = "collection:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,7 +68,7 @@ pub enum ProfileError {
     SystemTooLong(usize),
     #[error("flowix_metadata 序列化超过 {0} 字节")]
     MetadataTooLarge(usize),
-    #[error("flowix_memory 第 {index} 项引用非法（须 tag:/note:/collection: 前缀）: {value}")]
+    #[error("flowix_memory 第 {index} 项引用非法（须 tag:/note:/notebook:/collection: 前缀）: {value}")]
     InvalidMemoryRef { index: usize, value: String },
     #[error("flowix_memory 第 {index} 项与其前项的 tag 子树重叠")]
     MemorySubtreeOverlap { index: usize },
@@ -111,7 +112,8 @@ pub struct AgentProfile {
     #[serde(rename = "flowix_metadata", default)]
     pub metadata: std::collections::BTreeMap<String, String>,
     /// D-4 统一字段：入站记忆绑定 = 出站披露授权。
-    /// 元素三形态：`tag:<tag-path>` / `note:<nb>::<path>` / `collection:<id>`。
+    /// 元素形态：`notebook:<nb>`（整本笔记本）/ `tag:<tag-path>` /
+    /// `note:<nb>::<path>` / `collection:<id>`。
     #[serde(rename = "flowix_memory", default)]
     pub memory: Vec<String>,
     #[serde(rename = "flowix_created_at", default)]
@@ -125,8 +127,8 @@ fn default_true() -> bool {
 }
 
 impl AgentProfile {
-    /// 校验字段合法性。expertise 逐项过 normalize_tag_path；memory 三形态
-    /// 逐项校验且 tag 子树不得重叠（D-4）；system/metadata/tools/skills 限额。
+    /// 校验字段合法性。expertise 逐项过 normalize_tag_path；memory 逐项
+    /// 校验形态且 tag 子树不得重叠（D-4）；system/metadata/tools/skills 限额。
     pub fn validate(&self) -> Result<(), ProfileError> {
         if self.display_name.trim().is_empty() {
             return Err(ProfileError::MissingDisplayName);
@@ -170,7 +172,8 @@ impl AgentProfile {
         Ok(())
     }
 
-    /// memory 校验：三形态前缀 + tag 项路径合法 + tag 子树互不包含。
+    /// memory 校验：前缀合法（notebook:/note:/collection: 须非空 body）+
+    /// tag 项路径合法 + tag 子树互不包含。
     fn validate_memory(&self) -> Result<(), ProfileError> {
         let mut tag_paths: Vec<String> = Vec::new();
         for (i, reference) in self.memory.iter().enumerate() {
@@ -190,6 +193,7 @@ impl AgentProfile {
                 }
                 tag_paths.push(tag.to_string());
             } else if reference.starts_with(MEMORY_PREFIX_NOTE)
+                || reference.starts_with(MEMORY_PREFIX_NOTEBOOK)
                 || reference.starts_with(MEMORY_PREFIX_COLLECTION)
             {
                 let body = reference.split_once(':').map(|(_, rest)| rest).unwrap_or("");
@@ -609,14 +613,30 @@ mod tests {
     }
 
     #[test]
-    fn accepts_memory_three_forms() {
+    fn accepts_memory_all_forms() {
         let mut profile = base_profile();
         profile.memory = vec![
+            "notebook:work".into(),
             "tag:finance/财报".into(),
             "note:work::Q3复盘.md".into(),
             "collection:docs".into(),
         ];
         assert!(profile.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_memory_notebook_without_id() {
+        let mut profile = base_profile();
+        profile.memory = vec!["notebook:".into()];
+        assert!(matches!(
+            profile.validate(),
+            Err(ProfileError::InvalidMemoryRef { index: 0, .. })
+        ));
+        profile.memory = vec!["notebook:  ".into()];
+        assert!(matches!(
+            profile.validate(),
+            Err(ProfileError::InvalidMemoryRef { index: 0, .. })
+        ));
     }
 
     #[test]

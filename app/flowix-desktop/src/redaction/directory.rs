@@ -228,6 +228,7 @@ pub fn settle_draft(
 async fn http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .no_proxy() // 自建中继直连（同 relay-client account.rs 实机诊断结论）
         .build()
         .map_err(|e| format!("CARD_CLIENT_INIT_FAILED: {e}"))
 }

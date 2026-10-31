@@ -1,17 +1,18 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Bot, Fingerprint, Inbox, Loader2, Plus, Save, Store, Trash2, X } from 'lucide-react';
+import { BookmarkCheck, Bot, Fingerprint, Inbox, Loader2, Plus, Save, Store, Trash2, X } from 'lucide-react';
 
-import { agentProfile, market, redaction, tags as tagsClient } from '@platform/tauri/client';
-import type { MarketMyCard } from '@platform/tauri/client';
+import { agentProfile, market, redaction } from '@platform/tauri/client';
+import type { MarketMyCard, SubscribedCard } from '@platform/tauri/client';
 import type { RelayAccountInfo } from '@/lib/types/redaction';
+import { toast } from '@/lib/toast';
 import { PublishCardDialog } from '@features/agent/components/publish-card-dialog';
 import { AgentMarket } from '@features/agent/components/agent-market';
 import type { AgentProfile, AgentState } from '@/lib/types/agent-profile';
 import { PROFILE_REDACTION_LEVELS } from '@/lib/types/agent-profile';
 import { AGENT_TYPES } from '@/lib/agent-types';
-import { useNoteStore } from '@features/memo/store/note-store';
+import { useNoteStore, type Notebook } from '@features/memo/store/note-store';
 import { AgentProfileInbox } from '@features/agent/components/agent-profile-inbox';
 import { MEMO_LIST_VIEW_HEADER_INSET_CLASS } from '@features/memo/components/memo-list-view-tabs';
 import { WorkColumnTitlebarShell } from '@features/shell/components/work-column-titlebar-shell';
@@ -161,20 +162,20 @@ function ChipsEditor({ items, onChange, placeholder }: { items: string[]; onChan
 
 /**
  * 记忆库编辑器（AGENT-PROFILE-REDESIGN P3 迭代）：
- * tag 项从笔记本标签下拉选取（`tag:<path>`）；note:/collection: 与清单外
- * tag 走手输。已选项 chips 可删。UI 全权——扩缩均放行（UI 即人审）。
+ * 整本笔记本从下拉选取（`notebook:<id>`）；note:/collection: 走手输。
+ * 已选项 chips 可删。UI 全权——扩缩均放行（UI 即人审）。
  */
 function MemoryEditor({
   items,
   onChange,
-  notebookTags,
+  notebooks,
   pickLabel,
   manualPlaceholder,
   emptyLabel,
 }: {
   items: string[];
   onChange: (items: string[]) => void;
-  notebookTags: { id: string; name: string }[];
+  notebooks: Notebook[];
   pickLabel: string;
   manualPlaceholder?: string;
   emptyLabel?: string;
@@ -185,8 +186,8 @@ function MemoryEditor({
     onChange(appendItem(items, draft));
     setDraft('');
   };
-  const selectedTagPaths = new Set(items.filter((item) => item.startsWith('tag:')).map((item) => item.slice('tag:'.length)));
-  const addableTags = notebookTags.filter((tag) => !selectedTagPaths.has(tag.name));
+  const selectedNotebookIds = new Set(items.filter((item) => item.startsWith('notebook:')).map((item) => item.slice('notebook:'.length)));
+  const addableNotebooks = notebooks.filter((notebook) => !selectedNotebookIds.has(notebook.id));
   return (
     <div className="space-y-2">
       <ChipRow items={items} onRemove={(item) => onChange(items.filter((value) => value !== item))} />
@@ -195,15 +196,15 @@ function MemoryEditor({
           className={cn(inputClass, 'py-0')}
           value=""
           onChange={(event) => {
-            const name = event.target.value;
-            if (name) onChange(appendItem(items, `tag:${name}`));
+            const id = event.target.value;
+            if (id) onChange(appendItem(items, `notebook:${id}`));
           }}
-          disabled={addableTags.length === 0}
+          disabled={addableNotebooks.length === 0}
         >
-          <option value="">{addableTags.length === 0 ? (emptyLabel ?? pickLabel) : pickLabel}</option>
-          {addableTags.map((tag) => (
-            <option key={tag.id} value={tag.name}>
-              {tag.name}
+          <option value="">{addableNotebooks.length === 0 ? (emptyLabel ?? pickLabel) : pickLabel}</option>
+          {addableNotebooks.map((notebook) => (
+            <option key={notebook.id} value={notebook.id}>
+              {notebook.name}
             </option>
           ))}
         </select>
@@ -279,6 +280,8 @@ export function AgentProfileListPanel({ notebookPath }: { notebookPath: string }
   const [profiles, setProfiles] = useState<AgentProfile[] | null>(null);
   /** AGENT-MARKET M1：发布态徽章数据（agentId → 状态）。 */
   const [myCards, setMyCards] = useState<Record<string, MarketMyCard>>({});
+  /** AGENT-ASSET-ROADMAP P2-E：已订阅分组（只读，与市场页订阅区同源）。 */
+  const [subscriptions, setSubscriptions] = useState<SubscribedCard[]>([]);
   const [loading, setLoading] = useState(true);
   const target = useNoteStore((state) => state.agentProfileViewTarget);
   const version = useNoteStore((state) => state.agentProfilesVersion);
@@ -287,13 +290,15 @@ export function AgentProfileListPanel({ notebookPath }: { notebookPath: string }
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [list, cards] = await Promise.all([
+      const [list, cards, subs] = await Promise.all([
         agentProfile.list(notebookPath),
         market.myCards(notebookPath).catch(() => [] as MarketMyCard[]),
+        market.subscriptions().catch(() => [] as SubscribedCard[]),
       ]);
       if (disposedRef.current) return;
       setProfiles(list);
       setMyCards(Object.fromEntries(cards.map((card) => [card.agentId, card])));
+      setSubscriptions(subs);
     } catch {
       if (!disposedRef.current) setProfiles([]);
     } finally {
@@ -368,6 +373,45 @@ export function AgentProfileListPanel({ notebookPath }: { notebookPath: string }
                   {t('agent.market.entry')}
                 </span>
               </button>
+              {/* AGENT-ASSET-ROADMAP P2-E：已订阅分组（只读卡片，点击复制完整地址）。 */}
+              {subscriptions.length > 0 && (
+                <div className="pt-2">
+                  <p className="px-2.5 pb-1 text-[10px] font-semibold tracking-wide text-[var(--muted-foreground)]">
+                    {t('agent.market.mySubscriptions')}
+                  </p>
+                  {subscriptions.map((item) => {
+                    const fullAddress = item.relayUrl
+                      ? `${item.address}@${item.relayUrl}`
+                      : item.address;
+                    return (
+                      <button
+                        key={item.address}
+                        type="button"
+                        title={fullAddress}
+                        onClick={() => {
+                          void navigator.clipboard
+                            .writeText(fullAddress)
+                            .then(() => toast.success(t('agent.relay.copied')))
+                            .catch(() => undefined);
+                        }}
+                        className="flex w-full items-center gap-1.5 rounded-lg px-2.5 py-2 text-left outline-none transition-colors hover:bg-[color-mix(in_oklch,var(--muted)_50%,transparent)]"
+                      >
+                        <BookmarkCheck className="h-3.5 w-3.5 shrink-0 text-[var(--muted-foreground)]" />
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-sm text-[var(--muted-foreground)]">
+                            @{item.displayName}
+                          </span>
+                          {item.specialtyTags.length > 0 && (
+                            <span className="block truncate text-[11px] text-[var(--muted-foreground)]">
+                              {item.specialtyTags.join(' / ')}
+                            </span>
+                          )}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
               {profiles?.map((profile) => {
                 const active = profile.flowix_agent_id === activeAgentId;
                 return (
@@ -553,27 +597,8 @@ export function AgentProfileEditor({ notebookPath }: { notebookPath: string }) {
     }
   }, [agentId, unpublishing, notebookPath, reloadMyCard, bumpProfiles]);
 
-  // 记忆库下拉数据源：当前笔记本标签（path → id 匹配，取不到则为空）。
+  // 记忆库下拉数据源：全部已注册笔记本（整本作为记忆源）。
   const notebooks = useNoteStore((state) => state.notebooks);
-  const [notebookTags, setNotebookTags] = useState<{ id: string; name: string }[]>([]);
-  useEffect(() => {
-    let cancelled = false;
-    const notebookId = notebooks.find((notebook) => notebook.path === notebookPath)?.id;
-    if (!notebookId) {
-      setNotebookTags([]);
-      return undefined;
-    }
-    void tagsClient.getAll(notebookId)
-      .then((result) => {
-        if (!cancelled) setNotebookTags(result.tags);
-      })
-      .catch(() => {
-        if (!cancelled) setNotebookTags([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [notebooks, notebookPath]);
 
   // 加载选中身份卡（含本地运行状态）。
   useEffect(() => {
@@ -887,10 +912,10 @@ export function AgentProfileEditor({ notebookPath }: { notebookPath: string }) {
                   <MemoryEditor
                     items={form.memory}
                     onChange={(memory) => patchForm({ memory })}
-                    notebookTags={notebookTags}
-                    pickLabel={t('agent.profile.memoryPickTag')}
+                    notebooks={notebooks}
+                    pickLabel={t('agent.profile.memoryPickNotebook')}
                     manualPlaceholder={t('agent.profile.memoryManualPlaceholder')}
-                    emptyLabel={t('agent.profile.memoryNoTags')}
+                    emptyLabel={t('agent.profile.memoryNoNotebooks')}
                   />
                 </Field>
                 <p className="text-xs leading-5 text-[var(--muted-foreground)]">

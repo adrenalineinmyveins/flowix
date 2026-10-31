@@ -10,18 +10,27 @@ export interface ThreadListItem {
   updatedAt: number;
 }
 
-// Core message type used throughout the app
-export type AgentTypeKey =
-  | "codex"
-  | "claude"
-  | "gemini"
-  | "hermes"
-  | "openclaw"
-  | "opencode"
-  | "pi"
-  | "deepseek-harness"
+/**
+ * 全部对话 agent 类型 key。与 Rust 侧 `ExternalRuntimeKind`
+ * （app/flowix-desktop/src/agent_external/runtime_registry.rs）对齐；
+ * `gemini` / `openclaw` 为前端预告位（releaseStatus: coming-soon），Rust 侧尚无 runtime。
+ * 集合一致性由 types/agent.test.ts 守护。
+ */
+export const AGENT_TYPE_KEYS = [
+  "codex",
+  "claude",
+  "gemini",
+  "hermes",
+  "openclaw",
+  "opencode",
+  "pi",
+  "deepseek-harness",
   // 云同步下来的移动端会话（只读展示，无本地 runtime）
-  | "mobile";
+  "mobile",
+] as const;
+
+// Core message type used throughout the app
+export type AgentTypeKey = (typeof AGENT_TYPE_KEYS)[number];
 
 export interface AgentType {
   key: AgentTypeKey;

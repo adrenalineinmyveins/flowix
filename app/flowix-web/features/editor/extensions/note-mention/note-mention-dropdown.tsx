@@ -8,6 +8,7 @@ import {
   type MentionItem,
 } from '@features/editor/extensions/agent-reference/agent-mention-data';
 import { agentFullAddress } from '@features/editor/extensions/agent-reference/agent-reference';
+import { formatTimeAgo } from '@/lib/format-time-ago';
 import { useI18n } from '@/lib/i18n';
 
 export interface NoteMentionDropdownProps {
@@ -105,6 +106,17 @@ export function NoteMentionDropdown({
                   {isMentionAgent(item) ? (
                     <span className="mention-note-title mention-note-title--agent">
                       @{item.displayName}
+                      {item.refreshedAt > 0 && (
+                        <span
+                          className={
+                            Date.now() / 1000 - item.refreshedAt > 7 * 24 * 3600
+                              ? 'mention-note-agent-time mention-note-agent-time--stale'
+                              : 'mention-note-agent-time'
+                          }
+                        >
+                          {formatTimeAgo(item.refreshedAt * 1000, t, { compact: true })}
+                        </span>
+                      )}
                     </span>
                   ) : (
                     <span className="mention-note-title">{item.title}</span>
