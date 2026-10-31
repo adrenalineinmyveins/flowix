@@ -12,7 +12,7 @@
     },
     "patch": {
       "type": "object",
-      "description": "Partial update. Writable fields: displayName, bio, system, tools, skills, metadata (object of string→string), model, memory. memory is the agent's long-term memory binding and disclosure scope (tag:… / note:<nb>::<path> / collection:<id>); shrinking is allowed here, adding sources must be done in the app's Agent page.",
+      "description": "Partial update. Writable fields: displayName, bio, system, tools, skills, metadata (object of string→string), model, memory. memory is the agent's long-term memory binding and disclosure scope (notebook:<nb> for a whole notebook / tag:… / note:<nb>::<path> / collection:<id>); shrinking is allowed here, adding sources must be done in the app's Agent page.",
       "additionalProperties": false
     }
   },

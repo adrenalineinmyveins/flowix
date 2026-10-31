@@ -68,6 +68,10 @@ flate2 = { workspace = true }
 tar = { workspace = true }
 semver = { workspace = true }
 minisign-verify = { workspace = true }
+# F4 咨询编排兜底：直接解压 DSH 会话日志（session.v4.jsonl.zstd）提取
+# 子代理最终回答——JSON-RPC 查询通道（usage/history）对 continuable
+# 子代理会挂起（2026-10-31 实机）。纯 Rust 解码器，无 C 依赖。
+ruzstd = "0.7"
 
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }

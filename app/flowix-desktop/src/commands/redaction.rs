@@ -662,6 +662,32 @@ fn scope_entry_ids_for_hints(app: &tauri::AppHandle, hints: &[String]) -> Vec<St
 }
 
 /// auto_send 共用核心（Tauri 命令与 M2 consult_remote 桥接共用）：
+/// consult 的发起笔记本解析：bridge cwd 来自 MCP 子进程 `current_dir()`
+/// （appserver 进程目录而非会话笔记本根——flowix-cli mcp.rs 的 M2 实机
+/// 结论，memo/agent_profile 工具已因此改走全局配置），注册表匹配不上时
+/// 回退当前选中笔记本，避免蒸馏入口报 `notebook is not registered`。
+pub(crate) fn consult_cwd_or_selected(app_handle: &tauri::AppHandle, cwd: &str) -> String {
+    use tauri::Manager;
+    let state = app_handle.state::<crate::app::state::AppState>();
+    let memo_file = crate::lock_utils::read_lock(&state.memo_file, "memo_file");
+    let configs = memo_file.read_notebook_configs().unwrap_or_default();
+    if let Ok(canonical) = dunce::canonicalize(cwd) {
+        let registered = configs.iter().any(|config| {
+            dunce::canonicalize(&config.path)
+                .map(|path| path == canonical)
+                .unwrap_or(false)
+        });
+        if registered {
+            return cwd.to_string();
+        }
+    }
+    memo_file
+        .current_notebook_id_value()
+        .as_deref()
+        .and_then(|id| memo_file.get_notebook_config_by_id(id).map(|c| c.path))
+        .unwrap_or_else(|| cwd.to_string())
+}
+
 /// 判定 → 取材交集 → 直通/蒸馏 preview → 快照入档 → 自动过门 → send。
 pub(crate) async fn consult_auto_send_core(
     app_handle: &tauri::AppHandle,
@@ -675,7 +701,18 @@ pub(crate) async fn consult_auto_send_core(
     if question.trim().is_empty() {
         return Err("QUESTION_REQUIRED".to_string());
     }
-    let root = notebook_root(cwd)?;
+    // 目标地址规范化：`user/slug@relay` 取 @ 前段。中继路由由
+    // config.relay_url 决定，@ 后缀不进信封——relay 按 `user/slug`
+    // 裸 id 查 agent_owner，带后缀会 RECIPIENT_UNKNOWN 404（2026-10-31
+    // 实机：bridge 短地址补全后投递 404，此前 A 端不投递故未暴露）。
+    let target_agent_id = target_agent_id
+        .split('@')
+        .next()
+        .unwrap_or(target_agent_id)
+        .to_string();
+    let target_agent_id = target_agent_id.as_str();
+    let cwd = consult_cwd_or_selected(app_handle, cwd);
+    let root = notebook_root(&cwd)?;
     let config = crate::redaction::auto_grant::load_config();
     let usage = crate::redaction::auto_grant::AutoGrantUsage::current();
     let target_user = target_agent_id.split('/').next().unwrap_or_default().to_string();
@@ -718,7 +755,7 @@ pub(crate) async fn consult_auto_send_core(
     ));
     let report = crate::redaction::preview_full_mode(
         app_handle,
-        cwd,
+        &cwd,
         question,
         &scope_entry_ids, // M2 取材交集：scopeHint 命中的 access entries。
         target_level,
@@ -747,13 +784,21 @@ pub(crate) async fn consult_auto_send_core(
 
     // 自动过门：与人工确认同一出口（盲转加密 + 签名 + settle confirmed）。
     crate::redaction::submit_confirmation(&root, &report.receipt_id, true)?;
-    let payload = redaction_send(cwd.to_string(), report.receipt_id.clone())?;
+    // F5 传输：后台路径没有前端 redaction_transmit，出门即直投中继
+    // （deviceToken 认证档配额；失败留档保持 confirmed，可重试）。
+    let delivered = crate::redaction::deliver_confirmed_envelope_with_token(
+        &root,
+        &report.receipt_id,
+        &redaction_config.relay_url,
+        redaction_config.device_token.as_deref(),
+    )
+    .await?;
     crate::redaction::auto_grant::AutoGrantUsage::record(session_id);
     Ok(AutoSendResult {
         receipt_id: report.receipt_id,
         status: "sent".to_string(),
         distill_mode: report.distill_mode,
-        byte_length: payload.byte_length,
+        byte_length: delivered.byte_length,
     })
 }
 
@@ -874,6 +919,7 @@ async fn subscribe_once(
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(600))
+        .no_proxy() // 自建中继直连（同 relay-client account.rs 实机诊断结论）
         .build()
         .map_err(|e| format!("PUSH_CLIENT_INIT_FAILED: {e}"))?;
     let url = crate::redaction::inbound::relay_endpoint(relay_url, "/v2/events");
@@ -911,7 +957,7 @@ async fn subscribe_once(
                     // 前端 emit 保留（收件箱面板自动刷新照旧）。
                     let app = app.clone();
                     tauri::async_runtime::spawn(async move {
-                        poll_and_inject(&app).await;
+                        poll_and_inject(&app, PollSource::SseEvent).await;
                     });
                 }
             }
@@ -942,12 +988,96 @@ pub fn redaction_push_stop() -> Result<(), String> {
 // FD-12 M3：回程拉取与注入（应用级，不依赖收件箱面板）
 // ----------------------------------------------------------------------
 
+/// 取件节流 + 429 退避闸（2026-10-31 实机教训：poll_and_inject 被 SSE 事件
+/// 与等待循环多源触发、无节流无退避，把自建中继限流打满——取件永久 429，
+/// 回程躺在信箱取不回，等待窗口必然超时）。
+///
+/// 源感知节流：SSE 事件（真实投递信号，低频）走 5s 小闸保取件延迟；
+/// 兜底轮询（等待循环/断线补拉）走 30s 大闸省配额——中继 poll 配额
+/// 600/h（FLOWIX_RELAY_QUOTA_POLL 可调），2 agent × 30s = 240/h 富余。
+const POLL_EVENT_MIN_GAP_SECS: u64 = 5;
+const POLL_FALLBACK_MIN_GAP_SECS: u64 = 30;
+const POLL_BACKOFF_CAP_SECS: u64 = 60;
+
+/// 触发源：SSE 入队事件（主通道，要求低延迟）vs 周期/等待兜底（省配额）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollSource {
+    SseEvent,
+    Fallback,
+}
+
+impl PollSource {
+    fn min_gap(self) -> std::time::Duration {
+        std::time::Duration::from_secs(match self {
+            Self::SseEvent => POLL_EVENT_MIN_GAP_SECS,
+            Self::Fallback => POLL_FALLBACK_MIN_GAP_SECS,
+        })
+    }
+}
+
+struct PollGate {
+    last_poll_at: Option<std::time::Instant>,
+    next_allowed: std::time::Instant,
+    backoff_secs: u64,
+}
+
+fn poll_gate() -> &'static std::sync::Mutex<PollGate> {
+    static GATE: std::sync::OnceLock<std::sync::Mutex<PollGate>> =
+        std::sync::OnceLock::new();
+    GATE.get_or_init(|| {
+        std::sync::Mutex::new(PollGate {
+            last_poll_at: None,
+            next_allowed: std::time::Instant::now(),
+            backoff_secs: POLL_EVENT_MIN_GAP_SECS,
+        })
+    })
+}
+
+/// 一轮 poll 的闸后处理：见 429 → 指数退避翻倍（封顶）并把 next_allowed
+/// 推远；全成功 → 重置退避基数（next_allowed 交还源感知节流管）。
+/// 纯函数（可测）。
+fn apply_poll_outcome(gate: &mut PollGate, saw_rejected_429: bool) {
+    let now = std::time::Instant::now();
+    if saw_rejected_429 {
+        gate.backoff_secs = (gate.backoff_secs * 2).min(POLL_BACKOFF_CAP_SECS);
+        gate.next_allowed = now + std::time::Duration::from_secs(gate.backoff_secs);
+    } else {
+        gate.backoff_secs = POLL_EVENT_MIN_GAP_SECS;
+        gate.next_allowed = now;
+    }
+}
+
+/// 是否放行本轮 poll（源感知间隔 + 429 退避）。放行即占位 last_poll_at。
+fn poll_gate_admit(gate: &mut PollGate, source: PollSource) -> bool {
+    let now = std::time::Instant::now();
+    if now < gate.next_allowed {
+        return false;
+    }
+    if let Some(last) = gate.last_poll_at {
+        if now.duration_since(last) < source.min_gap() {
+            return false;
+        }
+    }
+    gate.last_poll_at = Some(now);
+    true
+}
+
 /// SSE 事件到达后的应用级拉取：对所有 pending 关联的笔记本逐 agent poll
 /// （幂等，重复信封按 receiptId 去重），新落档的 reply 命中关联即注入。
-async fn poll_and_inject(app: &tauri::AppHandle) {
-    let cwds = crate::redaction::consult_registry::pending_cwds();
+/// 全局源感知节流 + 429 指数退避。
+async fn poll_and_inject(app: &tauri::AppHandle, source: PollSource) {
+    if !poll_gate_admit(
+        &mut poll_gate().lock().unwrap_or_else(|e| e.into_inner()),
+        source,
+    ) {
+        return;
+    }
+    let mut cwds = crate::redaction::consult_registry::pending_cwds();
     if cwds.is_empty() {
-        return; // 无待回程关联：收件箱面板自身的 poll 语义已覆盖。
+        // M5 修复：无 pending 回程关联时 SSE 事件仍需取件——入站咨询
+        // （auto-answer 被咨询方）没有关联 link，回退当前选中笔记本接收；
+        // 否则咨询无限滞留信箱（probe6 实机：躺 75s+ 零轮询）。
+        cwds.push(consult_cwd_or_selected(app, ""));
     }
     let Ok(config) = load_config() else {
         return;
@@ -956,6 +1086,7 @@ async fn poll_and_inject(app: &tauri::AppHandle) {
         return;
     };
     let relay_url = config.relay_url.clone();
+    let mut saw_rejected_429 = false;
     for cwd in cwds {
         let Ok(root) = notebook_root(&cwd) else {
             continue;
@@ -966,22 +1097,41 @@ async fn poll_and_inject(app: &tauri::AppHandle) {
             )
             .await
             {
-                Ok(summary) => {
-                    for receipt_id in &summary.stored_receipt_ids {
+                Ok(round) => {
+                    // M5 诊断：落档路径与每轮摘要（定位"拉走无落档"）。
+                    if round.stored > 0 || round.duplicates > 0 || round.rejected > 0 {
+                        tracing::info!(
+                            agent,
+                            root = %root.display(),
+                            stored = round.stored,
+                            duplicates = round.duplicates,
+                            rejected = round.rejected,
+                            receipts = ?round.stored_receipt_ids,
+                            "inbox poll round"
+                        );
+                    }
+                    for receipt_id in &round.stored_receipt_ids {
                         inject_if_reply(app, &root, receipt_id).await;
                         auto_answer_if_consultation(app, &root, receipt_id).await;
                     }
                 }
                 Err(error) => {
+                    if error.contains("INBOX_FETCH_REJECTED:429") {
+                        saw_rejected_429 = true;
+                    }
                     tracing::warn!(agent, "consult reply poll failed: {error}");
                 }
             }
         }
     }
+    let mut gate = poll_gate().lock().unwrap_or_else(|e| e.into_inner());
+    apply_poll_outcome(&mut gate, saw_rejected_429);
 }
 
 /// 新落档信封若是回程（kind=reply）且 `in_reply_to` 命中未终结关联 →
 /// 注入发起会话并 settle（成败均置位，防重复注入；失败留痕收件箱兜底）。
+/// `awaited` 关联（发起方在桥上同步等待）：跳过会话注入——答案经工具
+/// 结果通道回到发起 turn，注入会造成双重呈现；仍 settle。
 async fn inject_if_reply(app: &tauri::AppHandle, root: &std::path::Path, receipt_id: &str) {
     let dir = crate::redaction::inbound::inbound_dir(root);
     let Some(record) = crate::redaction::inbound::read_inbound(&dir, receipt_id) else {
@@ -996,6 +1146,14 @@ async fn inject_if_reply(app: &tauri::AppHandle, root: &std::path::Path, receipt
     let Some(link) = crate::redaction::consult_registry::find_open_by_reply(in_reply_to) else {
         return;
     };
+    if link.awaited {
+        tracing::info!(
+            receipt_id = %link.receipt_id,
+            "consult reply skips injection: originator is waiting on the bridge"
+        );
+        crate::redaction::consult_registry::settle(&link.receipt_id);
+        return;
+    }
     let thread = link.thread_id.clone().unwrap_or_default();
     if !inject_reply_into_session(app, &link, &record).await {
         tracing::warn!(
@@ -1005,6 +1163,55 @@ async fn inject_if_reply(app: &tauri::AppHandle, root: &std::path::Path, receipt
         );
     }
     crate::redaction::consult_registry::settle(&link.receipt_id);
+}
+
+/// FD-12 M5：桥同步等待回程。拉模式——SSE 事件驱动 poll_and_inject 落档
+/// 并 settle 关联，本循环只观测 settled 翻转（每 2s 一次；每 2 tick 兜底
+/// poll 一次，防 SSE 断线窗口）。回程到达 → 从 inbound 读出答案记录；
+/// 超时 → 置回非等待语义（此后到达的回程照常注入）并返回 None。
+pub(crate) async fn wait_for_consult_reply(
+    app: &tauri::AppHandle,
+    receipt_id: &str,
+    wait_secs: u64,
+) -> Option<crate::redaction::inbound::InboundRecord> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+    let mut tick: u32 = 0;
+    loop {
+        // 每 2 tick（4s）触发一次兜底 poll（闸内按 30s 源间隔放行）：
+        // SSE 订阅是主通道，这里只补断线窗口。
+        if tick % 2 == 0 {
+            poll_and_inject(app, PollSource::Fallback).await;
+        }
+        if let Some(link) = crate::redaction::consult_registry::find_by_reply(receipt_id) {
+            if link.settled {
+                let root = notebook_root(&link.cwd).ok()?;
+                return find_reply_record(&root, receipt_id);
+            }
+        } else {
+            // 关联不存在（异常：注册失败或被清理）——按超时语义回退。
+            return None;
+        }
+        if std::time::Instant::now() >= deadline {
+            crate::redaction::consult_registry::set_awaited(receipt_id, false);
+            return None;
+        }
+        tick += 1;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+/// 在笔记本 inbound 目录里找 `in_reply_to == receipt` 的回程记录（纯函数，
+/// 可测）。settled 但找不到记录 = 落档异常，调用方按超时语义回退。
+fn find_reply_record(
+    root: &std::path::Path,
+    receipt_id: &str,
+) -> Option<crate::redaction::inbound::InboundRecord> {
+    let dir = crate::redaction::inbound::inbound_dir(root);
+    crate::redaction::inbound::list_inbound(&dir)
+        .into_iter()
+        .find(|record| {
+            record.payload_kind == "reply" && record.in_reply_to.as_deref() == Some(receipt_id)
+        })
 }
 
 // ----------------------------------------------------------------------
@@ -1078,7 +1285,10 @@ async fn run_auto_answer(
         crate::consult::ConsultRequest {
             from_agent_id: from_agent.clone(),
             to_agent_id: record.to_agent_id.clone(),
-            token_budget: None,
+            // DSH 编排每 step 全上下文重发（AGENTS.md/skills 注入大），
+            // 表观 token 用量数十 k 起步——默认 50k 会在答案产出前熔断
+            // （2026-10-31 实机：probe7 已出答案仍 budget_exceeded）。
+            token_budget: Some(500_000),
         },
         record.payload_text.clone(),
     )?;
@@ -1114,8 +1324,13 @@ async fn run_auto_answer(
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     };
 
-    // reply 出门：R3 完整蒸馏（回答含取材复述风险，最严档），
-    // 跳数继承减一；快照审计 + 自动过门 + send 与 M1 链同出口。
+    // reply 出门：形态按 §3.3 判定——reply 无取材恒 ZeroMaterial（载荷 =
+    // 回答围栏，L1 规则 + L3 复扫恒走，L2 蒸馏跳过）。此前硬编码
+    // FullDistill + 空 scope 会在 assemble_l0_payload 首检 ScopeEmpty，
+    // 答案已提取也送不出去（2026-10-31 实机：probe14）。跳数继承减一；
+    // 快照审计 + 自动过门 + send 与 M1 链同出口。
+    let grant_config = crate::redaction::auto_grant::load_config();
+    let distill_mode = crate::redaction::auto_grant::distill_mode(&grant_config, &[], false);
     let parties = Some((
         crate::redaction::outbox::AgentParty {
             agent_id: record.to_agent_id.clone(),
@@ -1136,7 +1351,7 @@ async fn run_auto_answer(
         parties,
         Some((record.receipt_id.clone(), hops)),
         false,
-        crate::redaction::auto_grant::DistillMode::FullDistill,
+        distill_mode,
     )
     .await
     .map_err(|error| error.to_ipc_error())?;
@@ -1145,7 +1360,7 @@ async fn run_auto_answer(
             auto_pass: true,
             reason: "auto_answer".into(),
         },
-        distill_mode: crate::redaction::auto_grant::DistillMode::FullDistill,
+        distill_mode,
         target_level: "r3".into(),
         scopes: Vec::new(),
         session_used: 0,
@@ -1157,7 +1372,16 @@ async fn run_auto_answer(
         let _ = crate::redaction::outbox::write_record(root, &out);
     }
     crate::redaction::submit_confirmation(root, &report.receipt_id, true)?;
-    redaction_send(root.to_string_lossy().into_owned(), report.receipt_id.clone())?;
+    // F5 传输：后台自动回答无前端 redaction_transmit，出门即直投中继
+    // （deviceToken 认证档；失败留档保持 confirmed，可重试）。
+    let send_config = load_config()?;
+    crate::redaction::deliver_confirmed_envelope_with_token(
+        root,
+        &report.receipt_id,
+        &send_config.relay_url,
+        send_config.device_token.as_deref(),
+    )
+    .await?;
     crate::redaction::auto_grant::AutoGrantUsage::record(&format!("auto-answer-{}", record.receipt_id));
     tracing::info!(
         outbound = %report.receipt_id,
@@ -1243,6 +1467,7 @@ mod tests {
             target_agent_id: "alice/researcher@https://relay".into(),
             at: 0,
             settled: false,
+            awaited: false,
         };
         let mut record = crate::redaction::inbound::InboundRecord {
             receipt_id: "rct_2".into(),
@@ -1272,6 +1497,96 @@ mod tests {
         // 缺签名结论时回落 unverified。
         record.signature_status = None;
         assert!(consult_reply_injection_text(&link, &record).contains("unverified"));
+    }
+
+    /// M5：find_reply_record 只命中 `in_reply_to` 匹配的 reply 记录；
+    /// consultation 与不匹配的 receipt 均不命中。
+    #[test]
+    fn find_reply_record_matches_reply_kind_and_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbound = crate::redaction::inbound::inbound_dir(dir.path());
+        let write_record = |receipt: &str, kind: &str, in_reply: Option<&str>| {
+            let record = crate::redaction::inbound::InboundRecord {
+                receipt_id: receipt.into(),
+                queue_id: "q-1".into(),
+                from_agent_id: "alice/researcher@https://relay".into(),
+                from_display_name: String::new(),
+                to_agent_id: "bob/expert".into(),
+                payload_kind: kind.into(),
+                payload_text: "远端答案".into(),
+                reject_code: None,
+                in_reply_to: in_reply.map(str::to_string),
+                disclosure: serde_json::from_str(
+                    r#"{"redactionLevel":"R3","maxHops":2,"hopsRemaining":1,"expiresAt":0}"#,
+                )
+                .unwrap(),
+                received_at: 0,
+                status: crate::redaction::inbound::InboundStatus::Pending,
+                signature_status: None,
+                encrypted: false,
+            };
+            let path = inbound.join(format!("{receipt}.json"));
+            std::fs::create_dir_all(&inbound).unwrap();
+            std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+        };
+        write_record("rct_reply1", "reply", Some("rct_origin"));
+        write_record("rct_in1", "consultation", None);
+        let found = find_reply_record(dir.path(), "rct_origin").expect("reply record found");
+        assert_eq!(found.receipt_id, "rct_reply1");
+        assert_eq!(found.payload_text, "远端答案");
+        assert!(find_reply_record(dir.path(), "rct_missing").is_none());
+    }
+
+    /// M5 修复：429 指数退避翻倍封顶，成功后重置最小间隔。
+    #[test]
+    fn poll_gate_backoff_doubles_and_resets() {
+        let mut gate = PollGate {
+            last_poll_at: None,
+            next_allowed: std::time::Instant::now(),
+            backoff_secs: POLL_EVENT_MIN_GAP_SECS,
+        };
+        apply_poll_outcome(&mut gate, true);
+        assert_eq!(gate.backoff_secs, 10);
+        apply_poll_outcome(&mut gate, true);
+        assert_eq!(gate.backoff_secs, 20);
+        apply_poll_outcome(&mut gate, true);
+        assert_eq!(gate.backoff_secs, 40);
+        apply_poll_outcome(&mut gate, false);
+        assert_eq!(gate.backoff_secs, POLL_EVENT_MIN_GAP_SECS);
+        // 封顶：从大值连续 429 不超过 60。
+        gate.backoff_secs = 40;
+        apply_poll_outcome(&mut gate, true);
+        assert_eq!(gate.backoff_secs, 60);
+        apply_poll_outcome(&mut gate, true);
+        assert_eq!(gate.backoff_secs, POLL_BACKOFF_CAP_SECS);
+    }
+
+    /// 源感知节流：事件源 5s / 兜底源 30s；429 退避期间全源拒绝。
+    #[test]
+    fn poll_gate_admit_source_aware() {
+        let mut gate = PollGate {
+            last_poll_at: None,
+            next_allowed: std::time::Instant::now(),
+            backoff_secs: POLL_EVENT_MIN_GAP_SECS,
+        };
+        // 首轮放行并占位。
+        assert!(poll_gate_admit(&mut gate, PollSource::Fallback));
+        // 兜底源 30s 内再触发 → 拒绝；事件源 5s 内也拒绝（刚 poll 过）。
+        assert!(!poll_gate_admit(&mut gate, PollSource::Fallback));
+        assert!(!poll_gate_admit(&mut gate, PollSource::SseEvent));
+        // 模拟 6s 后：事件源放行（>5s），兜底源仍拒绝（<30s）。
+        gate.last_poll_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(6));
+        assert!(poll_gate_admit(&mut gate, PollSource::SseEvent));
+        gate.last_poll_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(6));
+        assert!(!poll_gate_admit(&mut gate, PollSource::Fallback));
+        // 模拟 31s 后：兜底源放行。
+        gate.last_poll_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(31));
+        assert!(poll_gate_admit(&mut gate, PollSource::Fallback));
+        // 429 退避期间：任何源、任何间隔都拒绝。
+        gate.next_allowed = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        gate.last_poll_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(61));
+        assert!(!poll_gate_admit(&mut gate, PollSource::SseEvent));
+        assert!(!poll_gate_admit(&mut gate, PollSource::Fallback));
     }
 
     #[test]

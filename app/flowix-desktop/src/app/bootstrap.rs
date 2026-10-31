@@ -349,6 +349,11 @@ pub fn run() {
             // FD-12 M2：consult_remote 桥接端点（回环 + 随机 token），
             // 必须先于任何 DSH 会话 spawn，port/token 经 env 注入子进程链。
             crate::redaction::consult_bridge::ensure_started(app.handle().clone());
+            // M5 修复：SSE 订阅预启动——否则订阅只在首次 consult 发送后建立，
+            // 重启后（无人发咨询）本机对已注册 agent 信箱完全无取件通道，
+            // 入站咨询（auto-answer 被咨询方）无限滞留（2026-10-31 实机：
+            // probe6 在 alice 信箱躺 75s+ 零轮询）。
+            crate::commands::redaction::ensure_push_subscribed(app.handle());
             if let Some(window) = app.get_webview_window("main") {
                 // �?��即�?齐主题背�?��, 消除冷启动白�?(尤其深色主�?)�?
                 let theme = app.state::<AppState>().user_config.get_preference().theme;

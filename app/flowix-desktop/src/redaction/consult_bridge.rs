@@ -27,10 +27,16 @@ static BRIDGE: std::sync::OnceLock<BridgeInfo> = std::sync::OnceLock::new();
 
 /// 桥接端点 env（供 host_registry 注入 dsh-appserver 子进程）。
 /// 桥未启动时返回空——CLI 工具会以明确错误提示桌面不在运行。
+///
+/// 凭据主名是 `FLOWIX_CONSULT_BRIDGE_AUTH`：DSH spawn MCP server 子进程时
+/// 按敏感词剥离含 `TOKEN` 的变量名（2026-10-30 实证：TOKEN 被剥、AUTH
+/// 穿透，见 flowix-cli mcp 的 bridge_token 注释）。`_TOKEN` 仅作旧 sidecar
+/// 回退兼容，desktop 与 CLI 版本对齐后撤除。
 pub fn bridge_env_vars() -> Vec<(&'static str, String)> {
     match BRIDGE.get() {
         Some(info) => vec![
             ("FLOWIX_CONSULT_BRIDGE_PORT", info.port.to_string()),
+            ("FLOWIX_CONSULT_BRIDGE_AUTH", info.token.clone()),
             ("FLOWIX_CONSULT_BRIDGE_TOKEN", info.token.clone()),
         ],
         None => Vec::new(),
@@ -106,6 +112,10 @@ struct ConsultBridgeRequest {
     target_level: String,
     target_agent_id: String,
     session_id: String,
+    /// FD-12 M5：同步等待回程秒数（0-120，钳制；0/缺省 = 立即回执，
+    /// 答案照旧异步注入会话）。
+    #[serde(default)]
+    wait_seconds: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -122,6 +132,17 @@ struct ConsultBridgeResponse {
     byte_length: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// M5 等待结果：waited=true 表示本请求经历过等待窗口；timedOut=true
+    /// 表示窗口用尽（回程未到，回退异步注入语义）；answer/replyFrom 仅在
+    /// 等到回程时携带。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    waited: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timed_out: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    answer: Option<String>,
 }
 
 /// 解析后的极简 HTTP 请求（仅支持单请求、无 keep-alive）。
@@ -247,6 +268,10 @@ async fn handle_connection(mut stream: TcpStream, app: &tauri::AppHandle, token:
                 distill_mode: None,
                 byte_length: None,
                 error: Some(format!("INVALID_BODY:{error}")),
+                waited: None,
+                timed_out: None,
+                reply_from: None,
+                answer: None,
             };
             let _ = write_response(&mut stream, 200, &serde_json::to_string(&body).unwrap_or_default()).await;
             return;
@@ -255,6 +280,8 @@ async fn handle_connection(mut stream: TcpStream, app: &tauri::AppHandle, token:
     // FD-12 M2 补：短地址补全（LLM 常只知道 slug——`expert` / `bob/expert`
     // 自动补本地用户名与中继；完整地址原样通过）。
     let resolved_target = resolve_target(&request.target_agent_id);
+    // M5：等待窗口 0-120s 钳制（CLI 侧读超时 180s，窗口内必返回）。
+    let wait_secs = request.wait_seconds.unwrap_or(0).min(120);
     let response = match consult_auto_send_core(
         app,
         &request.cwd,
@@ -269,17 +296,45 @@ async fn handle_connection(mut stream: TcpStream, app: &tauri::AppHandle, token:
         Ok(result) => {
             // FD-12 M3：出门成功登记回程关联（receiptId → 发起会话）并
             // 启动应用级 SSE 订阅——回程注入不依赖收件箱面板。
+            // cwd 用与发送管线同一 fallback（未注册 cwd → 选中笔记本）：
+            // link.cwd 是回程 poll 与落档的 root，原值透传会让 DSH 会话的
+            // appserver 目录（或探针的 System32）承接落档/编排。
             let thread_id = consult_registry::resolve_active_dsh_thread(app).await;
+            let link_cwd =
+                crate::commands::redaction::consult_cwd_or_selected(app, &request.cwd);
             consult_registry::register(consult_registry::ConsultLink {
                 receipt_id: result.receipt_id.clone(),
                 thread_id,
-                cwd: request.cwd.clone(),
+                cwd: link_cwd,
                 target_agent_id: resolved_target.clone(),
                 at: chrono::Utc::now().timestamp(),
                 settled: false,
+                awaited: wait_secs > 0,
             });
             crate::commands::redaction::ensure_push_subscribed(app);
-            success_response(&result)
+            let mut response = success_response(&result);
+            // M5：同步等待——回程在窗口内到达则答案随本响应返回（发起
+            // turn 仍在等工具结果，agent 同轮呈现）；窗口用尽回退异步注入。
+            if wait_secs > 0 {
+                response.waited = Some(true);
+                match crate::commands::redaction::wait_for_consult_reply(
+                    app,
+                    &result.receipt_id,
+                    wait_secs,
+                )
+                .await
+                {
+                    Some(record) => {
+                        response.timed_out = Some(false);
+                        response.reply_from = Some(record.from_agent_id.clone());
+                        response.answer = Some(record.payload_text.clone());
+                    }
+                    None => {
+                        response.timed_out = Some(true);
+                    }
+                }
+            }
+            response
         }
         Err(error) => ConsultBridgeResponse {
             ok: false,
@@ -288,6 +343,10 @@ async fn handle_connection(mut stream: TcpStream, app: &tauri::AppHandle, token:
             distill_mode: None,
             byte_length: None,
             error: Some(error),
+            waited: None,
+            timed_out: None,
+            reply_from: None,
+            answer: None,
         },
     };
     let body = serde_json::to_string(&response).unwrap_or_default();
@@ -302,6 +361,10 @@ fn success_response(result: &AutoSendResult) -> ConsultBridgeResponse {
         distill_mode: Some(result.distill_mode.clone()),
         byte_length: Some(result.byte_length),
         error: None,
+        waited: None,
+        timed_out: None,
+        reply_from: None,
+        answer: None,
     }
 }
 

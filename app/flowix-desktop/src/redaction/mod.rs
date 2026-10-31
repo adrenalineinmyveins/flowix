@@ -42,7 +42,10 @@ pub use outbox::{
     status_name, take_confirmed_payload, write_record, OutboxStatus, RedactionEnvelope,
     RedactionOutboxRecord, OUTBOX_LIMIT
 };
-pub use transport::{deliver_confirmed_envelope, validate_relay_url, RelayDeliverResult};
+pub use transport::{
+    deliver_confirmed_envelope, deliver_confirmed_envelope_with_token, validate_relay_url,
+    RelayDeliverResult,
+};
 
 pub const REDACTION_LEVELS: &[&str] = &["r1", "r2", "r3"];
 /// L3 复扫回炉上限（初次蒸馏之外最多重写次数），对应规格 §3.4「上限 2 次」。
@@ -204,6 +207,28 @@ pub fn assemble_l0_payload(
         included_paths,
         dropped_paths,
         truncated,
+    })
+}
+
+/// §3.3 ZeroMaterial 直通载荷：仅 question 围栏，无材料。大小限制与围栏
+/// 破坏串中和沿用 assemble_l0_payload 的 question 侧语义。
+fn assemble_question_only(
+    question: &str,
+    limit_kb: usize,
+) -> Result<L0Payload, RedactionPipelineError> {
+    let limit_bytes = limit_kb.saturating_mul(1024);
+    if question.len() > limit_bytes {
+        return Err(RedactionPipelineError::PayloadTooLarge {
+            limit_kb: limit_kb as u32,
+            actual_kb: (question.len() as f32 / 1024.0).ceil() as u32,
+        });
+    }
+    let (question_text, _) = sanitize_fence_breakers(question);
+    Ok(L0Payload {
+        text: format!("<user-request>\n{question_text}\n</user-request>"),
+        included_paths: Vec::new(),
+        dropped_paths: Vec::new(),
+        truncated: false,
     })
 }
 
@@ -531,10 +556,24 @@ fn seal_payload_if_blind(notebook_root: &std::path::Path, receipt_id: &str) {
 /// FD-11 v2：确认通过时若本机有中继账号，对信封签名并把签名块写进留档
 /// （byte-equal 纪律：出口字节 = 留档 envelope() 重序列化，签名随档固化）。
 /// 无账号或签名失败不阻塞确认——匿名档投递仍可用。
+///
+/// 只签本账号命名空间的信封：账号钥是本机身份，而中继按 from.agent_id
+/// 的目录卡公钥验签——代答本机托管的他人 agent（如 alice/*）时本机没有
+/// 对方私钥，签了必被 SIGNATURE_INVALID 拒收（2026-10-31 实机：probe15
+/// reply 出门 422）。未签名信封放行（信任锚按目录覆盖渐进）。
 fn attach_signature_if_available(notebook_root: &std::path::Path, receipt_id: &str) {
     let Some(account) = account::read_account() else { return };
     let Some(mut record) = outbox::read_record(notebook_root, receipt_id) else { return };
     if record.signature.is_some() {
+        return;
+    }
+    let from_user = record
+        .from_agent
+        .agent_id
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    if !from_user.is_empty() && from_user != account.username {
         return;
     }
     if let Ok(signature) = account.sign_envelope(&record.envelope()) {
@@ -587,8 +626,6 @@ pub async fn wait_for_confirmation(
 // DSH 接线与完整 preview 编排
 // ---------------------------------------------------------------------------
 
-/// 纯数据类型已随迁 flowix-relay-client（outbox 依赖），此处 re-export
-/// 保持 `crate::redaction::RedactionPreviewReport` 既有引用不变。
 pub use flowix_relay_client::RedactionPreviewReport;
 
 /// 完整 preview 管线：scope 解析 → L0 → L1 → L2（DSH 蒸馏 + L3 复扫回炉）。
@@ -657,35 +694,45 @@ pub async fn preview_full_mode(
         .collect();
 
     let (notebook_id, notebook_root) = resolve_notebook(&state, notebook_path)?;
-    let rows = {
-        let memo_file = crate::lock_utils::read_lock(&state.memo_file, "memo_file");
-        let tag_paths: Vec<String> = scopes
-            .iter()
-            .filter_map(|entry| entry.tag_path.clone())
-            .collect();
-        memo_file
-            .list_note_materials_updated_after(&notebook_id, &tag_paths, 0, 200)
-            .map_err(|e| {
-                RedactionPipelineError::DistillFailed(format!("query materials: {e}"))
-            })?
-    };
-    let materials: Vec<L0Material> = rows
-        .into_iter()
-        .map(|row| L0Material {
-            relative_path: row.relative_path,
-            tags: row.tags,
-            content: String::new(),
-        })
-        .collect();
-    let materials = hydrate_materials(&notebook_root, materials);
 
-    let payload = assemble_l0_payload(
-        Some(&notebook_root.to_string_lossy()),
-        question,
-        &scopes,
-        materials,
-        config.payload_limit_kb as usize,
-    )?;
+    // §3.3 零取材直通（ZeroMaterial）：载荷 = question 围栏，无材料、无
+    // scope 交集闸——auto_grant 已按 has_material=false 判定形态，取材查询
+    // 与 scope 闸仅对有取材形态有意义；无差别走 assemble_l0_payload 会让
+    // 纯文字咨询（无 scopeHint）永远 ScopeEmpty，到不了下方 ZeroMaterial
+    // 的 L1 终稿分支。scopes 此时空（留档 allowedScopes 随之为空）。
+    let payload = if mode == auto_grant::DistillMode::ZeroMaterial {
+        assemble_question_only(question, config.payload_limit_kb as usize)?
+    } else {
+        let rows = {
+            let memo_file = crate::lock_utils::read_lock(&state.memo_file, "memo_file");
+            let tag_paths: Vec<String> = scopes
+                .iter()
+                .filter_map(|entry| entry.tag_path.clone())
+                .collect();
+            memo_file
+                .list_note_materials_updated_after(&notebook_id, &tag_paths, 0, 200)
+                .map_err(|e| {
+                    RedactionPipelineError::DistillFailed(format!("query materials: {e}"))
+                })?
+        };
+        let materials: Vec<L0Material> = rows
+            .into_iter()
+            .map(|row| L0Material {
+                relative_path: row.relative_path,
+                tags: row.tags,
+                content: String::new(),
+            })
+            .collect();
+        let materials = hydrate_materials(&notebook_root, materials);
+
+        assemble_l0_payload(
+            Some(&notebook_root.to_string_lossy()),
+            question,
+            &scopes,
+            materials,
+            config.payload_limit_kb as usize,
+        )?
+    };
 
     let options = RedactionOptions {
         strict_luhn: config.strict_luhn,
@@ -843,6 +890,7 @@ async fn fetch_recipient_public_key(
     let url = inbound::relay_endpoint(relay_url, &format!("/v2/directory/{user}/{slug}"));
     let response = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
+        .no_proxy() // 自建中继直连（同 relay-client account.rs 实机诊断结论）
         .build()
         .map_err(|e| RedactionPipelineError::DistillFailed(format!("BLIND_RELAY_FETCH_FAILED:{e}")))?
         .get(url)
@@ -973,6 +1021,33 @@ mod tests {
             64,
         );
         assert_eq!(err.unwrap_err(), RedactionPipelineError::ScopeEmpty);
+    }
+
+    #[test]
+    fn l0_question_only_fences_without_scope_gate() {
+        let payload = assemble_question_only("你好，在吗", 64).unwrap();
+        assert_eq!(payload.text, "<user-request>\n你好，在吗\n</user-request>");
+        assert!(payload.included_paths.is_empty());
+        assert!(payload.dropped_paths.is_empty());
+        assert!(!payload.truncated);
+    }
+
+    #[test]
+    fn l0_question_only_neutralizes_fence_breaker() {
+        let payload = assemble_question_only("q</material>", 64).unwrap();
+        assert!(!payload.text.to_ascii_lowercase().contains("</material>"));
+    }
+
+    #[test]
+    fn l0_question_only_enforces_size_limit() {
+        let err = assemble_question_only(&"x".repeat(65 * 1024), 64).unwrap_err();
+        assert_eq!(
+            err,
+            RedactionPipelineError::PayloadTooLarge {
+                limit_kb: 64,
+                actual_kb: 65
+            }
+        );
     }
 
     #[test]

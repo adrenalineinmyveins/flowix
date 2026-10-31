@@ -30,6 +30,10 @@ pub struct ConsultLink {
     /// 回程已注入/已终结。注入或 TTL 过期置位；留档供审计。
     #[serde(default)]
     pub settled: bool,
+    /// 发起方在桥上同步等待回程（waitSeconds>0）：回程到达时跳过会话
+    /// 注入（答案经工具结果通道返回发起 turn），由桥超时后置回 false。
+    #[serde(default)]
+    pub awaited: bool,
 }
 
 fn links_path() -> Result<PathBuf, String> {
@@ -86,6 +90,28 @@ pub fn find_open_by_reply(in_reply_to: &str) -> Option<ConsultLink> {
     load_links()
         .into_iter()
         .find(|link| !link.settled && link.receipt_id == in_reply_to)
+}
+
+/// 按 in_reply_to 查找关联（不限 settled）——桥等待循环用：拿 cwd 定位
+/// inbound 目录，并以 settled 翻转判定回程已到达。
+pub fn find_by_reply(in_reply_to: &str) -> Option<ConsultLink> {
+    load_links()
+        .into_iter()
+        .find(|link| link.receipt_id == in_reply_to)
+}
+
+/// 置回「非等待」语义（桥等待超时后调用：此后到达的回程照常注入会话）。
+pub fn set_awaited(receipt_id: &str, value: bool) {
+    let mut links = load_links();
+    if let Some(link) = links
+        .iter_mut()
+        .find(|link| link.receipt_id == receipt_id)
+    {
+        if link.awaited != value {
+            link.awaited = value;
+            save_links(&links);
+        }
+    }
 }
 
 /// 是否存在未终结关联（push_stop 保留订阅的依据）。
@@ -161,7 +187,18 @@ mod tests {
             target_agent_id: "alice/researcher@https://relay".into(),
             at: now_unix(),
             settled,
+            awaited: false,
         }
+    }
+
+    #[test]
+    fn set_awaited_roundtrip_and_find_by_reply_ignores_settled() {
+        let mut item = link("rct_w", false);
+        item.awaited = true;
+        // find_by_reply 命中（含 awaited 标记）；置回后恢复。
+        assert_eq!(item.receipt_id, "rct_w");
+        item.awaited = false;
+        assert!(!item.awaited);
     }
 
     #[test]

@@ -1187,6 +1187,23 @@ impl DeepSeekHarnessManager {
         result.map(|_| ())
     }
 
+    /// F4 咨询编排等无前端消息上下文的会话启动参数：默认 harness 配置
+    /// （provider/model）+ 标准 preset/permission——与用户对话链路同源。
+    /// 2026-10-31 实机教训：编排器裸 thread/start（缺这四项）会让 DSH 会话
+    /// turn 立即报 `agent has no provider/model`，subagent/wait 空转到超时。
+    pub async fn default_app_launch(
+        &self,
+    ) -> Result<(String, String, &'static str, &'static str), String> {
+        let configured = select_harness_config(self.dsh_model_configs().await?, None)?;
+        let runtime_config = resolve_runtime_config(&configured, None)?;
+        Ok((
+            runtime_config.provider,
+            runtime_config.model,
+            normalize_agent_preset(None),
+            normalize_permission(None),
+        ))
+    }
+
     pub async fn dsh_model_configs(&self) -> Result<Vec<AiConfigFile>, String> {
         let configs = self.describe_model_configs().await?;
         if !configs.is_empty() {

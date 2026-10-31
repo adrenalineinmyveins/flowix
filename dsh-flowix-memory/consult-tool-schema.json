@@ -13,6 +13,12 @@
       "type": "array",
       "items": { "type": "string" },
       "description": "Optional tag-path scopes to draw material from (for example finance/reports). Omit it unless the answer must quote your notes; scopes outside the pre-authorized whitelist fall back to manual review."
+    },
+    "waitSeconds": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 120,
+      "description": "Optional wait window in seconds to block until the reply arrives (10-120 recommended). When the answer lands inside the window it is returned directly and you can present it in the same turn; on timeout you get the delivery receipt and the answer still arrives asynchronously."
     }
   },
   "required": ["target", "question"],

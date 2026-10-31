@@ -20,14 +20,135 @@ use super::{
 
 const POLL_INTERVAL_MS: u64 = 2000;
 const CONSULT_TIMEOUT_SECS: u64 = 600;
+/// 单个 JSON-RPC 请求的兜底超时：DSH 对 inactive continuable 子代理的
+/// 部分调用（如 session/history 的冷恢复）可能无限挂起，不带超时会让
+/// 轮询循环整体卡死（2026-10-31 实机：meta 停在首轮 usage 后 5min 不动）。
+const REQUEST_TIMEOUT_SECS: u64 = 20;
+
+async fn timed_request(
+    host: &dyn crate::agent_external::deepseek_harness::DshClient,
+    value: Value,
+) -> Result<Value, String> {
+    let method = value
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS),
+        host.request(value),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(method, "orchestrator request timeout");
+            Err(format!("request_timeout:{REQUEST_TIMEOUT_SECS}s"))
+        }
+    }
+}
+
+/// 兜底通道：直接解压子代理会话日志提取最终回答。JSON-RPC 查询
+/// （usage/history）对 continuable 子代理会挂起且毒化后续请求
+/// （2026-10-31 实机），而 DSH 落盘日志始终实时更新——答案以日志为准。
+/// 日志形态：`<sessions>/<munged-cwd>/<child_id>/session.v4.jsonl.zstd`，
+/// munged 目录名不反推（含空格转义等规则），在 sessions 下逐目录探测。
+pub fn read_child_answer_from_session_log(
+    sessions_dir: &Path,
+    child_id: &str,
+) -> Option<String> {
+    let entries = std::fs::read_dir(sessions_dir).ok()?;
+    let mut newest: Option<(std::time::SystemTime, String)> = None;
+    for entry in entries.flatten() {
+        let log_path = entry.path().join(child_id).join("session.v4.jsonl.zstd");
+        if !log_path.is_file() {
+            continue;
+        }
+        let text = decode_zstd_log(&log_path)?;
+        if let Some(answer) = extract_last_assistant_from_log(&text) {
+            let modified = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            if newest.as_ref().is_none_or(|(prev, _)| modified > *prev) {
+                newest = Some((modified, answer));
+            }
+        }
+    }
+    newest.map(|(_, answer)| answer)
+}
+
+fn decode_zstd_log(path: &Path) -> Option<String> {
+    use std::io::Write as _;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut decoder = ruzstd::FrameDecoder::new();
+    let mut raw = Vec::new();
+    // DSH 会话日志是多帧追加流（每批事件一个独立 zstd 帧，实机单文件
+    // 可达 10+ 帧）。ruzstd 的 StreamingDecoder 单帧即止——当前帧排空后
+    // 直接报 EOF，会静默丢掉后续帧（最终 assistant 回答恰在尾部帧）。
+    // 必须逐帧 init + 全量解码 + 排空直到流尾。
+    while decoder.init(&mut file).is_ok() {
+        let mut failed = false;
+        while !decoder.is_finished() {
+            if decoder
+                .decode_blocks(&mut file, ruzstd::BlockDecodingStrategy::All)
+                .is_err()
+            {
+                // 尾帧可能仍在写入（半包）：保留已解出部分。
+                failed = true;
+                break;
+            }
+        }
+        if failed || decoder.collect_to_writer(&mut raw).is_err() {
+            break;
+        }
+    }
+    Some(String::from_utf8_lossy(&raw).into_owned())
+}
+
+/// 从会话日志 JSONL 提取最后一条 assistant 纯文本回答（跳过 tool-call）。
+fn extract_last_assistant_from_log(log: &str) -> Option<String> {
+    let mut last: Option<String> = None;
+    for line in log.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("assistant/message") {
+            continue;
+        }
+        let content = value
+            .pointer("/data/message/content")
+            .and_then(Value::as_array)?;
+        let text: Vec<String> = content
+            .iter()
+            .filter(|item| {
+                item.get("type").and_then(Value::as_str) == Some("text")
+            })
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect();
+        let joined = text.join("");
+        if !joined.trim().is_empty() {
+            last = Some(joined.trim().to_string());
+        }
+    }
+    last
+}
 
 /// 从 `session/history` 响应中提取最后一条 assistant 文本。
+/// 响应结构（DSH native-dsh-runtime `sessionHistory`）：
+/// `{sessionId, messages: [{id, role, content, messageType?…}], …}`。
+/// `messageType` 标记非对话时间线投影（tool-call / dsh-command /
+/// context-compaction 等），纯文本 assistant 消息不带。
 pub fn extract_last_assistant(history: &Value) -> Option<String> {
-    let items = history.get("history").and_then(Value::as_array)?;
+    let items = history.get("messages").and_then(Value::as_array)?;
     items
         .iter()
         .rev()
         .filter_map(|item| {
+            if item.get("messageType").and_then(Value::as_str).is_some() {
+                return None;
+            }
             let role = item.get("role").and_then(Value::as_str)?;
             let content = item.get("content").and_then(Value::as_str)?;
             Some((role, content))
@@ -49,13 +170,6 @@ pub fn parse_usage(usage: &Value) -> (u64, u64) {
         pick(&["tokensIn", "inputTokens", "input_tokens"]),
         pick(&["tokensOut", "outputTokens", "output_tokens"]),
     )
-}
-
-/// 取 `completed` 标志（thread/subagent/wait 响应）。
-pub fn parse_wait_completed(wait: &Value) -> bool {
-    wait.get("completed")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
 }
 
 /// 检测最后回答中的反问标记（C-M3 文本协议）。
@@ -102,8 +216,25 @@ pub async fn orchestrate(app: &AppHandle, notebook_root: &Path, mut meta: Consul
             return;
         }
     };
+    // thread/start 必须带 provider/model/preset/permission（裸启动会话 turn
+    // 立即报 `agent has no provider/model`，子代理空转到超时）。
+    let launch = match state.deepseek_harness.default_app_launch().await {
+        Ok(launch) => launch,
+        Err(error) => {
+            fail(&meta, &format!("launch_config_unavailable: {error}"));
+            return;
+        }
+    };
 
-    let result = run_consult_cycle(&*host, &mut meta, notebook_root, &prompt).await;
+    let result = run_consult_cycle(
+        &*host,
+        &launch,
+        &mut meta,
+        notebook_root,
+        state.user_config.dsh_sessions_dir(),
+        &prompt,
+    )
+    .await;
     match result {
         Ok(answer) => {
             // F1 记账：专家被咨询 +1（本地 state；无 state 文件则新建）。
@@ -138,38 +269,56 @@ pub async fn orchestrate(app: &AppHandle, notebook_root: &Path, mut meta: Consul
 
 type CycleError = (String, bool);
 
+#[allow(clippy::too_many_arguments)]
 async fn run_consult_cycle(
     host: &dyn crate::agent_external::deepseek_harness::DshClient,
+    launch: &(String, String, &'static str, &'static str),
     meta: &mut ConsultMeta,
     notebook_root: &Path,
+    sessions_dir: std::path::PathBuf,
     prompt: &str,
 ) -> Result<String, CycleError> {
     let err = |reason: String| -> CycleError { (reason, false) };
 
     // 1. A 的咨询线程。
-    let start = host
-        .request(json!({
+    let start = timed_request(
+        host,
+        json!({
             "jsonrpc": "2.0", "id": host.next_request_id(),
             "method": "thread/start",
-            "params": { "flowixThreadId": meta.consult_id, "cwd": notebook_root.to_string_lossy() }
-        }))
-        .await
-        .map_err(|e| err(format!("parent_start_failed: {e}")))?;
+            "params": {
+                "flowixThreadId": meta.consult_id,
+                "cwd": notebook_root.to_string_lossy(),
+                "provider": launch.0, "model": launch.1,
+                "agentPreset": launch.2, "permissionMode": launch.3
+            }
+        }),
+    )
+    .await
+    .map_err(|e| err(format!("parent_start_failed: {e}")))?;
+    // DSH App Server 的 thread/start 响应字段是 `thread.id`（与
+    // deepseek_harness::manager 同口径；顶层 threadId 是旧协议残留）。
     let parent_id = start
-        .get("threadId")
+        .pointer("/thread/id")
+        .or_else(|| start.get("threadId"))
+        .or_else(|| start.get("id"))
         .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
         .ok_or_else(|| err("parent_start_failed: no threadId".into()))?
         .to_string();
 
     // 2. B 为子线程（depth 约束由 subagent-service 硬校验）。
-    let spawn = host
-        .request(json!({
+    let spawn = timed_request(
+        host,
+        json!({
             "jsonrpc": "2.0", "id": host.next_request_id(),
             "method": "thread/subagent/spawn",
             "params": { "parentThreadId": parent_id, "prompt": prompt }
-        }))
-        .await
-        .map_err(|e| err(format!("spawn_failed: {e}")))?;
+        }),
+    )
+    .await
+    .map_err(|e| err(format!("spawn_failed: {e}")))?;
     let child_id = spawn
         .pointer("/subagent/childThreadId")
         .and_then(Value::as_str)
@@ -185,21 +334,27 @@ async fn run_consult_cycle(
     // 3. 轮询：预算 + 完成 + 反问。
     let mut guard = BudgetGuard::new(meta.token_budget);
     let mut askbacks = 0usize;
+    let mut last_answer: Option<String> = None;
+    let mut tick: u32 = 0;
     let deadline = tokio::time::Instant::now()
         + std::time::Duration::from_secs(CONSULT_TIMEOUT_SECS);
     loop {
+        // 心跳：定位轮询卡点（2026-10-31 实机：meta 停在 spawn 后不再前进）。
+        tracing::info!(consult_id = %meta.consult_id, tick, "consult poll tick");
         if tokio::time::Instant::now() >= deadline {
             let _ = interrupt_and_close(host, &child_id, &parent_id).await;
             return Err(("run_failed: consult timed out".into(), false));
         }
         // 预算。
-        if let Ok(usage) = host
-            .request(json!({
+        if let Ok(usage) = timed_request(
+            host,
+            json!({
                 "jsonrpc": "2.0", "id": host.next_request_id(),
                 "method": "flowix/session/usage",
                 "params": { "sessionId": child_id }
-            }))
-            .await
+            }),
+        )
+        .await
         {
             let (tokens_in, tokens_out) = parse_usage(&usage);
             guard.record(tokens_in.saturating_add(tokens_out));
@@ -214,31 +369,38 @@ async fn run_consult_cycle(
                 return Err(("budget_exceeded".into(), true));
             }
         }
-        // 完成（或反问）。
-        let completed = host
-            .request(json!({
+        // 完成（或反问）。native continuable 子代理没有 host 级 run
+        // completion——上游 nativeStatus 只产 running|idle，TERMINAL 判定
+        // 永假，subagent/wait 的 completed 恒 false（2026-10-31 实机：子代理
+        // turn 3s completed，wait 轮询 5min 仍超时）。改用 history 双采样
+        // 稳定判定：连续两轮提取到相同非空 assistant 文本即视为完成。
+        let history = timed_request(
+            host,
+            json!({
                 "jsonrpc": "2.0", "id": host.next_request_id(),
-                "method": "thread/subagent/wait",
-                "params": { "childThreadId": child_id }
-            }))
-            .await
+                "method": "session/history",
+                "params": { "sessionId": child_id, "limit": 50 }
+            }),
+        )
+        .await;
+        // JSON-RPC history 挂起/失败时兜底读会话日志（日志始终实时落盘）。
+        let current_answer = history
             .ok()
-            .and_then(|wait| parse_wait_completed(&wait).then_some(wait));
-        if let Some(_wait) = completed {
-            let history = host
-                .request(json!({
-                    "jsonrpc": "2.0", "id": host.next_request_id(),
-                    "method": "session/history",
-                    "params": { "sessionId": child_id, "limit": 50 }
-                }))
-                .await
-                .map_err(|e| ("history_failed".to_string(), false))?;
-            let asks_back = extract_last_assistant(&history)
-                .and_then(|text| extract_askback(&text));
+            .as_ref()
+            .and_then(extract_last_assistant)
+            .or_else(|| read_child_answer_from_session_log(&sessions_dir, &child_id));
+        let stable = match (&current_answer, &last_answer) {
+            (Some(current), Some(previous)) => current == previous,
+            _ => false,
+        };
+        if stable {
+            let answer = current_answer.expect("stable implies Some");
+            let asks_back = extract_askback(&answer);
             if let (Some(question), true) = (asks_back, askbacks < MAX_ASKBACKS) {
                 askbacks += 1;
                 if handle_askback(host, meta, notebook_root, &child_id, question).await {
                     // 答复已注入，回到轮询等 B 继续。
+                    last_answer = None;
                     continue;
                 }
                 // 等待通道异常（如 cancel 已移除 waiter）：按未答复兜底注入。
@@ -248,24 +410,34 @@ async fn run_consult_cycle(
                     "咨询方未答复，请基于现有信息作答。",
                 )
                 .await;
+                last_answer = None;
                 continue;
             }
             break;
         }
+        last_answer = current_answer;
+        tick += 1;
         tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
     }
 
-    // 4. 取最终回答（反问轮次之后的输出）。
-    let history = host
-        .request(json!({
+    // 4. 取最终回答（反问轮次之后的输出）。history 挂起/失败时回退用
+    // 稳定判定轮已提取的答案（两者同源，稳定轮即最终文本）。
+    let answer = match timed_request(
+        host,
+        json!({
             "jsonrpc": "2.0", "id": host.next_request_id(),
             "method": "session/history",
             "params": { "sessionId": child_id, "limit": 50 }
-        }))
-        .await
-        .map_err(|e| (format!("history_failed: {e}"), false))?;
-    let answer = extract_last_assistant(&history)
-        .ok_or_else(|| ("run_failed: no assistant output".to_string(), false))?;
+        }),
+    )
+    .await
+    {
+        Ok(history) => extract_last_assistant(&history)
+            .ok_or_else(|| ("run_failed: no assistant output".to_string(), false))?,
+        Err(_) => last_answer
+            .or_else(|| read_child_answer_from_session_log(&sessions_dir, &child_id))
+            .ok_or_else(|| ("run_failed: history unavailable".to_string(), false))?,
+    };
 
     // 5. 清理。
     let _ = interrupt_and_close(host, &child_id, &parent_id).await;
@@ -334,16 +506,23 @@ async fn interrupt_and_close(
     child_id: &str,
     parent_id: &str,
 ) {
+    // close 全部走超时兜底：nativeClose 的 drain 在 continuable 子代理上
+    // 可能无限挂起，且会把 host 的 JSON-RPC 处理整体卡死，毒化后续所有
+    // 编排请求（2026-10-31 实机：上轮编排的 close 挂死后，下一轮编排的
+    // usage/history 全部无响应）。放弃清理无碍——child 留在 DSH 侧
+    // continuable，不占本地资源。
     for (method, params) in [
         ("thread/subagent/close", json!({ "childThreadId": child_id })),
         ("thread/close", json!({ "threadId": parent_id })),
     ] {
-        let _ = host
-            .request(json!({
+        let _ = timed_request(
+            host,
+            json!({
                 "jsonrpc": "2.0", "id": host.next_request_id(),
                 "method": method, "params": params
-            }))
-            .await;
+            }),
+        )
+        .await;
     }
 }
 
@@ -354,14 +533,17 @@ mod tests {
     #[test]
     fn extracts_last_assistant_message() {
         let history = json!({
-            "history": [
+            "sessionId": "session-x",
+            "messages": [
                 { "role": "user", "content": "问题" },
                 { "role": "assistant", "content": "" },
+                // 工具调用投影（带 messageType）不算回答。
+                { "role": "assistant", "messageType": "tool-call", "content": "{\"q\":1}" },
                 { "role": "assistant", "content": "  最终回答  " }
             ]
         });
         assert_eq!(extract_last_assistant(&history).as_deref(), Some("最终回答"));
-        assert!(extract_last_assistant(&json!({ "history": [] })).is_none());
+        assert!(extract_last_assistant(&json!({ "messages": [] })).is_none());
         assert!(extract_last_assistant(&json!({})).is_none());
     }
 
@@ -376,13 +558,6 @@ mod tests {
             (7, 3)
         );
         assert_eq!(parse_usage(&json!({})), (0, 0));
-    }
-
-    #[test]
-    fn parses_wait_completed_flag() {
-        assert!(parse_wait_completed(&json!({ "completed": true })));
-        assert!(!parse_wait_completed(&json!({ "completed": false })));
-        assert!(!parse_wait_completed(&json!({})));
     }
 
     #[test]

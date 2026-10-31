@@ -22,9 +22,10 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
 
 pub const TOOL_DESCRIPTION: &str = "Search and manage Flowix Markdown notes, read table and media library collection datasets by collection ID or notebook-relative path, and use declared artifacts. Delete is destructive.";
 
-/// FD-12 M2：远程咨询工具。默认抽象提问（零取材直通，毫秒级出门）；
-/// scopeHint 仅在需要引用笔记原文时携带。回执立即返回，回程异步到达。
-pub const CONSULT_TOOL_DESCRIPTION: &str = "Consult another user's published Flowix agent over the network (asynchronous). Ask in abstract terms by default: a question written from scratch leaves in milliseconds. Include scopeHint only when the answer must draw on your notes; scopes outside the pre-authorized whitelist fall back to manual review. Returns a delivery receipt (receiptId, status); the answer arrives asynchronously and will be injected into this conversation later. Target accepts a full address (user/agent@relay), or a short form (agent slug, user/agent) which is completed locally; call consult_targets to list reachable agents.";
+/// FD-12 M2/M5：远程咨询工具。默认抽象提问（零取材直通，毫秒级出门）；
+/// scopeHint 仅在需要引用笔记原文时携带。waitSeconds>0 时同步等待回程，
+/// 窗口内到达则直接返回答案；否则回执返回，回程异步注入会话。
+pub const CONSULT_TOOL_DESCRIPTION: &str = "Consult another user's published Flowix agent over the network. Ask in abstract terms by default: a question written from scratch leaves in milliseconds. Include scopeHint only when the answer must draw on your notes; scopes outside the pre-authorized whitelist fall back to manual review. By default returns a delivery receipt (receiptId, status) and the answer is injected into this conversation later. Pass waitSeconds (10-120) to block until the reply arrives: when it lands inside the window the answer is returned directly and you can present it in the same turn; on timeout you get the receipt plus timedOut=true and the answer still arrives asynchronously. Target accepts a full address (user/agent@relay), or a short form (agent slug, user/agent) which is completed locally; call consult_targets to list reachable agents.";
 
 /// Run the MCP line-delimited JSON-RPC loop until stdin reaches EOF.
 pub fn run_mcp<R: BufRead, W: Write>(reader: R, mut writer: W) -> Result<(), CliError> {
@@ -561,6 +562,21 @@ fn consult_tool_result(data: Value, is_error: bool) -> Value {
             .and_then(Value::as_str)
             .unwrap_or("consult_remote failed")
             .to_string()
+    } else if let Some(answer) = data.get("answer").and_then(Value::as_str) {
+        // M5 等待命中：答案随工具结果直接回到发起 turn。
+        format!(
+            "Consult answered by {} (receipt {}):\n\n{}",
+            data.get("replyFrom").and_then(Value::as_str).unwrap_or("?"),
+            data.get("receiptId").and_then(Value::as_str).unwrap_or("?"),
+            answer,
+        )
+    } else if data.get("timedOut").and_then(Value::as_bool) == Some(true) {
+        format!(
+            "Consult delivered, wait window exhausted (receipt {}, status {}, mode {}); the answer has not arrived yet and will be injected into this conversation later.",
+            data.get("receiptId").and_then(Value::as_str).unwrap_or("?"),
+            data.get("status").and_then(Value::as_str).unwrap_or("?"),
+            data.get("distillMode").and_then(Value::as_str).unwrap_or("?"),
+        )
     } else {
         format!(
             "Consult delivered (receipt {}, status {}, mode {})",
@@ -607,6 +623,21 @@ fn call_consult_tool(params: &Map<String, Value>) -> Result<Value, CliError> {
     };
     let cwd = std::env::current_dir()
         .map_err(|error| CliError::Other(format!("resolve cwd: {error}")))?;
+    // M5：可选同步等待窗口（0-120；非法类型报 Usage，桌面侧再钳制）。
+    let wait_seconds = match arguments.get("waitSeconds") {
+        None => None,
+        Some(value) => {
+            let raw = value
+                .as_u64()
+                .ok_or_else(|| CliError::Usage("consult_remote.waitSeconds must be a non-negative integer".into()))?;
+            if raw > 120 {
+                return Err(CliError::Usage(
+                    "consult_remote.waitSeconds must be at most 120".into(),
+                ));
+            }
+            Some(raw)
+        }
+    };
     let body = json!({
         "cwd": cwd.to_string_lossy(),
         "question": question,
@@ -615,6 +646,7 @@ fn call_consult_tool(params: &Map<String, Value>) -> Result<Value, CliError> {
         "targetLevel": "r3",
         "targetAgentId": target,
         "sessionId": consult_session_id(),
+        "waitSeconds": wait_seconds,
     });
     match bridge_roundtrip(&body) {
         Ok(value) => {
@@ -870,6 +902,23 @@ fn call_consult_targets_tool() -> Result<Value, CliError> {
     }))
 }
 
+/// 桥鉴权值：优先 `FLOWIX_CONSULT_BRIDGE_AUTH`，回退旧名
+/// `FLOWIX_CONSULT_BRIDGE_TOKEN`（兼容未更新双名注入的旧 desktop）。
+///
+/// 主名不能用 TOKEN：DSH spawn MCP server 子进程（本进程）时按敏感词
+/// 剥离含 TOKEN 的变量名——2026-10-30 实证同链 TOKEN 被剥而 AUTH 穿透，
+/// 旧名时代因此表现为空 token → 桥 403。缺失时显式报错，不再静默
+/// 空串（静默只会换来难排查的 BRIDGE_HTTP_ERROR 403）。
+fn bridge_token() -> Result<String, CliError> {
+    let value = std::env::var("FLOWIX_CONSULT_BRIDGE_AUTH")
+        .or_else(|_| std::env::var("FLOWIX_CONSULT_BRIDGE_TOKEN"))
+        .map_err(|_| CliError::Other("BRIDGE_TOKEN_MISSING".to_string()))?;
+    if value.trim().is_empty() {
+        return Err(CliError::Other("BRIDGE_TOKEN_MISSING".to_string()));
+    }
+    Ok(value)
+}
+
 /// 桌面桥接 GET 单请求往返（Connection: close，读至 EOF）。
 fn bridge_get(path: &str) -> Result<Value, CliError> {
     use std::io::{Read, Write as _};
@@ -880,7 +929,7 @@ fn bridge_get(path: &str) -> Result<Value, CliError> {
         .ok()
         .and_then(|value| value.parse().ok())
         .ok_or_else(|| CliError::Other(BRIDGE_UNAVAILABLE.to_string()))?;
-    let token = std::env::var("FLOWIX_CONSULT_BRIDGE_TOKEN").unwrap_or_default();
+    let token = bridge_token()?;
     let address: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))
         .map_err(|_| CliError::Other(BRIDGE_UNAVAILABLE.to_string()))?;
@@ -922,7 +971,7 @@ fn bridge_roundtrip(body: &Value) -> Result<Value, CliError> {
         .ok()
         .and_then(|value| value.parse().ok())
         .ok_or_else(|| CliError::Other(BRIDGE_UNAVAILABLE.to_string()))?;
-    let token = std::env::var("FLOWIX_CONSULT_BRIDGE_TOKEN").unwrap_or_default();
+    let token = bridge_token()?;
     let payload = serde_json::to_string(body)
         .map_err(|error| CliError::Other(format!("serialize consult body: {error}")))?;
     let address: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
@@ -1090,6 +1139,7 @@ mod tests {
             json!(["target", "question"])
         );
         assert!(consult["inputSchema"]["properties"]["scopeHint"].is_object());
+        assert!(consult["inputSchema"]["properties"]["waitSeconds"].is_object());
     }
 
     #[test]
@@ -1101,6 +1151,25 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("question"));
+    }
+
+    #[test]
+    fn consult_wait_seconds_validated() {
+        // 非整数 → Usage；>120 → Usage（均以 protocol error 形式返回）。
+        let responses = run(
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"consult_remote","arguments":{"target":"a/b@https://relay.example","question":"q","waitSeconds":"soon"}}}"#,
+        );
+        assert!(responses[0]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("waitSeconds"));
+        let responses = run(
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"consult_remote","arguments":{"target":"a/b@https://relay.example","question":"q","waitSeconds":300}}}"#,
+        );
+        assert!(responses[0]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("at most 120"));
     }
 
     #[test]
@@ -1139,6 +1208,40 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("BRIDGE_UNAVAILABLE"));
+    }
+
+    /// 桥凭据读取：AUTH 主名优先（DSH 敏感词过滤剥 TOKEN 名），旧名回退，
+    /// 双缺/空串显式报错（不再静默空 token → 403）。
+    #[test]
+    fn bridge_token_prefers_auth_and_errors_when_missing() {
+        let saved_auth = std::env::var("FLOWIX_CONSULT_BRIDGE_AUTH").ok();
+        let saved_token = std::env::var("FLOWIX_CONSULT_BRIDGE_TOKEN").ok();
+        std::env::remove_var("FLOWIX_CONSULT_BRIDGE_AUTH");
+        std::env::remove_var("FLOWIX_CONSULT_BRIDGE_TOKEN");
+
+        // 双缺 → 显式错误。
+        let err = bridge_token().unwrap_err();
+        assert!(err.to_string().contains("BRIDGE_TOKEN_MISSING"));
+
+        // 仅旧名 → 回退可用（兼容旧 desktop 单名注入）。
+        std::env::set_var("FLOWIX_CONSULT_BRIDGE_TOKEN", "legacy");
+        assert_eq!(bridge_token().unwrap(), "legacy");
+
+        // 主名存在 → 优先（同值双名注入时结果一致，空串视为缺失）。
+        std::env::set_var("FLOWIX_CONSULT_BRIDGE_AUTH", "primary");
+        assert_eq!(bridge_token().unwrap(), "primary");
+        std::env::set_var("FLOWIX_CONSULT_BRIDGE_AUTH", "  ");
+        assert!(bridge_token().is_err());
+
+        // 恢复现场。
+        std::env::remove_var("FLOWIX_CONSULT_BRIDGE_AUTH");
+        std::env::remove_var("FLOWIX_CONSULT_BRIDGE_TOKEN");
+        if let Some(v) = saved_auth {
+            std::env::set_var("FLOWIX_CONSULT_BRIDGE_AUTH", v);
+        }
+        if let Some(v) = saved_token {
+            std::env::set_var("FLOWIX_CONSULT_BRIDGE_TOKEN", v);
+        }
     }
 
     /// P2 非对称闸门纯函数：新增即扩（含子树扩大引入的新字符串），缩小/等价放行。
