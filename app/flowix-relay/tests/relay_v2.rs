@@ -417,11 +417,14 @@ async fn restart_recovers_accounts_queue_and_usage() {
 async fn federation_one_hop_forward_and_loop_guard() {
     let client = reqwest::Client::new();
 
-    // B 中继：注册 carol/analyst。
+    // B 中继：carol 账号注册 analyst（匿名不可注册命名空间 id）。
     let b_base = spawn_relay(Arc::new(AppState::new(Store::in_memory()))).await;
+    let carol_key = SigningKey::from_bytes(&[7u8; 32]);
+    let (_, carol_token) = register_account(&client, &b_base, "carol", &carol_key).await;
     let b_token = client
         .post(format!("{b_base}/v1/devices"))
-        .json(&serde_json::json!({ "agentIds": ["carol/analyst"] }))
+        .bearer_auth(&carol_token)
+        .json(&serde_json::json!({ "agentIds": ["analyst"] }))
         .send()
         .await
         .unwrap()
@@ -479,4 +482,63 @@ async fn federation_one_hop_forward_and_loop_guard() {
         .await
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+/// 归属加固（2026-10-31）：匿名不可注册命名空间 id；匿名先占后，
+/// 重注册同 id 一律 409 AGENT_TAKEN，原归属不受影响。
+#[tokio::test]
+async fn agent_ownership_hardening_over_http() {
+    let base = spawn_relay(Arc::new(AppState::new(Store::in_memory()))).await;
+    let client = reqwest::Client::new();
+
+    // 匿名 + 命名空间 id → 403 NAMESPACE_REQUIRED。
+    let response = client
+        .post(format!("{base}/v1/devices"))
+        .json(&serde_json::json!({ "agentIds": ["alice/researcher"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap()["code"].as_str().unwrap(),
+        "NAMESPACE_REQUIRED"
+    );
+
+    // 匿名先占裸 id（v1 语义保留）。
+    let response = client
+        .post(format!("{base}/v1/devices"))
+        .json(&serde_json::json!({ "agentIds": ["agt_probe"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let token = response
+        .json::<serde_json::Value>()
+        .await
+        .unwrap()["deviceToken"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 重注册同 id → 409 AGENT_TAKEN。
+    let response = client
+        .post(format!("{base}/v1/devices"))
+        .json(&serde_json::json!({ "agentIds": ["agt_probe"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap()["code"].as_str().unwrap(),
+        "AGENT_TAKEN"
+    );
+
+    // 原归属不受影响：原 token 仍可拉信箱。
+    let response = client
+        .get(format!("{base}/v1/inbox?agentId=agt_probe"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
 }

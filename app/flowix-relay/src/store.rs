@@ -208,10 +208,43 @@ impl Store {
     // 设备与 agent 归属（v1 语义 + v2 账号归属）
     // ------------------------------------------------------------------
 
-    /// 注册收件设备；返回 deviceToken。后注册的设备夺走 agent 的收件权（单设备语义）。
-    /// `user_id`：Some = v2 账号设备（agentId 由路由层做命名空间归一）；None = v1 匿名。
-    pub fn register_device(&self, agent_ids: Vec<String>, user_id: Option<&str>, now: i64) -> String {
+    /// 注册收件设备；返回 deviceToken。
+    ///
+    /// 归属先到先得（2026-10-31 加固，替代此前的「后注册者夺走归属」）：
+    /// agent 已有归属时，仅同一 v2 账号的新设备可改绑（换机场景）；匿名
+    /// 注册或不同账号一律 `AGENT_TAKEN:<agentId>` 整单拒绝，零副作用。
+    /// 此前先删后插意味着任何人匿名重注册 `{"agentIds":["alice/researcher"]}`
+    /// 即可劫持信箱。匿名归属（无账号绑定）同理不可被改绑——拿不出归属
+    /// 证明；确需转移时由服务器侧人工处理。`user_id`：Some = v2 账号设备
+    /// （agentId 由路由层做命名空间归一）；None = v1 匿名。
+    pub fn register_device(
+        &self,
+        agent_ids: Vec<String>,
+        user_id: Option<&str>,
+        now: i64,
+    ) -> Result<String, String> {
         let mut conn = self.conn.lock().unwrap();
+        // 先整单校验归属冲突，再创建设备——冲突时零副作用。
+        for agent_id in &agent_ids {
+            let owner: Option<Option<String>> = conn
+                .query_row(
+                    "SELECT d.user_id FROM agent_owner ao
+                     LEFT JOIN devices d ON d.token = ao.token
+                     WHERE ao.agent_id = ?1",
+                    [agent_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| format!("internal:{e}"))?;
+            let Some(owner_user) = owner else { continue };
+            let same_owner = matches!(
+                (owner_user.as_deref(), user_id),
+                (Some(owner), Some(new)) if owner == new
+            );
+            if !same_owner {
+                return Err(format!("AGENT_TAKEN:{agent_id}"));
+            }
+        }
         let token = Self::insert_device_locked(&mut conn, user_id, now);
         for agent_id in agent_ids {
             conn.execute("DELETE FROM agent_owner WHERE agent_id = ?1", [&agent_id]).ok();
@@ -221,7 +254,7 @@ impl Store {
             )
             .ok();
         }
-        token
+        Ok(token)
     }
 
     pub fn token_owns_agent(&self, token: &str, agent_id: &str) -> bool {
@@ -557,7 +590,7 @@ mod tests {
     #[test]
     fn register_and_route() {
         let store = Store::in_memory();
-        let token = store.register_device(vec!["agt_b".into()], None, 1);
+        let token = store.register_device(vec!["agt_b".into()], None, 1).unwrap();
         assert!(store.agent_registered("agt_b"));
         assert!(store.token_owns_agent(&token, "agt_b"));
 
@@ -571,18 +604,54 @@ mod tests {
     }
 
     #[test]
-    fn reregister_steals_agent() {
+    fn agent_ownership_first_claim_resists_takeover() {
         let store = Store::in_memory();
-        let first = store.register_device(vec!["agt_b".into()], None, 1);
-        let second = store.register_device(vec!["agt_b".into()], None, 1);
-        assert!(!store.token_owns_agent(&first, "agt_b"));
-        assert!(store.token_owns_agent(&second, "agt_b"));
+        let first = store.register_device(vec!["agt_b".into()], None, 1).unwrap();
+        // 匿名重注册不可夺走归属。
+        assert_eq!(
+            store.register_device(vec!["agt_b".into()], None, 1).unwrap_err(),
+            "AGENT_TAKEN:agt_b"
+        );
+        // 账号设备也拿不出归属证明，不可夺走匿名归属。
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let (user_id, _) = store.create_account("alice", key.verifying_key().as_bytes(), 1).unwrap();
+        assert_eq!(
+            store.register_device(vec!["agt_b".into()], Some(&user_id), 1).unwrap_err(),
+            "AGENT_TAKEN:agt_b"
+        );
+        // 原归属不受影响。
+        assert!(store.token_owns_agent(&first, "agt_b"));
+    }
+
+    #[test]
+    fn same_account_rebinds_agent_cross_account_rejected() {
+        let store = Store::in_memory();
+        let key_a = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let key_b = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let (user_a, _) = store.create_account("alice", key_a.verifying_key().as_bytes(), 1).unwrap();
+        let (user_b, _) = store.create_account("bob", key_b.verifying_key().as_bytes(), 1).unwrap();
+        // 同账号新设备可改绑（换机）。
+        let first =
+            store.register_device(vec!["alice/researcher".into()], Some(&user_a), 1).unwrap();
+        let second =
+            store.register_device(vec!["alice/researcher".into()], Some(&user_a), 2).unwrap();
+        assert!(!store.token_owns_agent(&first, "alice/researcher"));
+        assert!(store.token_owns_agent(&second, "alice/researcher"));
+        // 他账号与匿名均不可改绑。
+        assert_eq!(
+            store.register_device(vec!["alice/researcher".into()], Some(&user_b), 3).unwrap_err(),
+            "AGENT_TAKEN:alice/researcher"
+        );
+        assert_eq!(
+            store.register_device(vec!["alice/researcher".into()], None, 3).unwrap_err(),
+            "AGENT_TAKEN:alice/researcher"
+        );
     }
 
     #[test]
     fn expired_envelopes_are_dropped_from_inbox() {
         let store = Store::in_memory();
-        store.register_device(vec!["agt_b".into()], None, 1);
+        store.register_device(vec!["agt_b".into()], None, 1).unwrap();
         store.enqueue("agt_b", sample(), 1);
         // sample 的 expires_at = 4_102_444_800。
         assert!(store.inbox("agt_b", 4_102_444_900).is_empty());
@@ -594,7 +663,7 @@ mod tests {
         let path = dir.path().join("relay-state.db");
         {
             let store = Store::persisted(&path);
-            store.register_device(vec!["agt_b".into()], None, 1);
+            store.register_device(vec!["agt_b".into()], None, 1).unwrap();
             store.enqueue("agt_b", sample(), 1);
         }
         let restored = Store::persisted(&path);
@@ -618,7 +687,8 @@ mod tests {
         );
 
         // 命名空间 agent 注册（归属 alice）。
-        let agent_token = store.register_device(vec!["alice/researcher".into()], Some(&user_id), 1);
+        let agent_token =
+            store.register_device(vec!["alice/researcher".into()], Some(&user_id), 1).unwrap();
         assert!(store.agent_registered("alice/researcher"));
         assert!(store.token_owns_agent(&agent_token, "alice/researcher"));
 

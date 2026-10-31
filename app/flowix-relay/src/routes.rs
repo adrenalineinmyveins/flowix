@@ -13,6 +13,15 @@ use crate::store::{split_namespaced, Store};
 
 /// 配额（FD-11 §5 默认值；测试可注入小值）。
 /// 「已认证」= 投递请求带 Bearer deviceToken（M4 信封签名落地后按 keyId 精确化）。
+///
+/// 部署可用 env 覆盖（2026-10-31 实机教训：poll 120/h 对「SSE 事件驱动 +
+/// 等待窗口兜底轮询」的桌面客户端太紧——回程取件被限流卡死，同步等待
+/// 必然超时；默认放宽到 600/h，可按部署再调）：
+/// - `FLOWIX_RELAY_QUOTA_POLL`（默认 600）
+/// - `FLOWIX_RELAY_QUOTA_DELIVER_AUTH`（默认 30）
+/// - `FLOWIX_RELAY_QUOTA_DELIVER_ANON`（默认 3）
+/// - `FLOWIX_RELAY_QUOTA_WINDOW_SECS`（默认 3600）
+/// - `FLOWIX_RELAY_QUOTA_DIRECTORY_WRITE`（默认 10）
 #[derive(Clone, Copy)]
 pub struct QuotaConfig {
     pub window_secs: i64,
@@ -30,10 +39,30 @@ impl Default for QuotaConfig {
             window_secs: 3600,
             deliver_authenticated: 30,
             deliver_anonymous: 3,
-            poll: 120,
+            poll: 600,
             directory_write: 10,
             directory_window_secs: 86_400,
         }
+    }
+}
+
+impl QuotaConfig {
+    /// env 覆盖（未设置/非法值 → 保持默认）。
+    pub fn from_env() -> Self {
+        let mut config = Self::default();
+        let read = |key: &str, slot: &mut i64| {
+            if let Ok(raw) = std::env::var(key) {
+                if let Ok(value) = raw.trim().parse::<i64>() {
+                    *slot = value;
+                }
+            }
+        };
+        read("FLOWIX_RELAY_QUOTA_POLL", &mut config.poll);
+        read("FLOWIX_RELAY_QUOTA_DELIVER_AUTH", &mut config.deliver_authenticated);
+        read("FLOWIX_RELAY_QUOTA_DELIVER_ANON", &mut config.deliver_anonymous);
+        read("FLOWIX_RELAY_QUOTA_WINDOW_SECS", &mut config.window_secs);
+        read("FLOWIX_RELAY_QUOTA_DIRECTORY_WRITE", &mut config.directory_write);
+        config
     }
 }
 
@@ -50,7 +79,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(store: Store) -> Self {
         let (events, _) = tokio::sync::broadcast::channel(256);
-        Self { store, quotas: QuotaConfig::default(), events, federation_peers: Vec::new() }
+        Self { store, quotas: QuotaConfig::from_env(), events, federation_peers: Vec::new() }
     }
 
     /// 测试注入配额用。
@@ -111,12 +140,27 @@ pub async fn register_device(
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|code| (StatusCode::FORBIDDEN, Json(RejectResponse { code })))?,
-        None => body.agent_ids,
+        None => {
+            // v1 匿名注册保留给裸 id；命名空间 id（含 '/'）必须带账号——
+            // 命名空间的语义属主是账号，匿名设备无法证明归属（防劫持，
+            // 2026-10-31 加固）。
+            for agent_id in &body.agent_ids {
+                if agent_id.contains('/') {
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        Json(RejectResponse { code: "NAMESPACE_REQUIRED" }),
+                    ));
+                }
+            }
+            body.agent_ids
+        }
     };
     let user_id = account.as_ref().map(|(user_id, _)| user_id.as_str());
-    Ok(Json(RegisterResponse {
-        device_token: state.store.register_device(agent_ids, user_id, now),
-    }))
+    let device_token = state
+        .store
+        .register_device(agent_ids, user_id, now)
+        .map_err(|_| (StatusCode::CONFLICT, Json(RejectResponse { code: "AGENT_TAKEN" })))?;
+    Ok(Json(RegisterResponse { device_token }))
 }
 
 #[derive(Serialize)]
@@ -824,4 +868,40 @@ pub struct HealthResponse {
 
 pub async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok", envelope_version: crate::envelope::ENVELOPE_VERSION })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// env 覆盖生效；非法/未设置回落默认。
+    #[test]
+    fn quota_config_from_env_overrides_and_falls_back() {
+        let keys = [
+            "FLOWIX_RELAY_QUOTA_POLL",
+            "FLOWIX_RELAY_QUOTA_DELIVER_AUTH",
+            "FLOWIX_RELAY_QUOTA_DELIVER_ANON",
+            "FLOWIX_RELAY_QUOTA_WINDOW_SECS",
+            "FLOWIX_RELAY_QUOTA_DIRECTORY_WRITE",
+        ];
+        let saved: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
+        for key in keys {
+            std::env::remove_var(key);
+        }
+        // 未设置 → 全默认（poll 默认 600）。
+        assert_eq!(QuotaConfig::from_env().poll, 600);
+        // 合法值覆盖；非法值忽略。
+        std::env::set_var("FLOWIX_RELAY_QUOTA_POLL", "1200");
+        std::env::set_var("FLOWIX_RELAY_QUOTA_WINDOW_SECS", "not-a-number");
+        let config = QuotaConfig::from_env();
+        assert_eq!(config.poll, 1200);
+        assert_eq!(config.window_secs, 3600);
+        std::env::remove_var("FLOWIX_RELAY_QUOTA_POLL");
+        std::env::remove_var("FLOWIX_RELAY_QUOTA_WINDOW_SECS");
+        for (key, value) in keys.iter().zip(saved) {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            }
+        }
+    }
 }
