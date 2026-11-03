@@ -386,21 +386,34 @@ fn execute_command(command: &str, stdin: Option<&str>) -> Result<Value, CliError
             let (configs, selected_notebook_id) = store::notebooks_list_data()?;
             let counts = store::notebook_note_counts(&configs)?;
             let tag_counts = store::notebook_tag_counts(&configs)?;
-            Ok(fmt::notebooks_to_json(
-                &configs,
-                &counts,
-                &tag_counts,
-                selected_notebook_id.as_deref(),
-            ))
+            // MCP structuredContent 必须是 record：裸数组会被宿主
+            // zod 校验拒收（DSH 实机报 Invalid result for tools/call:
+            // expected record, received array）。
+            Ok(json!({
+                "action": "notebooks",
+                "notebooks": fmt::notebooks_to_json(
+                    &configs,
+                    &counts,
+                    &tag_counts,
+                    selected_notebook_id.as_deref(),
+                ),
+            }))
         }
         cli::Cli::List { notebook, .. } => {
             reject_stdin(stdin)?;
             let notebook = store::resolve_notebook_key(notebook.as_deref())?;
-            Ok(path_store::list(&notebook)?["notes"].clone())
+            Ok(json!({
+                "action": "list",
+                "notes": path_store::list(&notebook)?["notes"].clone(),
+            }))
         }
         cli::Cli::Tags { notebook, .. } => {
             reject_stdin(stdin)?;
-            store::notebook_tags(notebook.as_deref())
+            let tags = store::notebook_tags(notebook.as_deref())?;
+            Ok(match tags {
+                Value::Array(items) => json!({ "action": "tags", "tags": items }),
+                other => other,
+            })
         }
         cli::Cli::Show { id, .. } => {
             reject_stdin(stdin)?;
@@ -1012,22 +1025,108 @@ fn tool_result(data: Value, is_error: bool) -> Value {
             .unwrap_or("Flowix operation failed")
             .to_string()
     } else {
-        let action = data
-            .get("action")
-            .and_then(Value::as_str)
-            .unwrap_or("completed");
-        let id = data
-            .get("address")
-            .and_then(Value::as_str)
-            .map(|id| format!(" ({id})"))
-            .unwrap_or_default();
-        format!("Flowix {action}{id}")
+        summarize_result(&data)
     };
     json!({
         "content": [{"type": "text", "text": text}],
         "structuredContent": data,
         "isError": is_error
     })
+}
+
+/// 模型可读结果摘要：DSH 宿主只把 content text 呈现给模型，
+/// structuredContent 不透传——此前 text 仅有「Flowix {action}」标题，
+/// search/list/tags 对模型恒为空结果（2026-11-03 实机：子代理连续
+/// memo search/list 返回 "Flowix search" 后被迫降级 grep 文件系统取材）。
+fn summarize_result(data: &Value) -> String {
+    let action = data
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    let field_str = |value: &Value, key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    match action {
+        "search" => {
+            let matches = data
+                .get("matches")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let mut out = format!("Found {} match(es)", matches.len());
+            for item in matches.iter().take(10) {
+                out.push_str(&format!(
+                    "\n- {} ({})",
+                    field_str(item, "title"),
+                    field_str(item, "address")
+                ));
+                if let Some(snippet) = item.get("snippet").and_then(Value::as_str) {
+                    if let Some(first) = snippet.lines().map(str::trim).find(|line| !line.is_empty()) {
+                        out.push_str(&format!(" — {first}"));
+                    }
+                }
+            }
+            out
+        }
+        "list" => {
+            let notes = data
+                .get("notes")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let mut out = format!("{} note(s)", notes.len());
+            for item in notes.iter().take(80) {
+                let label = item.as_str().map(str::to_string).unwrap_or_else(|| {
+                    let path = field_str(item, "path");
+                    if path.is_empty() { field_str(item, "title") } else { path }
+                });
+                out.push_str(&format!("\n- {label}"));
+            }
+            out
+        }
+        "tags" => {
+            let tags = data
+                .get("tags")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let joined = tags
+                .iter()
+                .filter_map(|tag| tag.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("Tags: {joined}")
+        }
+        "notebooks" => {
+            let notebooks = data
+                .get("notebooks")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let mut out = format!("{} notebook(s)", notebooks.len());
+            for item in notebooks.iter().take(30) {
+                out.push_str(&format!(
+                    "\n- {} ({}) notes={}",
+                    field_str(item, "name"),
+                    field_str(item, "id"),
+                    item.get("notes").map(|value| value.to_string()).unwrap_or_default()
+                ));
+            }
+            out
+        }
+        _ => {
+            let id = data
+                .get("address")
+                .and_then(Value::as_str)
+                .map(|id| format!(" ({id})"))
+                .unwrap_or_default();
+            format!("Flowix {action}{id}")
+        }
+    }
 }
 
 fn error_code(error: &CliError) -> &'static str {
@@ -1190,6 +1289,46 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("BRIDGE_UNAVAILABLE"));
+    }
+
+    /// memo 结果摘要 + structuredContent record 形状（2026-11-03 实机：
+    /// DSH 只透传 content text 且 zod 拒收数组 structuredContent——
+    /// search/list/tags 对模型恒空、notebooks 直接校验失败）。
+    #[test]
+    fn memo_results_carry_readable_summary_and_record_payload() {
+        let _guard = env_lock();
+        let (root, previous) = install_temp_home("memo-summary");
+        let responses = run(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memo","arguments":{"action":"notebooks"}}}
+               {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memo","arguments":{"action":"search","query":"不存在的词"}}}
+               {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memo","arguments":{"action":"list"}}}"#,
+        );
+        restore_home(previous, root);
+
+        let notebooks = &responses[0]["result"];
+        assert_eq!(notebooks["isError"], json!(false));
+        // structuredContent 必须是 record（数组会被宿主校验拒收）。
+        assert!(notebooks["structuredContent"].is_object());
+        assert!(notebooks["structuredContent"]["notebooks"].is_array());
+        assert!(notebooks["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("notebook(s)"));
+
+        let search = &responses[1]["result"];
+        assert!(search["structuredContent"].is_object());
+        assert!(search["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Found 0 match(es)"));
+
+        let list = &responses[2]["result"];
+        assert!(list["structuredContent"].is_object());
+        assert!(list["structuredContent"]["notes"].is_array());
+        assert!(list["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("note(s)"));
     }
 
     #[test]

@@ -64,12 +64,17 @@ pub(crate) fn execute(operation: FlowixOperation) -> Result<Value, CliError> {
             let (configs, selected) = store::notebooks_list_data()?;
             let counts = store::notebook_note_counts(&configs)?;
             let tag_counts = store::notebook_tag_counts(&configs)?;
-            Ok(fmt::notebooks_to_json(
-                &configs,
-                &counts,
-                &tag_counts,
-                selected.as_deref(),
-            ))
+            // structuredContent 必须 record（MCP 规范；裸数组被 DSH zod
+            // 校验拒收，实机 2026-11-03）。
+            Ok(serde_json::json!({
+                "action": "notebooks",
+                "notebooks": fmt::notebooks_to_json(
+                    &configs,
+                    &counts,
+                    &tag_counts,
+                    selected.as_deref(),
+                ),
+            }))
         }
         FlowixOperation::List {
             notebook,
@@ -95,7 +100,15 @@ pub(crate) fn execute(operation: FlowixOperation) -> Result<Value, CliError> {
                 "next_offset": (offset + notes.len() < total).then_some(offset + notes.len())
             }))
         }
-        FlowixOperation::Tags { notebook } => store::notebook_tags(notebook.as_deref()),
+        FlowixOperation::Tags { notebook } => {
+            let tags = store::notebook_tags(notebook.as_deref())?;
+            Ok(match tags {
+                serde_json::Value::Array(items) => {
+                    serde_json::json!({ "action": "tags", "tags": items })
+                }
+                other => other,
+            })
+        }
         FlowixOperation::Show { address } => path_store::show(&address),
         FlowixOperation::Search {
             query,
