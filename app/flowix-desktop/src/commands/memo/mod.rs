@@ -13,6 +13,7 @@
 //! - [`reads`]   鈥?read-only IPC: list / search / get_memos / read_document /
 //!   mention / todo metadata / version listing.
 //! - [`creates`] 鈥?create / import / template and move commands.
+//! - [`imports`] 鈥?ENEX（Evernote 交换格式）批量导入。
 //! - [`versions`] 鈥?memo version history (list / read / create / restore).
 //! - [`deletes`] 鈥?delete commands.
 //!
@@ -24,6 +25,7 @@
 
 pub mod creates;
 pub mod deletes;
+pub mod imports;
 pub(crate) mod helpers;
 pub mod reads;
 pub mod versions;

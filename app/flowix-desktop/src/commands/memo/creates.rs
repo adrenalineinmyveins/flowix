@@ -46,7 +46,7 @@ pub struct CreatedPathDocumentResult {
     entry: flowix_core::memo_file::NoteEntry,
 }
 
-fn default_parent_relative_path(
+pub(super) fn default_parent_relative_path(
     memo_file: &MemoFile,
     notebook_id: &str,
 ) -> Result<Option<String>, flowix_core::FlowixError> {

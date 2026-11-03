@@ -24,7 +24,7 @@ use tokio::sync::{Notify, Semaphore};
 use super::helpers::{
     can_access_document_path, can_access_scoped_file, is_agent_access_folder,
     is_internal_notebook_path, is_registered_notebook_path, is_registered_notebook_root,
-    refresh_notebook_note_index, start_security_bookmark_access,
+    notebook_note_address, refresh_notebook_note_index, start_security_bookmark_access,
 };
 use crate::app::state::AppState;
 
@@ -1037,33 +1037,44 @@ pub fn read_file(
 }
 
 const MAX_DOCX_PREVIEW_BYTES: u64 = 50 * 1024 * 1024;
+const MAX_PDF_PREVIEW_BYTES: u64 = 50 * 1024 * 1024;
 
-fn authorized_docx_path(
+/// Shared authorization for binary preview reads (DOCX / PDF): absolute path,
+/// canonicalized existing file, exact extension match, and document or scoped
+/// access. `prefix` ("DOCX" / "PDF") keeps the per-format error codes stable
+/// for the WebView's user-facing error mapping.
+fn authorized_binary_preview_path(
     file_path: &str,
     space_path: Option<&str>,
     window_label: &str,
     state: &State<'_, AppState>,
+    extension: &str,
+    prefix: &str,
 ) -> Result<PathBuf, String> {
     let requested = Path::new(file_path);
     if !requested.is_absolute() {
-        return Err("DOCX_PATH_INVALID: DOCX path must be absolute".to_string());
+        return Err(format!("{prefix}_PATH_INVALID: path must be absolute"));
     }
     let path = dunce::canonicalize(requested)
-        .map_err(|error| format!("DOCX_UNAVAILABLE: could not open file: {error}"))?;
+        .map_err(|error| format!("{prefix}_UNAVAILABLE: could not open file: {error}"))?;
     if !path.is_file() {
-        return Err("DOCX_UNAVAILABLE: path is not a file".to_string());
+        return Err(format!("{prefix}_UNAVAILABLE: path is not a file"));
     }
     if !path
         .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("docx"))
+        .and_then(|path_extension| path_extension.to_str())
+        .is_some_and(|path_extension| path_extension.eq_ignore_ascii_case(extension))
     {
-        return Err("DOCX_UNSUPPORTED: only .docx files are supported".to_string());
+        return Err(format!(
+            "{prefix}_UNSUPPORTED: only .{extension} files are supported"
+        ));
     }
     if !can_access_document_path(&path, window_label, state)
         && !can_access_scoped_file(&path, space_path, state)
     {
-        return Err("DOCX_FORBIDDEN: file is outside its authorized space".to_string());
+        return Err(format!(
+            "{prefix}_FORBIDDEN: file is outside its authorized space"
+        ));
     }
     start_security_bookmark_access(state, &path);
     Ok(path)
@@ -1081,7 +1092,14 @@ pub async fn read_docx_file(
     let window_label = window.label().to_owned();
     crate::document_io::run("read_docx", move || {
         let state = app.state::<AppState>();
-        let path = authorized_docx_path(&file_path, space_path.as_deref(), &window_label, &state)?;
+        let path = authorized_binary_preview_path(
+            &file_path,
+            space_path.as_deref(),
+            &window_label,
+            &state,
+            "docx",
+            "DOCX",
+        )?;
         let metadata = fs::metadata(&path).map_err(|error| error.to_string())?;
         if metadata.len() > MAX_DOCX_PREVIEW_BYTES {
             return Err(format!(
@@ -1092,6 +1110,42 @@ pub async fn read_docx_file(
         let bytes = fs::read(&path).map_err(|error| format!("DOCX_READ_FAILED: {error}"))?;
         if bytes.len() as u64 > MAX_DOCX_PREVIEW_BYTES {
             return Err("DOCX_TOO_LARGE: file grew beyond the preview limit".to_string());
+        }
+        Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+    })
+    .await?
+}
+
+/// Read an authorized PDF for the in-app preview. Binary bytes cross IPC as
+/// base64 so the WebView can decode them without granting general fs access.
+#[tauri::command]
+pub async fn read_pdf_file(
+    window: WebviewWindow,
+    file_path: String,
+    space_path: Option<String>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let window_label = window.label().to_owned();
+    crate::document_io::run("read_pdf", move || {
+        let state = app.state::<AppState>();
+        let path = authorized_binary_preview_path(
+            &file_path,
+            space_path.as_deref(),
+            &window_label,
+            &state,
+            "pdf",
+            "PDF",
+        )?;
+        let metadata = fs::metadata(&path).map_err(|error| error.to_string())?;
+        if metadata.len() > MAX_PDF_PREVIEW_BYTES {
+            return Err(format!(
+                "PDF_TOO_LARGE: file is larger than {} MB",
+                MAX_PDF_PREVIEW_BYTES / (1024 * 1024)
+            ));
+        }
+        let bytes = fs::read(&path).map_err(|error| format!("PDF_READ_FAILED: {error}"))?;
+        if bytes.len() as u64 > MAX_PDF_PREVIEW_BYTES {
+            return Err("PDF_TOO_LARGE: file grew beyond the preview limit".to_string());
         }
         Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
     })
@@ -1141,7 +1195,7 @@ fn docx_image_extension(content_type: &str) -> Option<&'static str> {
     }
 }
 
-fn docx_asset_markdown_url(path: &Path) -> String {
+pub(crate) fn docx_asset_markdown_url(path: &Path) -> String {
     let mut encoded = String::new();
     let path = path.to_string_lossy();
     for byte in path.as_bytes() {
@@ -1338,7 +1392,14 @@ pub async fn create_docx_markdown(
     let window_label = window.label().to_owned();
     crate::document_io::run("create_docx_markdown", move || {
         let state = app.state::<AppState>();
-        let source = authorized_docx_path(&file_path, Some(&space_path), &window_label, &state)?;
+        let source = authorized_binary_preview_path(
+            &file_path,
+            Some(&space_path),
+            &window_label,
+            &state,
+            "docx",
+            "DOCX",
+        )?;
         // Creating a sibling requires an explicit browsable-space grant. A
         // one-file open grant is sufficient for preview, but not for writing.
         if !can_access_scoped_file(&source, Some(&space_path), &state) {
@@ -1365,6 +1426,125 @@ pub async fn create_docx_markdown(
                 .map_err(|error| error.to_string())??
         };
         refresh_notebook_note_index(&memo_file, &target);
+        // Same as the PDF conversion: notify the webview so the sidebar memo
+        // list and file tree reload without reopening the notebook.
+        if let Ok(Some((notebook_id, _))) = notebook_note_address(&memo_file, &target) {
+            let notebook_path = memo_file
+                .get_notebook_config_by_id(&notebook_id)
+                .map(|config| config.path.clone())
+                .unwrap_or_default();
+            let _ = app.emit("flowix:path-note-changed", serde_json::json!({
+                "notebookId": notebook_id,
+                "relativePath": "",
+                "deleted": false,
+            }));
+            let _ = app.emit("file-management-changed", serde_json::json!({
+                "notebookId": notebook_id,
+                "notebookPath": notebook_path,
+            }));
+        }
+        Ok(target.to_string_lossy().into_owned())
+    })
+    .await?
+}
+
+/// Create a sibling Markdown file from converted PDF text. Same contract as
+/// the DOCX conversion: never replace an existing document, take a numbered
+/// suffix when the natural name is taken. PDF has no extractable embedded
+/// images on this path, so the command only writes the text content.
+#[tauri::command]
+pub async fn create_pdf_markdown(
+    window: WebviewWindow,
+    file_path: String,
+    space_path: String,
+    content: String,
+    app: AppHandle,
+) -> Result<String, String> {
+    let window_label = window.label().to_owned();
+    crate::document_io::run("create_pdf_markdown", move || {
+        let state = app.state::<AppState>();
+        let source = authorized_binary_preview_path(
+            &file_path,
+            Some(&space_path),
+            &window_label,
+            &state,
+            "pdf",
+            "PDF",
+        )?;
+        // Creating a sibling requires an explicit browsable-space grant. A
+        // one-file open grant is sufficient for preview, but not for writing.
+        if !can_access_scoped_file(&source, Some(&space_path), &state) {
+            return Err("PDF_FORBIDDEN: cannot create Markdown outside this space".to_string());
+        }
+        let create_sibling = || -> Result<PathBuf, String> {
+            let parent = source
+                .parent()
+                .ok_or_else(|| "PDF_PATH_INVALID: source has no parent directory".to_string())?;
+            let stem = source
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .filter(|stem| !stem.is_empty())
+                .ok_or_else(|| "PDF_PATH_INVALID: source filename is invalid".to_string())?;
+            for suffix in 0..=9999 {
+                let file_name = if suffix == 0 {
+                    format!("{stem}.md")
+                } else {
+                    format!("{stem} ({suffix}).md")
+                };
+                let target = parent.join(file_name);
+                if !can_access_scoped_file(&target, Some(&space_path), &state) {
+                    return Err("PDF_FORBIDDEN: output path is outside this space".to_string());
+                }
+                match flowix_core::memo_file::atomic_create_bytes(&target, content.as_bytes()) {
+                    Ok(()) => return Ok(target),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(format!("PDF_WRITE_FAILED: {error}")),
+                }
+            }
+            Err("PDF_NAME_CONFLICT: could not find an unused Markdown filename".to_string())
+        };
+        let memo_file = read_lock(&state.memo_file, "memo_file");
+        let notebook_ids = memo_file
+            .notebook_ids_for_paths(&[&source])
+            .map_err(|error| error.to_string())?;
+        let target = if notebook_ids.is_empty() {
+            create_sibling()?
+        } else {
+            let ids: Vec<&str> = notebook_ids.iter().map(String::as_str).collect();
+            memo_file
+                .with_notebook_change(&ids, "create_pdf_markdown", || Ok(create_sibling()))
+                .map_err(|error| error.to_string())??
+        };
+        refresh_notebook_note_index(&memo_file, &target);
+        // The V2 index refresh above is backend-only; the sidebar memo list
+        // reloads on path-note-changed and the file tree on
+        // file-management-changed. Without both, new notes stay invisible
+        // until the notebook is reopened.
+        if let Ok(Some((notebook_id, _))) = notebook_note_address(&memo_file, &target) {
+            let notebook_path = memo_file
+                .get_notebook_config_by_id(&notebook_id)
+                .map(|config| config.path.clone())
+                .unwrap_or_default();
+            tracing::info!(
+                notebook_id = %notebook_id,
+                target = %target.display(),
+                "pdf markdown created: emitting sidebar refresh events"
+            );
+            let _ = app.emit("flowix:path-note-changed", serde_json::json!({
+                "notebookId": notebook_id,
+                "relativePath": "",
+                "deleted": false,
+            }));
+            let _ = app.emit("file-management-changed", serde_json::json!({
+                "notebookId": notebook_id,
+                "notebookPath": notebook_path,
+            }));
+        } else {
+            tracing::warn!(
+                target = %target.display(),
+                "pdf markdown created outside a registered notebook: no sidebar events"
+            );
+        }
         Ok(target.to_string_lossy().into_owned())
     })
     .await?

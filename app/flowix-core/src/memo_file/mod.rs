@@ -31,6 +31,7 @@ pub const MEMO_ID_LENGTH: usize = 8;
 
 mod content;
 mod derivation;
+mod enex;
 mod file_management;
 mod file_io;
 pub(crate) mod frontmatter;
@@ -60,6 +61,10 @@ pub use derivation::{
     apply_derived_memo_fields, ensure_todo_ids_in_content, extract_agent_threads_from_body,
     extract_title_and_preview, extract_todos_from_body, normalize_search_tag_filter,
     normalize_tag_path, tag_path_matches_filter,
+};
+pub use enex::{
+    enml_to_markdown, parse_enex, EnexNote, EnexResource, ResolvedMedia, MAX_ENEX_NOTES,
+    MAX_ENEX_RESOURCE_BYTES,
 };
 pub use file_io::{
     atomic_create_bytes, atomic_write_bytes, filesystem_identity, rename_file_noclobber,
