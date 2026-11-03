@@ -840,18 +840,24 @@ pub async fn get_events(
 
     let token = bearer_token(&headers)
         .ok_or((StatusCode::UNAUTHORIZED, Json(RejectResponse { code: "UNAUTHORIZED" })))?;
-    let owned: std::collections::HashSet<String> =
-        state.store.agents_of_token(&token).into_iter().collect();
     let stream = tokio_stream::wrappers::BroadcastStream::new(state.events.subscribe())
-        .filter_map(move |item| {
-            let agent_id = item.ok()?;
-            if !owned.contains(&agent_id) {
-                return None;
+        .filter_map({
+            let state = std::sync::Arc::clone(&state);
+            let token = token.clone();
+            move |item| {
+                let agent_id = item.ok()?;
+                // 动态查归属：连接期间新注册/改绑的 agent 即时生效。此前
+                // 连接时快照 owned 集合，后加归属的事件被静默丢弃——客户端
+                // 只能靠重启订阅恢复（2026-11-03 实机：连接后新增归属的
+                // agent 收不到任何投递通知）。
+                if !state.store.token_owns_agent(&token, &agent_id) {
+                    return None;
+                }
+                Some(Ok::<_, std::convert::Infallible>(
+                    axum::response::sse::Event::default()
+                        .data(serde_json::json!({ "agentId": agent_id }).to_string()),
+                ))
             }
-            Some(Ok::<_, std::convert::Infallible>(
-                axum::response::sse::Event::default()
-                    .data(serde_json::json!({ "agentId": agent_id }).to_string()),
-            ))
         });
     let sse = axum::response::Sse::new(stream).keep_alive(
         axum::response::sse::KeepAlive::default().interval(std::time::Duration::from_secs(20)),
