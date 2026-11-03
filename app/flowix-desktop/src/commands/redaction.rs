@@ -381,8 +381,13 @@ pub async fn redaction_transmit(
 
 /// F5 入站：向中继注册本机 agent 收件通道，凭据写入 config。
 /// FD-11 v2：有中继账号时裸 slug 归一到 `username/slug` 并以账号 token 注册。
+/// 注册成功即重启 SSE 订阅——deviceToken 每次注册轮换，旧订阅连接的
+/// 凭据与 agent 列表即刻失效，不重启会静默收不到新信（2026-11-03 实机）。
 #[tauri::command]
-pub async fn redaction_inbox_register(agent_ids: Vec<String>) -> Result<RedactionConfig, String> {
+pub async fn redaction_inbox_register(
+    app_handle: tauri::AppHandle,
+    agent_ids: Vec<String>,
+) -> Result<RedactionConfig, String> {
     if agent_ids.is_empty() {
         return Err("AGENT_IDS_EMPTY".to_string());
     }
@@ -414,6 +419,7 @@ pub async fn redaction_inbox_register(agent_ids: Vec<String>) -> Result<Redactio
     config.registered_agents = agent_ids;
     let dir = redaction_dir()?;
     write_config_to(&dir, &config)?;
+    start_push_subscription(&app_handle, &config);
     Ok(config)
 }
 
@@ -889,15 +895,17 @@ fn start_push_subscription(app: &tauri::AppHandle, config: &RedactionConfig) {
     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let flag = running.clone();
     let relay_url = config.relay_url.clone();
-    let agents = config.registered_agents.clone();
     let app_handle = app.clone();
     let handle = tauri::async_runtime::spawn(async move {
         let mut backoff = std::time::Duration::from_secs(5);
         while flag.load(std::sync::atomic::Ordering::SeqCst) {
-            match subscribe_once(&relay_url, &token, &agents, &app_handle, &flag).await {
+            match subscribe_once(&relay_url, &token, &app_handle, &flag).await {
                 Ok(()) => return,
                 Err(_) => {
-                    // 断线重连（退避封顶 60s）；错误不打断订阅生命周期。
+                    // 断线先兜底拉取一次：连接死亡到重连之间的窗口内漏掉
+                    // 的 SSE 事件无人补发，此处 poll 把窗口期的信拉回，
+                    // 防滞留。之后退避重连（封顶 60s）；错误不打断订阅。
+                    poll_and_inject(&app_handle, PollSource::Fallback).await;
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
                 }
@@ -910,7 +918,6 @@ fn start_push_subscription(app: &tauri::AppHandle, config: &RedactionConfig) {
 async fn subscribe_once(
     relay_url: &str,
     token: &str,
-    agents: &[String],
     app: &tauri::AppHandle,
     flag: &std::sync::atomic::AtomicBool,
 ) -> Result<(), String> {
@@ -918,7 +925,12 @@ async fn subscribe_once(
     use tauri::Emitter as _;
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(600))
+        // 空闲超时而非总超时：SSE 是长连接，服务端 keep-alive 20s 心跳，
+        // 75s 无字节必为死链（半开/NAT 静默断）。此前用 600s 总超时把活
+        // 连接每 10 分钟杀一次，超时与重连之间的窗口会漏投递事件，漏掉
+        // 的信滞留信箱直到下一个事件才被拉走（2026-11-03 实机：20:55
+        // 取件正常、21:05 同链路投递零反应，恰处重建窗口）。
+        .read_timeout(std::time::Duration::from_secs(75))
         .no_proxy() // 自建中继直连（同 relay-client account.rs 实机诊断结论）
         .build()
         .map_err(|e| format!("PUSH_CLIENT_INIT_FAILED: {e}"))?;
@@ -951,7 +963,16 @@ async fn subscribe_once(
                 let Some(agent_id) = value.get("agentId").and_then(|v| v.as_str()) else {
                     continue;
                 };
-                if agents.iter().any(|agent| agent == agent_id) {
+                // 动态读当前注册列表：服务端 /v2/events 本就按 token 归属
+                // 全推，此处本地闸在事件到达时判断——订阅连接期间新增/
+                // 移除收件 agent 即时生效（2026-11-03 实机：新增 rop/tuning
+                // 后旧连接的固化列表收不到事件，新信滞留信箱直到重启）。
+                let registered = load_config()
+                    .map(|config| {
+                        config.registered_agents.iter().any(|agent| agent == agent_id)
+                    })
+                    .unwrap_or(false);
+                if registered {
                     let _ = app.emit("redaction-inbound", serde_json::json!({ "agentId": agent_id }));
                     // FD-12 M3：Rust 侧直接拉取并尝试回程注入——
                     // 前端 emit 保留（收件箱面板自动刷新照旧）。
