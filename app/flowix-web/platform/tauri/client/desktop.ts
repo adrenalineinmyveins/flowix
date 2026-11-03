@@ -209,6 +209,10 @@ export const files = {
   read: (filePath: string, spacePath?: string) => invoke<string | null>('read_file', { filePath, spacePath }),
   readDocxFile: (filePath: string, spacePath?: string) =>
     invoke<string>('read_docx_file', { filePath, spacePath }),
+  readPdfFile: (filePath: string, spacePath?: string) =>
+    invoke<string>('read_pdf_file', { filePath, spacePath }),
+  createPdfMarkdown: (filePath: string, spacePath: string, content: string) =>
+    invoke<string>('create_pdf_markdown', { filePath, spacePath, content }),
   createDocxMarkdown: (filePath: string, spacePath: string, content: string, images: DocxMarkdownImage[] = []) =>
     invoke<string>('create_docx_markdown', { filePath, spacePath, content, images }),
   readImage: (filePath: string, spacePath?: string) => invoke<string | null>('read_image_file', { filePath, spacePath }),

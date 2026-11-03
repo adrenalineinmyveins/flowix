@@ -34,7 +34,7 @@ function externalSurface(
   transitionId: number,
 ): WorkColumnSurface {
   const filePath = kind === 'image-file' ? '/notebook/photo.png'
-    : kind === 'video-file' ? '/notebook/movie.mp4' : '/notebook/report.pdf';
+    : kind === 'video-file' ? '/notebook/movie.mp4' : '/notebook/archive.zip';
   const base = {
     instanceKey: `${kind}:${filePath}`,
     fileIdentity: { path: filePath, displayId: `display:${filePath}` },
@@ -81,7 +81,7 @@ describe('work column external-file transition completion', () => {
         await act(async () => root.render(<WorkColumnSurfaceHost surface={externalSurface(kind, 12)} />));
         expect(useDocumentStore.getState().isDocumentTransitioning).toBe(false);
         if (kind === 'unavailable-file') {
-          expect(element.querySelector('[data-file-path]')?.getAttribute('data-file-path')).toBe('/notebook/report.pdf');
+          expect(element.querySelector('[data-file-path]')?.getAttribute('data-file-path')).toBe('/notebook/archive.zip');
           expect(element.querySelector('[data-open-folder]')?.getAttribute('data-open-folder')).toBe('true');
         }
       } finally {

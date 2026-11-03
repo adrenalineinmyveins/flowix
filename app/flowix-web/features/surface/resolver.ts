@@ -65,6 +65,8 @@ function resolveExternalDocumentSurface(
       return { kind: 'csv-file', instanceKey, fileIdentity, scopePath, transitionId: document.documentProps.transitionId };
     case 'docx':
       return { kind: 'unavailable-file', instanceKey, fileIdentity, scopePath, props: document.documentProps };
+    case 'pdf':
+      return { kind: 'unavailable-file', instanceKey, fileIdentity, scopePath, props: document.documentProps };
     case 'unavailable':
       return { kind: 'unavailable-file', instanceKey, fileIdentity, scopePath, props: document.documentProps };
   }

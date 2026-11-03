@@ -41,7 +41,7 @@ export function CodeSurfaceFileBrowser({ surface }: { surface: CodeSurface }) {
       const current = useWorkColumnStore.getState().navigation;
       if (current.phase === 'loading' || current.target.kind !== 'external' || current.target.path !== target.path) return;
       const fileKind = externalFileViewKind(path);
-      if (fileKind === 'unavailable' || fileKind === 'docx') {
+      if (fileKind === 'unavailable' || fileKind === 'docx' || fileKind === 'pdf') {
         await openBrowserColumnTarget({
           ...context,
           kind: 'file-browser',

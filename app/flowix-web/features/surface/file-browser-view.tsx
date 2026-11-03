@@ -1,8 +1,9 @@
 import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
-import { ArrowLeft, ChevronRight, MoreHorizontal, Trash2 } from 'lucide-react';
+import { ArrowLeft, ChevronRight, FileDown, MoreHorizontal, Trash2 } from 'lucide-react';
 import { CaretDownIcon, FolderSimpleIcon, PlusIcon } from '@phosphor-icons/react';
 import { FolderFileTree } from '@features/memo/components/folder-file-tree';
 import { useFolderTree } from '@features/memo/components/use-folder-tree';
+import { runBatchConvert } from '@features/document/components/pdf-batch-convert';
 import { useNoteStore } from '@features/memo/store';
 import type { FileBrowserContext } from '@features/workspace/store/file-browser-target';
 import { useAgentAccessStore } from '@features/agent/store/agent-access-store';
@@ -425,6 +426,11 @@ export function FileBrowserView({ surface: input }: { surface: FileBrowserViewSu
     }
   }, [currentPath, t]);
 
+  const handleBatchConvert = useCallback(() => {
+    if (!root || !input.scopePath) return;
+    void runBatchConvert(root, input.scopePath, t);
+  }, [root, input.scopePath, t]);
+
   const handleOpenWithDefaultApp = useCallback(() => {
     void openPath(currentPath).catch(() => {
       toast.error(t('memo.fileTree.openFailed'));
@@ -513,6 +519,13 @@ export function FileBrowserView({ surface: input }: { surface: FileBrowserViewSu
               className="h-7 items-center justify-start rounded-lg px-2 py-0 text-left text-sm hover:bg-[var(--brand)] hover:text-[var(--primary-foreground)]"
             >
               {t('memo.fileTree.openDefaultApp')}
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              onClick={handleBatchConvert}
+              className="h-7 items-center justify-start gap-2 rounded-lg px-2 py-0 text-left text-sm hover:bg-[var(--brand)] hover:text-[var(--primary-foreground)]"
+            >
+              <FileDown className="h-3.5 w-3.5" aria-hidden="true" />
+              {t('pdf.batch.convert')}
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>

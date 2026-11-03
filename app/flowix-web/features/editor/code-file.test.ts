@@ -30,9 +30,9 @@ describe('code file classification', () => {
     expect(fileExtension('/src/.env')).toBe('');
   });
 
-  it('routes PDF files to the unavailable external-file view', () => {
+  it('routes PDF files to the dedicated preview view', () => {
     expect(resourceKindFromPath('/notebook/report.PDF')).toBe('other');
-    expect(externalFileViewKind('/notebook/report.PDF')).toBe('unavailable');
+    expect(externalFileViewKind('/notebook/report.PDF')).toBe('pdf');
   });
 
   it('classifies common image files for direct preview', () => {

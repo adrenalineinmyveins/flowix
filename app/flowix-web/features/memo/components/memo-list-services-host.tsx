@@ -48,7 +48,9 @@ import { openExternalTarget } from '@features/workspace/use-cases/workspace-navi
 import { documentIdentityFromFile, flushWorkspaceDocumentPath } from '@features/document/public/workspace-api';
 import { ensureFileDisplayIdentity } from '@/lib/file-display-registry';
 import {
+  FLOWIX_EXTERNAL_ENEX_IMPORT_EVENT,
   FLOWIX_EXTERNAL_MARKDOWN_OPEN_EVENT,
+  type ExternalEnexImportRequest,
   type ExternalMarkdownOpenRequest,
 } from '@platform/open-target/types';
 
@@ -261,6 +263,113 @@ function ExternalMarkdownOpenDialog() {
           </button>
           <button type="button" onClick={() => void open()} disabled={opening || !notebookId} className="h-8 rounded-lg bg-[var(--primary)] px-4 text-sm text-[var(--primary-foreground)] disabled:opacity-50">
             {opening ? t('memo.externalOpen.opening') : t('memo.externalOpen.save')}
+          </button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/**
+ * 拖入 .enex（Evernote 交换格式）后的导入对话框：选笔记本 → 整包批量建笔记。
+ */
+function ExternalEnexImportDialog() {
+  const { t } = useI18n();
+  const selectedNotebook = useNoteStore((state) => state.selectedNotebook);
+  const notebooks = useNoteStore((state) => state.notebooks);
+  const [request, setRequest] = useState<ExternalEnexImportRequest | null>(null);
+  const [notebookId, setNotebookId] = useState('');
+  const [importing, setImporting] = useState(false);
+
+  useEffect(() => {
+    const onRequest = (next: ExternalEnexImportRequest) => {
+      if (!next?.filePaths?.length) return;
+      setRequest(next);
+      setNotebookId((current) => current || selectedNotebook?.id || notebooks[0]?.id || '');
+    };
+    const onWindowRequest = (event: Event) => {
+      onRequest((event as CustomEvent<ExternalEnexImportRequest>).detail);
+    };
+    window.addEventListener(FLOWIX_EXTERNAL_ENEX_IMPORT_EVENT, onWindowRequest);
+    return () => {
+      window.removeEventListener(FLOWIX_EXTERNAL_ENEX_IMPORT_EVENT, onWindowRequest);
+    };
+  }, [notebooks, selectedNotebook?.id]);
+
+  useEffect(() => {
+    if (!request) return;
+    setNotebookId((current) => (
+      notebooks.some((notebook) => notebook.id === current)
+        ? current
+        : selectedNotebook?.id || notebooks[0]?.id || ''
+    ));
+  }, [notebooks, request, selectedNotebook?.id]);
+
+  const close = useCallback(() => {
+    if (!importing) setRequest(null);
+  }, [importing]);
+
+  const runImport = useCallback(async () => {
+    if (!request || !notebookId) return;
+    setImporting(true);
+    let imported = 0;
+    let failed = 0;
+    try {
+      for (const filePath of request.filePaths) {
+        const result = await notes.importEnex(filePath, notebookId);
+        imported += result.importedNotes;
+        failed += result.failedNotes;
+      }
+      await useNoteStore.getState().loadNotes({ notebookId });
+      setRequest(null);
+      if (failed > 0) {
+        toast.warning(t('memo.enexImport.partial', { imported, failed }));
+      } else {
+        toast.success(t('memo.enexImport.success', { count: imported }));
+      }
+    } catch (error) {
+      toast.error(`${t('memo.enexImport.failed')}: ${String(error)}`);
+    } finally {
+      setImporting(false);
+    }
+  }, [notebookId, request, t]);
+
+  const filenames = request?.filePaths.map((path) => path.split(/[\\/]/).pop() || path) ?? [];
+  return (
+    <Dialog open={!!request} onOpenChange={(openState) => !openState && close()}>
+      <DialogContent showCloseButton={!importing}>
+        <DialogHeader>
+          <DialogTitle>{t('memo.enexImport.title')}</DialogTitle>
+          <DialogDescription>{t('memo.enexImport.description')}</DialogDescription>
+        </DialogHeader>
+        <div className="mt-3 max-h-24 overflow-auto rounded-lg border border-[var(--border)] px-3 py-2 text-xs text-[var(--muted-foreground)]">
+          {filenames.map((filename) => <div key={filename} className="truncate">{filename}</div>)}
+        </div>
+        <label className="mt-4 block text-sm text-[var(--foreground)]">
+          {t('memo.enexImport.saveTo')}
+          <Select
+            value={notebookId}
+            onValueChange={setNotebookId}
+            disabled={importing}
+          >
+            <SelectTrigger className="mt-2 w-full">
+              <span className="min-w-0 flex-1 truncate text-left">
+                {notebooks.find((notebook) => notebook.id === notebookId)?.name ?? ''}
+              </span>
+            </SelectTrigger>
+            <SelectContent align="start" className="flowix-preferences-select-content w-72 max-w-[calc(100vw-2rem)]">
+              {notebooks.map((notebook) => (
+                <SelectItem key={notebook.id} value={notebook.id}>{notebook.name}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </label>
+        <div className="mt-5 flex justify-end gap-2">
+          <button type="button" onClick={close} disabled={importing} className="h-8 rounded-lg px-3 text-sm hover:bg-[var(--muted)]">
+            {t('dialog.cancel')}
+          </button>
+          <button type="button" onClick={() => void runImport()} disabled={importing || !notebookId} className="h-8 rounded-lg bg-[var(--primary)] px-4 text-sm text-[var(--primary-foreground)] disabled:opacity-50">
+            {importing ? t('memo.enexImport.importing') : t('memo.enexImport.import')}
           </button>
         </div>
       </DialogContent>
@@ -882,6 +991,7 @@ export function MemoListServicesHost({
         </div>
       )}
       <ExternalMarkdownOpenDialog />
+      <ExternalEnexImportDialog />
 
       {cloudImporting && (
         <BlockingOperationStatus

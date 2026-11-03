@@ -38,6 +38,14 @@ export interface CreatedNoteDocument {
   entry: NoteEntry;
 }
 
+export interface EnexImportResult {
+  notebookId: string;
+  parentRelativePath: string;
+  importedNotes: number;
+  failedNotes: number;
+  attachments: number;
+}
+
 export interface MarkdownLocation {
   path: string;
   notebookId: string | null;
@@ -137,6 +145,8 @@ export const notes = {
   deleteTemplate: (templateId: string) => invoke<boolean>('delete_memo_template', { templateId }),
   importDocument: (filePath: string, content: string, notebookId: string) =>
     invoke<CreatedNoteDocument>('import_external_document_by_path', { filePath, content, notebookId }),
+  importEnex: (filePath: string, notebookId: string) =>
+    invoke<EnexImportResult>('import_enex_file', { filePath, notebookId }),
   listVersions: (notebookId: string, relativePath: string) =>
     invoke<PathVersionMeta[]>('list_path_versions', { notebookId, relativePath }),
   listArchives: () => invoke<PathArchiveSummary[]>('list_local_path_archives'),

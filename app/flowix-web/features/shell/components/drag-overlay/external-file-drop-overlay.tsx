@@ -10,6 +10,10 @@ import {
   openBrowserColumnDroppedFile,
   openExternalTarget,
 } from '@features/workspace/public/shell-api';
+import {
+  FLOWIX_EXTERNAL_ENEX_IMPORT_EVENT,
+  type ExternalEnexImportRequest,
+} from '@platform/open-target/types';
 import { FullscreenDragOverlay } from './fullscreen-drag-overlay';
 
 const logger = createLogger('external-file-drop-overlay');
@@ -22,7 +26,15 @@ export function ExternalFileDropOverlay() {
   }, []);
   const handleDropPaths = useCallback(async (paths: string[], destination?: 'main-third' | 'browser-column') => {
     if (paths.length === 0) return;
-    for (const path of paths) {
+    // ENEX（Evernote 交换格式）整包导入走独立对话框：选笔记本后批量建笔记。
+    const enexPaths = paths.filter((path) => /\.enex$/i.test(path));
+    const otherPaths = enexPaths.length === 0 ? paths : paths.filter((path) => !/\.enex$/i.test(path));
+    if (enexPaths.length > 0) {
+      window.dispatchEvent(new CustomEvent<ExternalEnexImportRequest>(FLOWIX_EXTERNAL_ENEX_IMPORT_EVENT, {
+        detail: { filePaths: enexPaths },
+      }));
+    }
+    for (const path of otherPaths) {
       if (destination === 'browser-column') {
         await openBrowserColumnDroppedFile(path);
       } else {

@@ -16,6 +16,7 @@ import { normalizePluginArtifactRenderer, type PluginArtifactRendererId } from '
 import { extractFrontmatter } from '@features/document/properties/frontmatter-model';
 import { DocumentContainer, UnavailableFileView } from '@features/document/components/document-container';
 import { DocxPreview } from '@features/document/components/docx-preview';
+import { PdfPreview } from '@features/document/components/pdf-preview';
 import { CsvPreview } from '@features/document/components/csv-preview';
 import { useDocumentStore } from '@features/document/store/document-store';
 import { documentIdentityFromFile } from '@features/document/store/document-identity';
@@ -195,6 +196,9 @@ function UnavailableFileSurfaceView({ surface }: { surface: UnavailableFileSurfa
   );
   if (baseFileKind === 'docx') {
     return <DocxPreview filePath={filePath} scopePath={surface.scopePath} />;
+  }
+  if (baseFileKind === 'pdf') {
+    return <PdfPreview filePath={filePath} scopePath={surface.scopePath} />;
   }
   if (baseFileKind === 'csv') {
     return <CsvPreview filePath={filePath} scopePath={surface.scopePath} />;
