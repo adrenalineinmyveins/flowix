@@ -1262,6 +1262,8 @@ const zhCN = {
     "agent.profile.toolsHint": "memo / consult_remote 等",
     "agent.profile.skills": "Skills",
     "agent.profile.skillsHint": "skill / plugin 引用",
+    "agent.profile.skillsPick": "从已有技能添加…",
+    "agent.profile.skillsEmpty": "暂无可选技能",
     "agent.profile.listPlaceholder": "输入后回车添加",
     "agent.profile.metadata": "Metadata（每行 key=value）",
     "agent.profile.metadataHint": "自由键值",

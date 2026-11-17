@@ -1285,6 +1285,8 @@ const enUS: Record<keyof typeof zhCN, string> = {
     "agent.profile.toolsHint": "memo / consult_remote …",
     "agent.profile.skills": "Skills",
     "agent.profile.skillsHint": "skill / plugin references",
+    "agent.profile.skillsPick": "Add from installed skills…",
+    "agent.profile.skillsEmpty": "No selectable skills",
     "agent.profile.listPlaceholder": "type and press Enter",
     "agent.profile.metadata": "Metadata (key=value per line)",
     "agent.profile.metadataHint": "free-form key-values",

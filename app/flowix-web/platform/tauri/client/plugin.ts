@@ -1,6 +1,22 @@
 import { subscribe, type SubscribeOptions } from '@platform/tauri/event-bus';
+import { invoke } from '@tauri-apps/api/core';
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import type { PluginRunEvent } from './desktop';
+
+/** F3 技能注册表条目（commands/skill.rs skill_registry_list）。 */
+export interface SkillDescriptor {
+  source: string;
+  id: string;
+  displayName: string;
+  description: string;
+  kind: string;
+  publishState: string;
+  enabled: boolean;
+}
+
+export function skillRegistryList(cwd?: string): Promise<SkillDescriptor[]> {
+  return invoke<SkillDescriptor[]>('skill_registry_list', { cwd });
+}
 
 export function listenToPluginRuns(
   handler: (event: PluginRunEvent) => void,

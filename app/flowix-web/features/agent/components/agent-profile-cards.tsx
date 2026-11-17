@@ -3,7 +3,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { BookmarkCheck, Bot, Fingerprint, Inbox, Loader2, Plus, Save, Store, Trash2, X } from 'lucide-react';
 
-import { agentProfile, market, redaction } from '@platform/tauri/client';
+import { agentProfile, market, redaction, skillRegistryList } from '@platform/tauri/client';
+import type { SkillDescriptor } from '@platform/tauri/client';
 import type { MarketMyCard, SubscribedCard } from '@platform/tauri/client';
 import type { RelayAccountInfo } from '@/lib/types/redaction';
 import { toast } from '@/lib/toast';
@@ -128,6 +129,69 @@ function ChipRow({ items, onRemove }: { items: string[]; onRemove: (item: string
           </button>
         </span>
       ))}
+    </div>
+  );
+}
+
+/** AGENT-SKILLS：skills 选择式编辑器——下拉从技能注册表挑选（免手写
+ * id），手输框兜底未注册引用；结构与 MemoryEditor 同构。 */
+function SkillsEditor({
+  items,
+  onChange,
+  skills,
+  pickLabel,
+  manualPlaceholder,
+  emptyLabel,
+}: {
+  items: string[];
+  onChange: (items: string[]) => void;
+  skills: SkillDescriptor[];
+  pickLabel: string;
+  manualPlaceholder?: string;
+  emptyLabel?: string;
+}) {
+  const [draft, setDraft] = useState('');
+  const commit = () => {
+    if (!draft.trim()) return;
+    onChange(appendItem(items, draft.trim()));
+    setDraft('');
+  };
+  const selected = new Set(items);
+  const addable = skills.filter((skill) => skill.enabled && !selected.has(skill.id));
+  return (
+    <div className="space-y-2">
+      <ChipRow items={items} onRemove={(item) => onChange(items.filter((value) => value !== item))} />
+      <div className="flex gap-2">
+        <select
+          className={cn(inputClass, 'py-0 flex-1')}
+          value=""
+          onChange={(event) => {
+            const id = event.target.value;
+            if (id) onChange(appendItem(items, id));
+          }}
+          disabled={addable.length === 0}
+        >
+          <option value="">{addable.length === 0 ? (emptyLabel ?? pickLabel) : pickLabel}</option>
+          {addable.map((skill) => (
+            <option key={skill.id} value={skill.id}>
+              {skill.displayName}（{skill.id}）
+            </option>
+          ))}
+        </select>
+        <input
+          className={inputClass}
+          value={draft}
+          placeholder={manualPlaceholder}
+          onChange={(event) => setDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') {
+              event.preventDefault();
+              commit();
+            }
+          }}
+          onBlur={commit}
+        />
+      </div>
     </div>
   );
 }
@@ -600,6 +664,21 @@ export function AgentProfileEditor({ notebookPath }: { notebookPath: string }) {
   // 记忆库下拉数据源：全部已注册笔记本（整本作为记忆源）。
   const notebooks = useNoteStore((state) => state.notebooks);
 
+  // AGENT-SKILLS：技能注册表（插件 + 笔记本 .agents/skills 工作区技能；
+  // 加载失败退化为纯手输）。
+  const [skillOptions, setSkillOptions] = useState<SkillDescriptor[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    skillRegistryList(notebookPath)
+      .then((skills) => {
+        if (!cancelled) setSkillOptions(skills);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [notebookPath]);
+
   // 加载选中身份卡（含本地运行状态）。
   useEffect(() => {
     disposedRef.current = false;
@@ -930,10 +1009,13 @@ export function AgentProfileEditor({ notebookPath }: { notebookPath: string }) {
                     />
                   </Field>
                   <Field label={t('agent.profile.skills')} hint={t('agent.profile.skillsHint')}>
-                    <ChipsEditor
+                    <SkillsEditor
                       items={form.skills}
                       onChange={(skills) => patchForm({ skills })}
-                      placeholder={t('agent.profile.listPlaceholder')}
+                      skills={skillOptions}
+                      pickLabel={t('agent.profile.skillsPick')}
+                      manualPlaceholder={t('agent.profile.listPlaceholder')}
+                      emptyLabel={t('agent.profile.skillsEmpty')}
                     />
                   </Field>
                 </div>
