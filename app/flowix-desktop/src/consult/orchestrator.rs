@@ -186,6 +186,55 @@ pub fn extract_askback(answer: &str) -> Option<String> {
 }
 
 const MAX_ASKBACKS: usize = 3;
+const MAX_NUDGES: usize = 2;
+
+/// AGENT-SKILLS P3：预告式半截回答判定——很短且以过渡语开头（「我先…」
+/// 式），或以冒号收尾的清单引入。正常短回答（如「1+1 等于 2。」）不以
+/// 过渡语开头，不会误伤。
+fn looks_like_preamble(answer: &str) -> bool {
+    let trimmed = answer.trim();
+    let char_count = trimmed.chars().count();
+    if char_count >= 80 {
+        return false;
+    }
+    let transitions = [
+        "我先",
+        "我来",
+        "让我",
+        "接下来",
+        "现在开始",
+        "我打算",
+        "我先去",
+        "首先，我",
+    ];
+    transitions.iter().any(|prefix| trimmed.starts_with(prefix))
+        || trimmed.ends_with('：')
+        || trimmed.ends_with(':')
+}
+
+#[cfg(test)]
+mod preamble_tests {
+    use super::looks_like_preamble;
+
+    #[test]
+    fn detects_preamble_transitions_and_colon_endings() {
+        // 实机两轮复现的原文形态。
+        assert!(looks_like_preamble("我先找到这篇笔记。"));
+        assert!(looks_like_preamble("我先定位「内部代号备忘」这篇笔记。"));
+        assert!(looks_like_preamble("我先检查自己的记忆来源，确认是否已有相关材料。"));
+        assert!(looks_like_preamble("接下来分三步："));
+    }
+
+    #[test]
+    fn normal_answers_are_not_flagged() {
+        assert!(!looks_like_preamble("1+1 等于 2。"));
+        assert!(!looks_like_preamble("已修改：内部代号备忘.md 中共 1 处「12 月 9 日」改为「12 月 19 日」。"));
+        // 长回答即使以过渡语开头也不算预告（<80 字符才检测）。
+        let long = format!("我先{}——以下是完整分析：{}", "梳理了三个方向", "第一步定位现象，第二步复现路径，第三步隔离变量，第四步验证假设，第五步固化回归用例；每一步都附带了具体命令与判定标准，结论是第三个假设成立。".repeat(2));
+        assert!(!looks_like_preamble(&long));
+        assert!(!looks_like_preamble(""));
+    }
+}
 const ASKBACK_TIMEOUT_SECS: u64 = 120;
 
 /// 消费一个 Pending 咨询。由 `consult_initiate` spawn 的 task 调用；
@@ -249,7 +298,26 @@ pub async fn orchestrate(app: &AppHandle, notebook_root: &Path, mut meta: Consul
                 let _ = crate::commands::agent_profile::write_state(notebook_root, &expert_state);
             }
             let updated = finish(&meta, ConsultStatus::Completed);
-            let event = ConsultEvent::Result { answer, artifact_suggestion: None };
+            // AGENT-SKILLS P2：Result 事件携带注入命中的技能（咨询方与
+            // events.jsonl 回流口径）+ skill-usage 远程归因（token 按命中
+            // 数均摊；无命中不记）。
+            if !updated.applied_skills.is_empty() {
+                let per_skill = updated.tokens_used / updated.applied_skills.len() as u64;
+                for skill_id in &updated.applied_skills {
+                    crate::skill_registry::record_usage_sourced(
+                        skill_id,
+                        true,
+                        per_skill,
+                        "consult",
+                        Some(&updated.to_agent_id),
+                    );
+                }
+            }
+            let event = ConsultEvent::Result {
+                answer,
+                artifact_suggestion: None,
+                applied_skills: updated.applied_skills.clone(),
+            };
             push_event(&updated.consult_id, event.clone());
             append_consult_log(notebook_root, &updated, &event);
         }
@@ -334,6 +402,7 @@ async fn run_consult_cycle(
     // 3. 轮询：预算 + 完成 + 反问。
     let mut guard = BudgetGuard::new(meta.token_budget);
     let mut askbacks = 0usize;
+    let mut nudges = 0usize;
     let mut last_answer: Option<String> = None;
     let mut tick: u32 = 0;
     let deadline = tokio::time::Instant::now()
@@ -408,6 +477,21 @@ async fn run_consult_cycle(
                     host,
                     &child_id,
                     "咨询方未答复，请基于现有信息作答。",
+                )
+                .await;
+                last_answer = None;
+                continue;
+            }
+            // AGENT-SKILLS P3：预告式半截回答检测——模型只输出「我先…」
+            // 过渡文本未实际执行，stable 判定即收割（2026-11-12 实机两轮
+            // 复现）。催促一轮继续执行；上限防循环。
+            if looks_like_preamble(&answer) && nudges < MAX_NUDGES {
+                nudges += 1;
+                tracing::info!(consult_id = %meta.consult_id, "preamble answer detected; nudging");
+                let _ = send_followup(
+                    host,
+                    &child_id,
+                    "你刚才只输出了预告。请立即在同一轮内完成全部检索与操作，然后给出完整最终回答；不要再输出计划。",
                 )
                 .await;
                 last_answer = None;

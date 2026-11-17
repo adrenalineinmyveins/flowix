@@ -1321,12 +1321,12 @@ async fn run_auto_answer(
             return Err("AUTO_ANSWER_TIMEOUT".into());
         }
         let events = crate::consult::events_after(&meta.consult_id, last_seq);
-        let mut answer: Option<String> = None;
+        let mut answer: Option<(String, Vec<String>)> = None;
         for (seq, event) in events {
             last_seq = last_seq.max(seq);
             match event {
-                crate::consult::ConsultEvent::Result { answer: text, .. } => {
-                    answer = Some(text);
+                crate::consult::ConsultEvent::Result { answer: text, applied_skills, .. } => {
+                    answer = Some((text, applied_skills));
                 }
                 crate::consult::ConsultEvent::Askback { .. } => {
                     // 反问无法自动答复：终止（record 已 Accepted，答案由
@@ -1339,8 +1339,16 @@ async fn run_auto_answer(
                 _ => {}
             }
         }
-        if let Some(text) = answer {
-            break text;
+        if let Some((text, applied_skills)) = answer {
+            // AGENT-SKILLS P2：元数据以文本标注回流（wire 信封是签名契约
+            // 不可加字段）——标注行随答案一起进蒸馏管线，咨询方在回答
+            // 文本内直接可见；技能 id 为 slug，无脱敏面。
+            let annotated = if applied_skills.is_empty() {
+                text
+            } else {
+                format!("{text}\n\n---\n[已应用技能：{}]", applied_skills.join("、"))
+            };
+            break annotated;
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     };

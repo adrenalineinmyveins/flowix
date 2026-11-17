@@ -46,6 +46,32 @@ pub fn list_skills() -> Result<Vec<SkillDescriptor>, String> {
     Ok(result)
 }
 
+/// AGENT-SKILLS：带笔记本工作区聚合的技能清单——`cwd`（笔记本根目录）
+/// 有值时并入 `.agents/skills/` 下的 workspace 技能（与 DSH 会话实际
+/// 加载的技能同源）。插件技能优先，workspace 项按 id 去重。
+pub fn list_skills_with_workspace(cwd: Option<&std::path::Path>) -> Result<Vec<SkillDescriptor>, String> {
+    let mut result = list_skills()?;
+    if let Some(root) = cwd {
+        for skill in crate::commands::agent::notebook_agents::notebook_agent_skills_read(
+            root.to_string_lossy().to_string(),
+        )? {
+            if result.iter().any(|item| item.id == skill.id) {
+                continue;
+            }
+            result.push(SkillDescriptor {
+                source: "workspace".into(),
+                id: skill.id,
+                display_name: skill.name,
+                description: skill.description.chars().take(200).collect(),
+                kind: "agent-markdown".into(),
+                publish_state: "private".into(),
+                enabled: skill.enabled,
+            });
+        }
+    }
+    Ok(result)
+}
+
 fn list_dsh_skills() -> Vec<SkillDescriptor> {
     Vec::new()
 }
@@ -108,6 +134,19 @@ pub fn usage_summary(skill_id: Option<&str>) -> Result<Vec<SkillUsageSummary>, S
 
 /// 记录一次技能调用（`plugin-run` 事件埋点调用）。
 pub fn record_usage(skill_id: &str, ok: bool, tokens_used: u64) {
+    record_usage_sourced(skill_id, ok, tokens_used, "plugin", None);
+}
+
+/// AGENT-SKILLS P2：带来源与归因 agent 的调用记录——`source` =
+/// "plugin"（本地插件运行）| "consult"（远程咨询注入应用）；`agent_id`
+/// 为 consult 场景下被咨询的 agent（本地插件运行时 None）。
+pub fn record_usage_sourced(
+    skill_id: &str,
+    ok: bool,
+    tokens_used: u64,
+    source: &str,
+    agent_id: Option<&str>,
+) {
     let Some(path) = skill_usage_path() else {
         return;
     };
@@ -116,8 +155,8 @@ pub fn record_usage(skill_id: &str, ok: bool, tokens_used: u64) {
     let line = serde_json::json!({
         "ts": chrono::Utc::now().timestamp_millis(),
         "skillId": skill_id,
-        "source": "plugin",
-        "agentId": null,
+        "source": source,
+        "agentId": agent_id,
         "ok": ok,
         "tokensUsed": tokens_used,
         "truncated": false,
@@ -142,10 +181,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn workspace_skills_are_merged_and_deduped() {
+        // 临时笔记本：.agents/skills/pdf-export/SKILL.md（workspace 技能）。
+        let temp = tempfile::tempdir().unwrap();
+        let skill_dir = temp.path().join(".agents").join("skills").join("pdf-export");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: pdf-export\ndisplay-name: PDF 导出\ndescription: 按规范导出 PDF\n---\n# 正文",
+        )
+        .unwrap();
+
+        // 有 cwd：workspace 项并入（插件技能仍在前）。
+        let merged = list_skills_with_workspace(Some(temp.path())).unwrap();
+        let workspace: Vec<_> = merged.iter().filter(|item| item.source == "workspace").collect();
+        assert_eq!(workspace.len(), 1, "{merged:?}");
+        assert_eq!(workspace[0].id, "pdf-export");
+        assert_eq!(workspace[0].display_name, "PDF 导出");
+        assert!(workspace[0].enabled);
+        assert_eq!(workspace[0].kind, "agent-markdown");
+        // 插件技能仍在（全局注册表至少含内置插件）。
+        assert!(merged.iter().any(|item| item.source == "plugin"));
+
+        // 无 cwd：不并入 workspace 项（旧调用方语义不变）。
+        let plugins_only = list_skills_with_workspace(None).unwrap();
+        assert!(!plugins_only.iter().any(|item| item.source == "workspace"));
+    }
+
+    #[test]
     fn usage_summary_empty_when_no_file() {
-        // 无文件时返回空，不报错。
+        // 无文件时返回空，不报错。本机可能存在真实用量文件（P2 起
+        // consult 归因落此）：空断言仅在无文件时成立，降级不报错恒验证。
         let result = usage_summary(None).unwrap();
-        assert!(result.is_empty());
+        let file_exists = skill_usage_path().is_some_and(|path| path.exists());
+        if !file_exists {
+            assert!(result.is_empty());
+        }
     }
 
     #[test]
