@@ -361,10 +361,10 @@ fn build_skills_block(
     }
 }
 
-/// 解析技能块：候选 = 插件注册表（设备级）+ 笔记本 `.agents/skills/`
-/// workspace 技能（`notebook_root` 有值时；与 Skills 下拉同源——下拉可选
-/// 即注入可生效，两侧必须一致）。任一来源不可用则降级为该来源为空——
-/// skills 注入是增强，不阻塞咨询。
+/// 解析技能块：候选 = 插件注册表（设备级）+ **全部注册笔记本**的
+/// `.agents/skills/` workspace 技能（`notebook_root` 所在笔记本优先；与
+/// Skills 下拉同源——下拉可选即注入可生效）。任一来源不可用则降级为
+/// 该来源为空——skills 注入是增强，不阻塞咨询。
 fn resolve_skills_block(
     skill_ids: &[String],
     notebook_root: Option<&Path>,
@@ -380,19 +380,11 @@ fn resolve_skills_block(
             )
         }));
     }
-    if let Some(root) = notebook_root {
-        if let Ok(skills) =
-            crate::commands::agent::notebook_agents::notebook_agent_skills_read(
-                root.to_string_lossy().to_string(),
-            )
-        {
-            candidates.extend(
-                skills
-                    .into_iter()
-                    .map(|skill| (skill.id, skill.name, skill.body, skill.enabled)),
-            );
-        }
-    }
+    candidates.extend(
+        crate::skill_registry::workspace_skills(notebook_root)
+            .into_iter()
+            .map(|skill| (skill.id, skill.display_name, skill.body, skill.enabled)),
+    );
     build_skills_block(skill_ids, &candidates)
 }
 
@@ -501,7 +493,7 @@ pub fn initiate_consult(
     let root = notebook_root.to_path_buf();
     let meta_for_task = meta.clone();
     tauri::async_runtime::spawn(async move {
-        orchestrator::orchestrate(&app, &root, meta_for_task, prompt).await;
+        orchestrator::orchestrate(&app, &root, meta_for_task, prompt, question).await;
     });
     Ok(meta)
 }
@@ -570,13 +562,14 @@ mod tests {
     #[test]
     fn consult_prompt_injects_workspace_skills() {
         // 下拉与注入同源验证：笔记本 .agents/skills/<id>/SKILL.md 的
-        // workspace 技能，声明命中即注入正文。
+        // workspace 技能，声明命中即注入正文。id 用独特名，避免与真实
+        // 注册笔记本里的 workspace 技能（跨笔记本聚合）串味。
         let temp = tempfile::tempdir().unwrap();
-        let skill_dir = temp.path().join(".agents").join("skills").join("pdf-export");
+        let skill_dir = temp.path().join(".agents").join("skills").join("ws-unique-probe-77");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
             skill_dir.join("SKILL.md"),
-            "---\nname: pdf-export\ndisplay-name: PDF 导出\n---\n# PDF 导出方法论\n先确认源内容再整理大纲。",
+            "---\nname: ws-unique-probe-77\ndisplay-name: 唯一探针\n---\n# 探针方法论\n先确认源内容再整理大纲。",
         )
         .unwrap();
         let to = flowix_core::agent::AgentProfile {
@@ -591,19 +584,20 @@ mod tests {
             disclosure_scope: Vec::new(),
             system: String::new(),
             tools: Vec::new(),
-            skills: vec!["pdf-export".into()],
+            skills: vec!["ws-unique-probe-77".into()],
             metadata: Default::default(),
             memory: Vec::new(),
             created_at: 1,
             updated_at: 1,
         };
         let prompt = build_consult_prompt(&to, "咨询方", "整理文档", Some(temp.path()));
-        assert!(prompt.contains("<skill id=\"pdf-export\" name=\"PDF 导出\">"), "{prompt}");
+        assert!(prompt.contains("<skill id=\"ws-unique-probe-77\" name=\"唯一探针\">"), "{prompt}");
         assert!(prompt.contains("先确认源内容再整理大纲"));
-        // 同一声明在无 workspace 的根下不注入（候选仅插件，未命中）。
+        // 换一个无此技能的根：探针不在 cwd 也不在注册笔记本 → 不注入。
+        // （跨笔记本聚合只扫 cwd + 注册笔记本；temp 未注册故不再命中。）
         let other = tempfile::tempdir().unwrap();
         let bare = build_consult_prompt(&to, "咨询方", "整理文档", Some(other.path()));
-        assert!(!bare.contains("<skills>"), "{bare}");
+        assert!(!bare.contains("ws-unique-probe-77"), "{bare}");
     }
 
     #[test]

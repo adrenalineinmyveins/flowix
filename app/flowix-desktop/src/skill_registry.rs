@@ -46,28 +46,77 @@ pub fn list_skills() -> Result<Vec<SkillDescriptor>, String> {
     Ok(result)
 }
 
-/// AGENT-SKILLS：带笔记本工作区聚合的技能清单——`cwd`（笔记本根目录）
-/// 有值时并入 `.agents/skills/` 下的 workspace 技能（与 DSH 会话实际
-/// 加载的技能同源）。插件技能优先，workspace 项按 id 去重。
-pub fn list_skills_with_workspace(cwd: Option<&std::path::Path>) -> Result<Vec<SkillDescriptor>, String> {
-    let mut result = list_skills()?;
-    if let Some(root) = cwd {
-        for skill in crate::commands::agent::notebook_agents::notebook_agent_skills_read(
+/// AGENT-SKILLS：workspace 技能条目（含全文正文，供注入与下拉共用）。
+pub struct WorkspaceSkill {
+    pub id: String,
+    pub display_name: String,
+    pub description: String,
+    pub body: String,
+    pub enabled: bool,
+}
+
+/// AGENT-SKILLS：跨笔记本聚合 workspace 技能——扫描**全部注册笔记本**
+/// （用户级 index.db）的 `.agents/skills/`。`prefer`（当前/所在笔记本）
+/// 排最前，其余按注册顺序；跨笔记本按 id 去重（先到先得）。任一笔记本
+/// 读取失败静默跳过——聚合是增强，不阻塞。
+pub fn workspace_skills(prefer: Option<&std::path::Path>) -> Vec<WorkspaceSkill> {
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(root) = prefer {
+        roots.push(root.to_path_buf());
+    }
+    if let Some(home) = dirs::home_dir() {
+        let config_dir = crate::get_user_config_dir(&home);
+        if let Ok(configs) =
+            flowix_core::memo_file::MemoFile::new(config_dir).read_notebook_configs()
+        {
+            for config in configs {
+                let path = std::path::PathBuf::from(config.path);
+                if !roots.iter().any(|root| root == &path) {
+                    roots.push(path);
+                }
+            }
+        }
+    }
+    let mut skills = Vec::new();
+    for root in roots {
+        let Ok(entries) = crate::commands::agent::notebook_agents::notebook_agent_skills_read(
             root.to_string_lossy().to_string(),
-        )? {
-            if result.iter().any(|item| item.id == skill.id) {
+        ) else {
+            continue;
+        };
+        for entry in entries {
+            if skills.iter().any(|skill: &WorkspaceSkill| skill.id == entry.id) {
                 continue;
             }
-            result.push(SkillDescriptor {
-                source: "workspace".into(),
-                id: skill.id,
-                display_name: skill.name,
-                description: skill.description.chars().take(200).collect(),
-                kind: "agent-markdown".into(),
-                publish_state: "private".into(),
-                enabled: skill.enabled,
+            skills.push(WorkspaceSkill {
+                id: entry.id,
+                display_name: entry.name,
+                description: entry.description.clone(),
+                body: entry.body,
+                enabled: entry.enabled,
             });
         }
+    }
+    skills
+}
+
+/// AGENT-SKILLS：带 workspace 聚合的技能清单（跨笔记本）。插件技能优先，
+/// workspace 项按 id 去重。
+pub fn list_skills_with_workspace(cwd: Option<&std::path::Path>) -> Result<Vec<SkillDescriptor>, String> {
+    let mut result = list_skills()?;
+    for skill in workspace_skills(cwd) {
+        if result.iter().any(|item| item.id == skill.id) {
+            continue;
+        }
+        result.push(SkillDescriptor {
+            source: "workspace".into(),
+            id: skill.id,
+            display_name: skill.display_name,
+            description: skill.description.chars().take(200).collect(),
+            kind: "agent-markdown".into(),
+            publish_state: "private".into(),
+            enabled: skill.enabled,
+        });
     }
     Ok(result)
 }
@@ -183,6 +232,8 @@ mod tests {
     #[test]
     fn workspace_skills_are_merged_and_deduped() {
         // 临时笔记本：.agents/skills/pdf-export/SKILL.md（workspace 技能）。
+        // 跨笔记本聚合后也会并入真实注册表各笔记本的 workspace 技能——
+        // 断言用 contains 语义，不依赖本机注册表内容。
         let temp = tempfile::tempdir().unwrap();
         let skill_dir = temp.path().join(".agents").join("skills").join("pdf-export");
         std::fs::create_dir_all(&skill_dir).unwrap();
@@ -192,20 +243,27 @@ mod tests {
         )
         .unwrap();
 
-        // 有 cwd：workspace 项并入（插件技能仍在前）。
+        // 有 cwd：cwd 笔记本的 workspace 项并入。
         let merged = list_skills_with_workspace(Some(temp.path())).unwrap();
-        let workspace: Vec<_> = merged.iter().filter(|item| item.source == "workspace").collect();
-        assert_eq!(workspace.len(), 1, "{merged:?}");
-        assert_eq!(workspace[0].id, "pdf-export");
-        assert_eq!(workspace[0].display_name, "PDF 导出");
-        assert!(workspace[0].enabled);
-        assert_eq!(workspace[0].kind, "agent-markdown");
+        let entry = merged
+            .iter()
+            .find(|item| item.id == "pdf-export")
+            .expect("cwd workspace skill merged");
+        assert_eq!(entry.source, "workspace");
+        assert_eq!(entry.display_name, "PDF 导出");
+        assert!(entry.enabled);
+        assert_eq!(entry.kind, "agent-markdown");
         // 插件技能仍在（全局注册表至少含内置插件）。
         assert!(merged.iter().any(|item| item.source == "plugin"));
+        // 跨笔记本：真实注册表笔记本的 workspace 技能也在候选（本机
+        // tuning 笔记本有 coding-bootcamp；无则跳过断言——环境无关）。
+        if let Some(cross) = merged.iter().find(|item| item.id == "coding-bootcamp") {
+            assert_eq!(cross.source, "workspace");
+        }
 
-        // 无 cwd：不并入 workspace 项（旧调用方语义不变）。
-        let plugins_only = list_skills_with_workspace(None).unwrap();
-        assert!(!plugins_only.iter().any(|item| item.source == "workspace"));
+        // 无 cwd：仍聚合注册表笔记本（语义变化——跨笔记本恒聚合）。
+        let global = list_skills_with_workspace(None).unwrap();
+        assert!(global.iter().any(|item| item.source == "plugin"));
     }
 
     #[test]
